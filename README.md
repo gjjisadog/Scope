@@ -1,0 +1,48 @@
+# Scope Analyzer
+
+Windows 离线波形分析软件第一版原型。界面按软件示波器方式组织：通道勾选、全选/取消、自由缩放、双竖直光标测量、选区 FFT 与谐波表。
+
+## 当前支持的数据格式
+
+第一版支持两类 CSV。
+
+### 云端 Content CSV
+
+匹配现有 MATLAB 脚本里的云端录波格式：
+
+- 文件第一行是 `Content`。
+- 每行 `Content` 是一条十六进制报文。
+- 每条报文解析成 2 个采样点。
+- 每个采样点包含 30 个模拟量通道和 30 个数字/状态通道。
+- 前 30 个模拟量按 little-endian `int16` 解析。
+- 第 31/32 个 raw word 按 MATLAB 脚本的 bit 规则拆成数字/状态通道。
+
+### 本地/标准数值 CSV
+
+```csv
+time,CH1,CH2,CH3
+0.000000,0.0,0.1,0.2
+0.000010,0.1,0.2,0.3
+```
+
+- 第一列必须是时间，单位秒。
+- 后续列为通道值，最多读取 128 个通道。
+- 文件打开时只建立分块索引和 min/max 摘要；绘图和 FFT 按当前视窗/选区读取。
+
+后续如果还有新的二进制、加密或报文格式，应新增 `DataSource` 适配器，不需要改 UI 与 FFT 模块。
+
+## 本地运行
+
+```bash
+cargo run --release
+```
+
+## Windows 便携版打包
+
+在 Windows 机器安装 Rust 稳定版后执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1
+```
+
+产物在 `dist/ScopeAnalyzer-0.1.0-win-x64.zip`。
