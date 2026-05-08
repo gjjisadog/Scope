@@ -93,9 +93,9 @@ impl DataSource for CsvDataSource {
         let mut blocks = Vec::new();
         let mut current: Option<BlockIndex> = None;
         let mut row_count = 0_u64;
-        let mut first_time = None;
-        let mut last_time = None;
-        let mut previous_time = None;
+        let mut first_time: Option<f64> = None;
+        let mut last_time: Option<f64> = None;
+        let mut previous_time: Option<f64> = None;
         let mut dt_sum = 0.0_f64;
         let mut dt_count = 0_u64;
 
