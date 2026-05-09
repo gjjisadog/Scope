@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use eframe::egui::{self, Color32, PointerButton, RichText, Stroke};
-use egui_plot::{Legend, Line, LineStyle, Plot, PlotPoints, VLine};
+use egui_plot::{Legend, Line, LineStyle, Plot, PlotPoint, PlotPoints, Text, VLine};
 
 use crate::{
     data::{CloudCsvDataSource, CsvDataSource, DataSource, DatasetMeta, RangeSummary, SampleBlock},
@@ -315,10 +315,8 @@ impl ScopeApp {
     }
 
     fn cursor_color(cursor: CursorId) -> Color32 {
-        match cursor {
-            CursorId::A => Color32::WHITE,
-            CursorId::B => Color32::LIGHT_BLUE,
-        }
+        let _ = cursor;
+        Color32::from_rgb(255, 40, 40)
     }
 
     fn zoom_to_range(&mut self, start: f64, end: f64) {
@@ -760,11 +758,38 @@ impl ScopeApp {
                     }
                 }
 
+                let cursor_label_y = plot_y_max - (plot_y_max - plot_y_min) * 0.05;
                 if self.show_cursor_a {
-                    plot_ui.vline(VLine::new(self.cursor_a).name("A").color(Color32::WHITE));
+                    let color = Self::cursor_color(CursorId::A);
+                    plot_ui.vline(
+                        VLine::new(self.cursor_a)
+                            .name("A")
+                            .color(color)
+                            .width(2.5),
+                    );
+                    plot_ui.text(
+                        Text::new(
+                            PlotPoint::new(self.cursor_a, cursor_label_y),
+                            RichText::new("A").strong().color(Color32::BLACK).background_color(color),
+                        )
+                        .anchor(egui::Align2::CENTER_TOP),
+                    );
                 }
                 if self.show_cursor_b {
-                    plot_ui.vline(VLine::new(self.cursor_b).name("B").color(Color32::LIGHT_BLUE));
+                    let color = Self::cursor_color(CursorId::B);
+                    plot_ui.vline(
+                        VLine::new(self.cursor_b)
+                            .name("B")
+                            .color(color)
+                            .width(2.5),
+                    );
+                    plot_ui.text(
+                        Text::new(
+                            PlotPoint::new(self.cursor_b, cursor_label_y),
+                            RichText::new("B").strong().color(Color32::BLACK).background_color(color),
+                        )
+                        .anchor(egui::Align2::CENTER_TOP),
+                    );
                 }
 
                 if let (Some(cursor), Some(pointer)) =
@@ -775,7 +800,7 @@ impl ScopeApp {
                             .name(format!("Place {}", Self::cursor_label(cursor)))
                             .color(Self::cursor_color(cursor))
                             .style(LineStyle::Dashed { length: 6.0 })
-                            .width(1.5),
+                            .width(2.5),
                     );
                 }
 
