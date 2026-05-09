@@ -15,6 +15,15 @@ Push-Location $root
 cargo build --release
 Copy-Item "target\release\scope_analyzer.exe" (Join-Path $stage "ScopeAnalyzer.exe")
 Copy-Item "README.md" (Join-Path $stage "README.txt")
+
+$clang = Get-Command "x86_64-w64-mingw32-clang.exe" -ErrorAction SilentlyContinue
+if ($clang) {
+    $runtimeDir = Split-Path -Parent $clang.Source
+    $libunwind = Join-Path $runtimeDir "libunwind.dll"
+    if (Test-Path $libunwind) {
+        Copy-Item $libunwind (Join-Path $stage "libunwind.dll")
+    }
+}
 Pop-Location
 
 $zip = Join-Path $dist "ScopeAnalyzer-$version-win-x64.zip"
