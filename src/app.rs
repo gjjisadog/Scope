@@ -21,6 +21,8 @@ pub struct ScopeApp {
     y_max: Option<f64>,
     cursor_a: f64,
     cursor_b: f64,
+    show_cursor_a: bool,
+    show_cursor_b: bool,
     active_cursor: CursorId,
     channel_filter: String,
     last_error: Option<String>,
@@ -54,6 +56,8 @@ impl ScopeApp {
             y_max: None,
             cursor_a: 0.25,
             cursor_b: 0.75,
+            show_cursor_a: true,
+            show_cursor_b: true,
             active_cursor: CursorId::A,
             channel_filter: String::new(),
             last_error: None,
@@ -89,6 +93,8 @@ impl ScopeApp {
         let span = meta.duration();
         self.cursor_a = meta.start_time + span * 0.33;
         self.cursor_b = meta.start_time + span * 0.66;
+        self.show_cursor_a = true;
+        self.show_cursor_b = true;
         self.fft_channel = 0;
         self.fft_result = None;
         self.sequence_result = None;
@@ -271,8 +277,14 @@ impl ScopeApp {
         };
         let clamped = time.clamp(meta.start_time, meta.end_time);
         match self.active_cursor {
-            CursorId::A => self.cursor_a = clamped,
-            CursorId::B => self.cursor_b = clamped,
+            CursorId::A => {
+                self.cursor_a = clamped;
+                self.show_cursor_a = true;
+            }
+            CursorId::B => {
+                self.cursor_b = clamped;
+                self.show_cursor_b = true;
+            }
         }
         self.needs_fft_reload = true;
     }
@@ -283,8 +295,14 @@ impl ScopeApp {
         };
         let clamped = time.clamp(meta.start_time, meta.end_time);
         match cursor {
-            CursorId::A => self.cursor_a = clamped,
-            CursorId::B => self.cursor_b = clamped,
+            CursorId::A => {
+                self.cursor_a = clamped;
+                self.show_cursor_a = true;
+            }
+            CursorId::B => {
+                self.cursor_b = clamped;
+                self.show_cursor_b = true;
+            }
         }
         self.needs_fft_reload = true;
     }
@@ -542,8 +560,16 @@ impl ScopeApp {
             ui.radio_value(&mut self.active_cursor, CursorId::A, "A");
             ui.radio_value(&mut self.active_cursor, CursorId::B, "B");
         });
-        ui.label(format!("A: {:.9}s", self.cursor_a));
-        ui.label(format!("B: {:.9}s", self.cursor_b));
+        ui.label(format!(
+            "A: {:.9}s{}",
+            self.cursor_a,
+            if self.show_cursor_a { "" } else { " (hidden)" }
+        ));
+        ui.label(format!(
+            "B: {:.9}s{}",
+            self.cursor_b,
+            if self.show_cursor_b { "" } else { " (hidden)" }
+        ));
         let dt = (self.cursor_b - self.cursor_a).abs();
         ui.label(format!("dt: {:.9}s", dt));
         if dt > 0.0 {
@@ -734,8 +760,12 @@ impl ScopeApp {
                     }
                 }
 
-                plot_ui.vline(VLine::new(self.cursor_a).name("A").color(Color32::WHITE));
-                plot_ui.vline(VLine::new(self.cursor_b).name("B").color(Color32::LIGHT_BLUE));
+                if self.show_cursor_a {
+                    plot_ui.vline(VLine::new(self.cursor_a).name("A").color(Color32::WHITE));
+                }
+                if self.show_cursor_b {
+                    plot_ui.vline(VLine::new(self.cursor_b).name("B").color(Color32::LIGHT_BLUE));
+                }
 
                 if let (Some(cursor), Some(pointer)) =
                     (self.cursor_place_mode, plot_ui.pointer_coordinate())
@@ -771,6 +801,25 @@ impl ScopeApp {
             }
             if self.cursor_place_mode.is_some() && ui.button("Cancel Placement").clicked() {
                 self.cursor_place_mode = None;
+                ui.close_menu();
+            }
+            ui.separator();
+            if self.show_cursor_a {
+                if ui.button("Hide Cursor A").clicked() {
+                    self.show_cursor_a = false;
+                    ui.close_menu();
+                }
+            } else if ui.button("Show Cursor A").clicked() {
+                self.show_cursor_a = true;
+                ui.close_menu();
+            }
+            if self.show_cursor_b {
+                if ui.button("Hide Cursor B").clicked() {
+                    self.show_cursor_b = false;
+                    ui.close_menu();
+                }
+            } else if ui.button("Show Cursor B").clicked() {
+                self.show_cursor_b = true;
                 ui.close_menu();
             }
         });

@@ -45,6 +45,7 @@ cargo run --release
 - 左键拖拽：框选时间区域并放大。
 - 右键单击：弹出菜单，选择 `Place Cursor A` 或 `Place Cursor B` 后出现虚线预览光标。
 - 放置光标：虚线光标跟随鼠标，左键单击确认放置，`Esc` 取消。
+- 隐藏光标：右键菜单可 `Hide Cursor A/B` 或 `Show Cursor A/B`；隐藏只影响显示，光标位置和 A/B 测量仍保留。
 - 右键拖拽：平移当前波形视图。
 - `Fit Cursors`：缩放到 A/B 两个光标之间。
 - FFT 面板：自动分析光标 A/B 之间当前 FFT 通道的波形，并显示基波、谐波、相位和 THD。
