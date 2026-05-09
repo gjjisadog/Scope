@@ -1,7 +1,7 @@
-use std::path::PathBuf;
+use std::{fs::File, io::{BufRead, BufReader}, path::{Path, PathBuf}};
 
 use eframe::egui::{self, Color32, PointerButton, RichText, Stroke};
-use egui_plot::{Legend, Line, LineStyle, Plot, PlotPoint, PlotPoints, Text, VLine};
+use egui_plot::{Line, LineStyle, Plot, PlotBounds, PlotPoint, PlotPoints, Text, VLine};
 
 use crate::{
     data::{CloudCsvDataSource, CsvDataSource, DataSource, DatasetMeta, RangeSummary, SampleBlock},
@@ -15,6 +15,8 @@ const ZOOM_BOX_MIN_PIXELS: f32 = 8.0;
 pub struct ScopeApp {
     source: Option<Box<dyn DataSource>>,
     visible: Vec<bool>,
+    display_names: Vec<String>,
+    hovered_channel: Option<usize>,
     view_start: f64,
     view_end: f64,
     y_min: Option<f64>,
@@ -25,6 +27,9 @@ pub struct ScopeApp {
     show_cursor_b: bool,
     active_cursor: CursorId,
     channel_filter: String,
+    show_help: bool,
+    show_options: bool,
+    wheel_zoom_sensitivity: f64,
     last_error: Option<String>,
     loaded_path: Option<PathBuf>,
     plot_cache: SampleBlock,
@@ -50,6 +55,8 @@ impl ScopeApp {
         Self {
             source: None,
             visible: Vec::new(),
+            display_names: Vec::new(),
+            hovered_channel: None,
             view_start: 0.0,
             view_end: 1.0,
             y_min: None,
@@ -60,6 +67,9 @@ impl ScopeApp {
             show_cursor_b: true,
             active_cursor: CursorId::A,
             channel_filter: String::new(),
+            show_help: false,
+            show_options: false,
+            wheel_zoom_sensitivity: 0.25,
             last_error: None,
             loaded_path: None,
             plot_cache: SampleBlock::default(),
@@ -86,6 +96,12 @@ impl ScopeApp {
             .iter()
             .map(|channel| channel.default_visible)
             .collect();
+        self.display_names = meta
+            .channels
+            .iter()
+            .map(|channel| channel.name.clone())
+            .collect();
+        self.hovered_channel = None;
         self.view_start = meta.start_time;
         self.view_end = meta.end_time;
         self.y_min = None;
@@ -122,12 +138,54 @@ impl ScopeApp {
         }
     }
 
+    fn open_auto_csv(&mut self, path: PathBuf) {
+        match Self::looks_like_cloud_csv(&path) {
+            Ok(true) => self.open_cloud_csv(path),
+            Ok(false) => self.open_standard_csv(path),
+            Err(error) => self.last_error = Some(error),
+        }
+    }
+
+    fn looks_like_cloud_csv(path: &Path) -> Result<bool, String> {
+        let file = File::open(path).map_err(|error| error.to_string())?;
+        let mut reader = BufReader::new(file);
+        let mut header = String::new();
+        let bytes = reader
+            .read_line(&mut header)
+            .map_err(|error| error.to_string())?;
+        if bytes == 0 {
+            return Err("CSV file is empty.".to_owned());
+        }
+        let first_column = header
+            .trim_start_matches('\u{feff}')
+            .trim()
+            .split(',')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches('"');
+        Ok(first_column.eq_ignore_ascii_case("Content"))
+    }
+
     fn selected_channels(&self) -> Vec<usize> {
         self.visible
             .iter()
             .enumerate()
             .filter_map(|(index, visible)| visible.then_some(index))
             .collect()
+    }
+
+    fn channel_name(&self, index: usize) -> String {
+        self.display_names
+            .get(index)
+            .filter(|name| !name.trim().is_empty())
+            .cloned()
+            .or_else(|| {
+                self.meta()
+                    .and_then(|meta| meta.channels.get(index))
+                    .map(|channel| channel.name.clone())
+            })
+            .unwrap_or_else(|| format!("CH{}", index + 1))
     }
 
     fn reload_plot_cache(&mut self) {
@@ -330,14 +388,25 @@ impl ScopeApp {
         let mut end = range_end.clamp(meta.start_time, meta.end_time);
         if end - start < min_span {
             let center = (start + end) * 0.5;
-            start = (center - min_span * 0.5).max(meta.start_time);
-            end = (start + min_span).min(meta.end_time);
+            start = (center - min_span * 0.5).clamp(meta.start_time, meta.end_time);
+            end = start + min_span;
+            if end > meta.end_time {
+                end = meta.end_time;
+                start = (end - min_span).max(meta.start_time);
+            }
         }
         if end > start {
             self.view_start = start;
             self.view_end = end;
             self.needs_plot_reload = true;
         }
+    }
+
+    fn clamp_to_plot_rect(pos: egui::Pos2, rect: egui::Rect) -> egui::Pos2 {
+        egui::pos2(
+            pos.x.clamp(rect.left(), rect.right()),
+            pos.y.clamp(rect.top(), rect.bottom()),
+        )
     }
 
     fn run_fft(&mut self) {
@@ -352,7 +421,7 @@ impl ScopeApp {
         self.fft_channel = fft_channel;
         let start = self.cursor_a.min(self.cursor_b);
         let end = self.cursor_a.max(self.cursor_b);
-        let channel_name = meta.channels[fft_channel].name.clone();
+        let channel_name = self.channel_name(fft_channel);
         let sample_rate_hz = meta.channels[fft_channel].sample_rate_hz;
         let sequence_group = self.sequence_group_for_channel(fft_channel);
 
@@ -457,20 +526,12 @@ impl ScopeApp {
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if ui.button("Open Cloud CSV").clicked() {
+            if ui.button("Open CSV").clicked() {
                 if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Cloud Content CSV", &["csv"])
+                    .add_filter("Waveform CSV", &["csv"])
                     .pick_file()
                 {
-                    self.open_cloud_csv(path);
-                }
-            }
-            if ui.button("Open Local CSV").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Numeric CSV", &["csv"])
-                    .pick_file()
-                {
-                    self.open_standard_csv(path);
+                    self.open_auto_csv(path);
                 }
             }
             if ui.button("Reset View").clicked() {
@@ -480,6 +541,12 @@ impl ScopeApp {
                 self.view_start = self.cursor_a.min(self.cursor_b);
                 self.view_end = self.cursor_a.max(self.cursor_b);
                 self.needs_plot_reload = true;
+            }
+            if ui.button("Help").clicked() {
+                self.show_help = true;
+            }
+            if ui.button("Options").clicked() {
+                self.show_options = true;
             }
             ui.separator();
             if let Some(meta) = self.meta() {
@@ -491,9 +558,96 @@ impl ScopeApp {
                     meta.nominal_sample_rate_hz
                 ));
             } else {
-                ui.label("Open a cloud Content CSV or a local numeric CSV to begin.");
+                ui.label("Open a waveform CSV to begin. Content files are detected automatically.");
             }
         });
+    }
+
+    fn help_window(&mut self, ctx: &egui::Context) {
+        egui::Window::new("Help")
+            .open(&mut self.show_help)
+            .default_width(720.0)
+            .default_height(620.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.heading("Scope Analyzer");
+                    ui.label("Windows offline waveform analyzer with channel selection, oscilloscope-style zooming, cursor measurement, FFT, THD, and sequence components.");
+
+                    ui.separator();
+                    ui.heading("Supported CSV Formats");
+                    ui.label("Use Open CSV. The software reads the first CSV header and automatically chooses the cloud Content parser or the local numeric CSV parser.");
+                    ui.strong("Cloud Content CSV");
+                    ui.label("The first row is Content. Each following row is a hexadecimal record. Each record is decoded into two samples. Each sample contains 30 analog channels plus 30 digital/status channels. Analog channels use little-endian int16. The 31st and 32nd raw words are expanded into digital/status channels according to the original MATLAB script.");
+                    ui.add_space(6.0);
+                    ui.strong("Local / Numeric CSV");
+                    ui.label("The first column is time in seconds. Remaining columns are channel values. Up to 128 numeric channels are loaded. The file is indexed in blocks and the plot reads only the current view or min/max summaries.");
+                    ui.monospace("time,CH1,CH2,CH3\n0.000000,0.0,0.1,0.2\n0.000010,0.1,0.2,0.3");
+
+                    ui.separator();
+                    ui.heading("Waveform Controls");
+                    ui.label("Mouse wheel: zoom vertical amplitude range around the pointer.");
+                    ui.label("Ctrl + mouse wheel: zoom horizontal time range around the pointer.");
+                    ui.label("Options: adjust mouse wheel zoom sensitivity.");
+                    ui.label("Left channel list: select channels, edit display names, search variables, and use it as the legend.");
+                    ui.label("Hover a variable in the left list: the corresponding waveform becomes thicker.");
+                    ui.label("Left click plot: move the nearest cursor to the clicked position.");
+                    ui.label("Left drag plot: box-select a time range and zoom in.");
+                    ui.label("Right click plot: open cursor menu.");
+                    ui.label("Place Cursor A/B: shows a red dashed preview cursor; left click confirms, Esc cancels.");
+                    ui.label("Hide/Show Cursor A/B: toggles cursor visibility without changing cursor position or measurements.");
+                    ui.label("Right drag plot: pan the current view.");
+                    ui.label("Fit Cursors: zoom to the time range between cursor A and cursor B.");
+
+                    ui.separator();
+                    ui.heading("FFT, THD, and Sequence");
+                    ui.label("The FFT panel automatically analyzes the selected FFT channel between cursor A and cursor B.");
+                    ui.label("The harmonic table shows frequency, amplitude, phase, dBc, and THD.");
+                    ui.label("If the FFT channel belongs to stVg_0.iA/iB/iC, stIg_0.iA/iB/iC, or stVinv_0.iA/iB/iC, the software also shows zero, positive, and negative sequence components.");
+                    ui.label("Single-channel FFT phase depends on cursor start time. Sequence analysis uses the A-B-C positive-sequence convention; focus on relative phase and positive/negative/zero sequence magnitude ratios.");
+
+                    ui.separator();
+                    ui.heading("Build / Packaging");
+                    ui.label("Run locally with:");
+                    ui.monospace("cargo run --release");
+                    ui.label("Create a Windows portable package with:");
+                    ui.monospace("powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1");
+                    ui.label("Output: dist/ScopeAnalyzer-0.1.0-win-x64.zip");
+                });
+            });
+    }
+
+    fn options_window(&mut self, ctx: &egui::Context) {
+        egui::Window::new("Options")
+            .open(&mut self.show_options)
+            .default_width(360.0)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.heading("Interaction");
+                ui.add(
+                    egui::Slider::new(&mut self.wheel_zoom_sensitivity, 0.05..=0.80)
+                        .text("Wheel zoom sensitivity")
+                        .logarithmic(false),
+                );
+                ui.label(format!(
+                    "Current: {:.0}% per wheel step",
+                    self.wheel_zoom_sensitivity * 100.0
+                ));
+                if ui.button("Reset Sensitivity").clicked() {
+                    self.wheel_zoom_sensitivity = 0.25;
+                }
+                ui.separator();
+                ui.label("Mouse wheel zooms the vertical axis.");
+                ui.label("Ctrl + mouse wheel zooms the horizontal axis.");
+            });
+    }
+
+    fn wheel_zoom_factor(&self, scroll_delta: f32) -> f64 {
+        if scroll_delta > 0.0 {
+            1.0 - self.wheel_zoom_sensitivity
+        } else {
+            1.0 + self.wheel_zoom_sensitivity
+        }
     }
 
     fn channel_panel(&mut self, ui: &mut egui::Ui) {
@@ -520,36 +674,48 @@ impl ScopeApp {
             return;
         };
         let filter = self.channel_filter.to_lowercase();
+        let mut hovered_channel = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             for channel in &meta.channels {
-                if !filter.is_empty() && !channel.name.to_lowercase().contains(&filter) {
+                let display_name = self.channel_name(channel.index);
+                if !filter.is_empty()
+                    && !display_name.to_lowercase().contains(&filter)
+                    && !channel.name.to_lowercase().contains(&filter)
+                {
                     continue;
                 }
-                ui.horizontal(|ui| {
+                let row_response = ui
+                    .horizontal(|ui| {
                     let color = Self::channel_color(channel.index);
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                     ui.painter().rect_filled(rect, 2.0, color);
                     let changed = ui
-                        .checkbox(
-                            &mut self.visible[channel.index],
-                            format!(
-                                "{}{}",
-                                channel.name,
-                                if channel.unit.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!(" ({})", channel.unit)
-                                }
-                            ),
-                        )
+                        .checkbox(&mut self.visible[channel.index], "")
                         .changed();
                     if changed {
                         self.needs_plot_reload = true;
                     }
-                });
+                    if let Some(name) = self.display_names.get_mut(channel.index) {
+                        ui.add(
+                            egui::TextEdit::singleline(name)
+                                .desired_width(150.0),
+                        );
+                    }
+                    if !channel.unit.is_empty() {
+                        ui.label(format!("({})", channel.unit));
+                    }
+                    if display_name != channel.name {
+                        ui.label(RichText::new(format!("src: {}", channel.name)).small());
+                    }
+                    })
+                    .response;
+                if row_response.hovered() {
+                    hovered_channel = Some(channel.index);
+                }
             }
         });
+        self.hovered_channel = hovered_channel;
     }
 
     fn measurements_panel(&mut self, ui: &mut egui::Ui) {
@@ -619,13 +785,17 @@ impl ScopeApp {
             .selected_text(
                 meta.channels
                     .get(self.fft_channel)
-                    .map(|channel| channel.name.as_str())
-                    .unwrap_or("CH1"),
+                    .map(|channel| self.channel_name(channel.index))
+                    .unwrap_or_else(|| "CH1".to_owned()),
             )
             .show_ui(ui, |ui| {
                 for channel in &meta.channels {
                     if ui
-                        .selectable_value(&mut self.fft_channel, channel.index, &channel.name)
+                        .selectable_value(
+                            &mut self.fft_channel,
+                            channel.index,
+                            self.channel_name(channel.index),
+                        )
                         .changed()
                     {
                         fft_channel_changed = true;
@@ -706,22 +876,19 @@ impl ScopeApp {
         let selected = self.selected_channels();
         let (plot_y_min, plot_y_max) = self.current_y_bounds();
         let response = Plot::new("scope_plot")
-            .legend(Legend::default())
             .allow_drag(false)
             .allow_scroll(false)
             .allow_zoom(false)
-            .include_x(self.view_start)
-            .include_x(self.view_end)
-            .include_y(plot_y_min)
-            .include_y(plot_y_max)
             .show(ui, |plot_ui| {
+                plot_ui.set_plot_bounds(PlotBounds::from_min_max(
+                    [self.view_start, plot_y_min],
+                    [self.view_end, plot_y_max],
+                ));
+
                 for (out_index, channel_index) in selected.iter().enumerate() {
                     if out_index >= self.plot_cache.channels.len() {
                         continue;
                     }
-                    let Some(meta) = self.meta() else {
-                        continue;
-                    };
                     let raw_points = self
                         .plot_cache
                         .times
@@ -731,8 +898,13 @@ impl ScopeApp {
                         .collect::<Vec<_>>();
                     plot_ui.line(
                         Line::new(PlotPoints::from(raw_points))
-                            .name(meta.channels[*channel_index].name.clone())
-                            .color(Self::channel_color(*channel_index)),
+                            .name(self.channel_name(*channel_index))
+                            .color(Self::channel_color(*channel_index))
+                            .width(if self.hovered_channel == Some(*channel_index) {
+                                3.0
+                            } else {
+                                1.4
+                            }),
                     );
                 }
 
@@ -741,9 +913,6 @@ impl ScopeApp {
                         if out_index >= summary.min.len() || out_index >= summary.max.len() {
                             continue;
                         }
-                        let Some(meta) = self.meta() else {
-                            continue;
-                        };
                         let mut envelope = Vec::with_capacity(summary.bin_start.len() * 2);
                         for i in 0..summary.bin_start.len() {
                             let mid = (summary.bin_start[i] + summary.bin_end[i]) * 0.5;
@@ -752,8 +921,13 @@ impl ScopeApp {
                         }
                         plot_ui.line(
                             Line::new(PlotPoints::from(envelope))
-                                .name(format!("{} min/max", meta.channels[*channel_index].name))
-                                .color(Self::channel_color(*channel_index)),
+                                .name(format!("{} min/max", self.channel_name(*channel_index)))
+                                .color(Self::channel_color(*channel_index))
+                                .width(if self.hovered_channel == Some(*channel_index) {
+                                    3.0
+                                } else {
+                                    1.4
+                                }),
                         );
                     }
                 }
@@ -859,7 +1033,7 @@ impl ScopeApp {
             let scroll = ui.ctx().input(|input| input.smooth_scroll_delta.y);
             let ctrl_down = ui.ctx().input(|input| input.modifiers.ctrl);
             if scroll.abs() > 0.0 {
-                let factor = if scroll > 0.0 { 0.80 } else { 1.25 };
+                let factor = self.wheel_zoom_factor(scroll);
                 if ctrl_down {
                     let center = hover_time.unwrap_or((self.view_start + self.view_end) * 0.5);
                     self.zoom(center, factor);
@@ -907,9 +1081,10 @@ impl ScopeApp {
         if self.cursor_place_mode.is_none() && response.response.dragged_by(PointerButton::Primary) {
             self.zoom_box_current = response.response.interact_pointer_pos();
             if let (Some(start), Some(current)) = (self.zoom_box_start, self.zoom_box_current) {
+                let start = Self::clamp_to_plot_rect(start, response.response.rect);
+                let current = Self::clamp_to_plot_rect(current, response.response.rect);
                 if (current.x - start.x).abs() >= ZOOM_BOX_MIN_PIXELS {
-                    let rect = egui::Rect::from_two_pos(start, current)
-                        .intersect(response.response.rect);
+                    let rect = egui::Rect::from_two_pos(start, current);
                     ui.painter().rect_filled(
                         rect,
                         0.0,
@@ -927,6 +1102,8 @@ impl ScopeApp {
 
         if self.cursor_place_mode.is_none() && response.response.drag_stopped_by(PointerButton::Primary) {
             if let (Some(start), Some(end)) = (self.zoom_box_start.take(), self.zoom_box_current.take()) {
+                let start = Self::clamp_to_plot_rect(start, response.response.rect);
+                let end = Self::clamp_to_plot_rect(end, response.response.rect);
                 if (end.x - start.x).abs() >= ZOOM_BOX_MIN_PIXELS {
                     let start_plot = response.transform.value_from_position(start);
                     let end_plot = response.transform.value_from_position(end);
@@ -940,6 +1117,8 @@ impl ScopeApp {
 impl eframe::App for ScopeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| self.top_bar(ui));
+        self.help_window(ctx);
+        self.options_window(ctx);
 
         egui::SidePanel::left("channels")
             .resizable(true)
