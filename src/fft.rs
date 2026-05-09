@@ -5,6 +5,7 @@ pub struct HarmonicRow {
     pub order: usize,
     pub frequency_hz: f64,
     pub amplitude: f32,
+    pub phase_deg: f32,
     pub relative_db: f32,
 }
 
@@ -19,16 +20,27 @@ pub struct FftResult {
     pub harmonics: Vec<HarmonicRow>,
 }
 
-pub fn analyze(
-    channel_name: String,
-    samples: &[f32],
-    sample_rate_hz: f64,
-    harmonic_count: usize,
-) -> Option<FftResult> {
-    if samples.len() < 16 || sample_rate_hz <= 0.0 {
-        return None;
-    }
+#[derive(Clone, Debug, Default)]
+pub struct SequenceComponent {
+    pub name: &'static str,
+    pub amplitude: f32,
+    pub phase_deg: f32,
+    pub percent_of_positive: f32,
+}
 
+#[derive(Clone, Debug, Default)]
+pub struct SequenceResult {
+    pub group_name: String,
+    pub fundamental_hz: f64,
+    pub phase_a_deg: f32,
+    pub phase_b_deg: f32,
+    pub phase_c_deg: f32,
+    pub zero: SequenceComponent,
+    pub positive: SequenceComponent,
+    pub negative: SequenceComponent,
+}
+
+fn fft_buffer(samples: &[f32]) -> Vec<Complex<f32>> {
     let len = samples.len().next_power_of_two();
     let mean = samples.iter().copied().sum::<f32>() / samples.len() as f32;
     let mut buffer = vec![Complex::new(0.0_f32, 0.0_f32); len];
@@ -42,7 +54,30 @@ pub fn analyze(
     let mut planner = FftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(len);
     fft.process(&mut buffer);
+    buffer
+}
 
+fn phase_deg(value: Complex<f32>) -> f32 {
+    value.arg().to_degrees()
+}
+
+fn scaled_phasor(buffer: &[Complex<f32>], bin: usize, sample_count: usize) -> Complex<f32> {
+    let scale = 2.0 / sample_count as f32;
+    buffer[bin] * scale
+}
+
+pub fn analyze(
+    channel_name: String,
+    samples: &[f32],
+    sample_rate_hz: f64,
+    harmonic_count: usize,
+) -> Option<FftResult> {
+    if samples.len() < 16 || sample_rate_hz <= 0.0 {
+        return None;
+    }
+
+    let buffer = fft_buffer(samples);
+    let len = buffer.len();
     let half = len / 2;
     let scale = 2.0 / samples.len() as f32;
     let mut magnitudes = Vec::with_capacity(half.saturating_sub(1));
@@ -78,10 +113,12 @@ pub fn analyze(
         } else {
             f32::NEG_INFINITY
         };
+        let phase_deg = phase_deg(buffer[bin]);
         harmonics.push(HarmonicRow {
             order,
             frequency_hz: bin as f64 * sample_rate_hz / len as f64,
             amplitude,
+            phase_deg,
             relative_db,
         });
     }
@@ -103,6 +140,65 @@ pub fn analyze(
     })
 }
 
+pub fn analyze_sequence(
+    group_name: String,
+    samples_a: &[f32],
+    samples_b: &[f32],
+    samples_c: &[f32],
+    sample_rate_hz: f64,
+) -> Option<SequenceResult> {
+    let sample_count = samples_a.len().min(samples_b.len()).min(samples_c.len());
+    if sample_count < 16 || sample_rate_hz <= 0.0 {
+        return None;
+    }
+
+    let buffer_a = fft_buffer(&samples_a[..sample_count]);
+    let buffer_b = fft_buffer(&samples_b[..sample_count]);
+    let buffer_c = fft_buffer(&samples_c[..sample_count]);
+    let len = buffer_a.len();
+    let half = len / 2;
+    let scale = 2.0 / sample_count as f32;
+
+    let (fundamental_index, _) = (1..half)
+        .map(|bin| (bin, buffer_a[bin].norm() * scale))
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))?;
+    let fundamental_hz = fundamental_index as f64 * sample_rate_hz / len as f64;
+
+    let va = scaled_phasor(&buffer_a, fundamental_index, sample_count);
+    let vb = scaled_phasor(&buffer_b, fundamental_index, sample_count);
+    let vc = scaled_phasor(&buffer_c, fundamental_index, sample_count);
+    let alpha = Complex::from_polar(1.0_f32, 120.0_f32.to_radians());
+    let alpha2 = Complex::from_polar(1.0_f32, 240.0_f32.to_radians());
+    let third = 1.0_f32 / 3.0_f32;
+
+    let zero = (va + vb + vc) * third;
+    let positive = (va + alpha * vb + alpha2 * vc) * third;
+    let negative = (va + alpha2 * vb + alpha * vc) * third;
+    let positive_amp = positive.norm();
+
+    let component = |name: &'static str, value: Complex<f32>| SequenceComponent {
+        name,
+        amplitude: value.norm(),
+        phase_deg: phase_deg(value),
+        percent_of_positive: if positive_amp > 0.0 {
+            value.norm() / positive_amp * 100.0
+        } else {
+            0.0
+        },
+    };
+
+    Some(SequenceResult {
+        group_name,
+        fundamental_hz,
+        phase_a_deg: phase_deg(va),
+        phase_b_deg: phase_deg(vb),
+        phase_c_deg: phase_deg(vc),
+        zero: component("Zero", zero),
+        positive: component("Positive", positive),
+        negative: component("Negative", negative),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,4 +214,3 @@ mod tests {
         assert!((result.fundamental_hz - frequency).abs() < 25.0);
     }
 }
-

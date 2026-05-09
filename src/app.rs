@@ -1,21 +1,24 @@
 use std::path::PathBuf;
 
-use eframe::egui::{self, Color32, PointerButton, RichText};
+use eframe::egui::{self, Color32, PointerButton, RichText, Stroke};
 use egui_plot::{Legend, Line, Plot, PlotPoints, VLine};
 
 use crate::{
     data::{CloudCsvDataSource, CsvDataSource, DataSource, DatasetMeta, RangeSummary, SampleBlock},
-    fft::{self, FftResult},
+    fft::{self, FftResult, SequenceResult},
 };
 
 const MAX_DRAW_POINTS: usize = 20_000;
 const MAX_FFT_POINTS: usize = 262_144;
+const ZOOM_BOX_MIN_PIXELS: f32 = 8.0;
 
 pub struct ScopeApp {
     source: Option<Box<dyn DataSource>>,
     visible: Vec<bool>,
     view_start: f64,
     view_end: f64,
+    y_min: Option<f64>,
+    y_max: Option<f64>,
     cursor_a: f64,
     cursor_b: f64,
     active_cursor: CursorId,
@@ -25,8 +28,13 @@ pub struct ScopeApp {
     plot_cache: SampleBlock,
     plot_summary: Option<RangeSummary>,
     fft_result: Option<FftResult>,
+    sequence_result: Option<SequenceResult>,
     fft_channel: usize,
+    needs_fft_reload: bool,
     needs_plot_reload: bool,
+    right_click_time: Option<f64>,
+    zoom_box_start: Option<egui::Pos2>,
+    zoom_box_current: Option<egui::Pos2>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -42,6 +50,8 @@ impl ScopeApp {
             visible: Vec::new(),
             view_start: 0.0,
             view_end: 1.0,
+            y_min: None,
+            y_max: None,
             cursor_a: 0.25,
             cursor_b: 0.75,
             active_cursor: CursorId::A,
@@ -51,8 +61,13 @@ impl ScopeApp {
             plot_cache: SampleBlock::default(),
             plot_summary: None,
             fft_result: None,
+            sequence_result: None,
             fft_channel: 0,
+            needs_fft_reload: false,
             needs_plot_reload: false,
+            right_click_time: None,
+            zoom_box_start: None,
+            zoom_box_current: None,
         }
     }
 
@@ -69,11 +84,15 @@ impl ScopeApp {
             .collect();
         self.view_start = meta.start_time;
         self.view_end = meta.end_time;
+        self.y_min = None;
+        self.y_max = None;
         let span = meta.duration();
         self.cursor_a = meta.start_time + span * 0.33;
         self.cursor_b = meta.start_time + span * 0.66;
         self.fft_channel = 0;
         self.fft_result = None;
+        self.sequence_result = None;
+        self.needs_fft_reload = true;
         self.plot_cache = SampleBlock::default();
         self.plot_summary = None;
         self.loaded_path = Some(path);
@@ -166,6 +185,51 @@ impl ScopeApp {
         self.needs_plot_reload = true;
     }
 
+    fn zoom_y(&mut self, center: f64, factor: f64) {
+        let (current_min, current_max) = self.current_y_bounds();
+        let old_span = (current_max - current_min).abs().max(f64::EPSILON);
+        let new_span = (old_span * factor).max(f64::EPSILON);
+        let ratio = ((center - current_min) / old_span).clamp(0.0, 1.0);
+        self.y_min = Some(center - ratio * new_span);
+        self.y_max = Some(center + (1.0 - ratio) * new_span);
+    }
+
+    fn current_y_bounds(&self) -> (f64, f64) {
+        if let (Some(min), Some(max)) = (self.y_min, self.y_max) {
+            if max > min {
+                return (min, max);
+            }
+        }
+
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        if let Some(summary) = &self.plot_summary {
+            for values in &summary.min {
+                for value in values {
+                    min = min.min(*value as f64);
+                }
+            }
+            for values in &summary.max {
+                for value in values {
+                    max = max.max(*value as f64);
+                }
+            }
+        } else {
+            for values in &self.plot_cache.channels {
+                for value in values {
+                    min = min.min(*value as f64);
+                    max = max.max(*value as f64);
+                }
+            }
+        }
+
+        if !min.is_finite() || !max.is_finite() || max <= min {
+            return (-1.0, 1.0);
+        }
+        let padding = ((max - min) * 0.08).max(f64::EPSILON);
+        (min - padding, max + padding)
+    }
+
     fn pan(&mut self, delta_time: f64) {
         let Some(meta) = self.meta() else {
             return;
@@ -194,6 +258,8 @@ impl ScopeApp {
             let end_time = meta.end_time;
             self.view_start = start_time;
             self.view_end = end_time;
+            self.y_min = None;
+            self.y_max = None;
             self.needs_plot_reload = true;
         }
     }
@@ -207,13 +273,47 @@ impl ScopeApp {
             CursorId::A => self.cursor_a = clamped,
             CursorId::B => self.cursor_b = clamped,
         }
+        self.needs_fft_reload = true;
+    }
+
+    fn set_cursor(&mut self, cursor: CursorId, time: f64) {
+        let Some(meta) = self.meta() else {
+            return;
+        };
+        let clamped = time.clamp(meta.start_time, meta.end_time);
+        match cursor {
+            CursorId::A => self.cursor_a = clamped,
+            CursorId::B => self.cursor_b = clamped,
+        }
+        self.needs_fft_reload = true;
+    }
+
+    fn zoom_to_range(&mut self, start: f64, end: f64) {
+        let Some(meta) = self.meta() else {
+            return;
+        };
+        let min_span = (1.0 / meta.nominal_sample_rate_hz.max(1.0)).max(f64::EPSILON);
+        let range_start = start.min(end);
+        let range_end = start.max(end);
+        let mut start = range_start.clamp(meta.start_time, meta.end_time);
+        let mut end = range_end.clamp(meta.start_time, meta.end_time);
+        if end - start < min_span {
+            let center = (start + end) * 0.5;
+            start = (center - min_span * 0.5).max(meta.start_time);
+            end = (start + min_span).min(meta.end_time);
+        }
+        if end > start {
+            self.view_start = start;
+            self.view_end = end;
+            self.needs_plot_reload = true;
+        }
     }
 
     fn run_fft(&mut self) {
-        let Some(source) = &self.source else {
+        let Some(meta) = self.meta().cloned() else {
             return;
         };
-        let channel_count = source.metadata().channels.len();
+        let channel_count = meta.channels.len();
         if channel_count == 0 {
             return;
         }
@@ -221,19 +321,89 @@ impl ScopeApp {
         self.fft_channel = fft_channel;
         let start = self.cursor_a.min(self.cursor_b);
         let end = self.cursor_a.max(self.cursor_b);
-        let channel_name = source.metadata().channels[fft_channel].name.clone();
-        let sample_rate_hz = source.metadata().channels[fft_channel].sample_rate_hz;
+        let channel_name = meta.channels[fft_channel].name.clone();
+        let sample_rate_hz = meta.channels[fft_channel].sample_rate_hz;
+        let sequence_group = self.sequence_group_for_channel(fft_channel);
+
+        let Some(source) = &self.source else {
+            return;
+        };
+        let mut next_fft = None;
+        let mut next_sequence = None;
+        let mut next_error = None;
+
         match source.read_range(start, end, &[fft_channel], MAX_FFT_POINTS) {
             Ok(block) => {
-                self.fft_result = block.channels.first().and_then(|samples| {
-                    fft::analyze(channel_name, samples, sample_rate_hz, 10)
-                });
-                if self.fft_result.is_none() {
-                    self.last_error = Some("FFT needs at least 16 samples in the cursor range.".to_owned());
+                next_fft = block
+                    .channels
+                    .first()
+                    .and_then(|samples| fft::analyze(channel_name, samples, sample_rate_hz, 10));
+
+                if let Some((group_name, group_channels)) = sequence_group {
+                    if let Ok(group_block) =
+                        source.read_range(start, end, &group_channels, MAX_FFT_POINTS)
+                    {
+                        if group_block.channels.len() == 3 {
+                            next_sequence = fft::analyze_sequence(
+                                group_name,
+                                &group_block.channels[0],
+                                &group_block.channels[1],
+                                &group_block.channels[2],
+                                sample_rate_hz,
+                            );
+                        }
+                    }
+                }
+
+                if next_fft.is_none() {
+                    next_error = Some("FFT needs at least 16 samples in the cursor range.".to_owned());
                 }
             }
-            Err(error) => self.last_error = Some(error.to_string()),
+            Err(error) => next_error = Some(error.to_string()),
         }
+
+        self.fft_result = next_fft;
+        self.sequence_result = next_sequence;
+        self.needs_fft_reload = false;
+        if let Some(error) = next_error {
+            self.last_error = Some(error);
+        } else if self
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("FFT needs"))
+        {
+            self.last_error = None;
+        }
+    }
+
+    fn sequence_group_for_channel(&self, channel: usize) -> Option<(String, [usize; 3])> {
+        let meta = self.meta()?;
+        let groups = [
+            ("Grid Voltage", ["stVg_0.iA", "stVg_0.iB", "stVg_0.iC"]),
+            ("Grid Current", ["stIg_0.iA", "stIg_0.iB", "stIg_0.iC"]),
+            ("Inverter Voltage", ["stVinv_0.iA", "stVinv_0.iB", "stVinv_0.iC"]),
+        ];
+
+        for (label, names) in groups {
+            let mut indexes = [usize::MAX; 3];
+            let mut complete = true;
+            for (slot, name) in names.iter().enumerate() {
+                if let Some(index) = meta
+                    .channels
+                    .iter()
+                    .position(|candidate| candidate.name == *name)
+                {
+                    indexes[slot] = index;
+                } else {
+                    complete = false;
+                    break;
+                }
+            }
+            if complete && indexes.contains(&channel) {
+                return Some((label.to_owned(), indexes));
+            }
+        }
+        None
     }
 
     fn channel_color(index: usize) -> Color32 {
@@ -399,6 +569,7 @@ impl ScopeApp {
             return;
         };
 
+        let mut fft_channel_changed = false;
         egui::ComboBox::from_label("Channel")
             .selected_text(
                 meta.channels
@@ -408,11 +579,21 @@ impl ScopeApp {
             )
             .show_ui(ui, |ui| {
                 for channel in &meta.channels {
-                    ui.selectable_value(&mut self.fft_channel, channel.index, &channel.name);
+                    if ui
+                        .selectable_value(&mut self.fft_channel, channel.index, &channel.name)
+                        .changed()
+                    {
+                        fft_channel_changed = true;
+                    }
                 }
             });
 
-        if ui.button("Analyze Cursor Range").clicked() {
+        if fft_channel_changed {
+            self.needs_fft_reload = true;
+        }
+
+        ui.label("Auto analyzes the cursor A-B range.");
+        if self.needs_fft_reload {
             self.run_fft();
         }
 
@@ -426,13 +607,46 @@ impl ScopeApp {
                 ui.strong("N");
                 ui.strong("Hz");
                 ui.strong("Amp");
+                ui.strong("Phase");
                 ui.strong("dBc");
                 ui.end_row();
                 for row in &result.harmonics {
                     ui.label(row.order.to_string());
                     ui.label(format!("{:.2}", row.frequency_hz));
                     ui.label(format!("{:.5}", row.amplitude));
+                    ui.label(format!("{:.2} deg", row.phase_deg));
                     ui.label(format!("{:.2}", row.relative_db));
+                    ui.end_row();
+                }
+            });
+        }
+
+        if let Some(sequence) = &self.sequence_result {
+            ui.separator();
+            ui.heading("Sequence");
+            ui.label(format!(
+                "{} | Fundamental: {:.3} Hz",
+                sequence.group_name, sequence.fundamental_hz
+            ));
+            ui.label(format!(
+                "Phase A/B/C: {:.2} deg / {:.2} deg / {:.2} deg",
+                sequence.phase_a_deg, sequence.phase_b_deg, sequence.phase_c_deg
+            ));
+            egui::Grid::new("sequence_components").striped(true).show(ui, |ui| {
+                ui.strong("Seq");
+                ui.strong("Amp");
+                ui.strong("Phase");
+                ui.strong("% Pos");
+                ui.end_row();
+                for component in [
+                    &sequence.zero,
+                    &sequence.positive,
+                    &sequence.negative,
+                ] {
+                    ui.label(component.name);
+                    ui.label(format!("{:.5}", component.amplitude));
+                    ui.label(format!("{:.2} deg", component.phase_deg));
+                    ui.label(format!("{:.2}%", component.percent_of_positive));
                     ui.end_row();
                 }
             });
@@ -445,6 +659,7 @@ impl ScopeApp {
         }
 
         let selected = self.selected_channels();
+        let (plot_y_min, plot_y_max) = self.current_y_bounds();
         let response = Plot::new("scope_plot")
             .legend(Legend::default())
             .allow_drag(false)
@@ -452,6 +667,8 @@ impl ScopeApp {
             .allow_zoom(false)
             .include_x(self.view_start)
             .include_x(self.view_end)
+            .include_y(plot_y_min)
+            .include_y(plot_y_max)
             .show(ui, |plot_ui| {
                 for (out_index, channel_index) in selected.iter().enumerate() {
                     if out_index >= self.plot_cache.channels.len() {
@@ -499,38 +716,48 @@ impl ScopeApp {
                 plot_ui.vline(VLine::new(self.cursor_a).name("A").color(Color32::WHITE));
                 plot_ui.vline(VLine::new(self.cursor_b).name("B").color(Color32::LIGHT_BLUE));
 
-                if let Some(pointer) = plot_ui.pointer_coordinate() {
-                    let (clicked, down) = plot_ui.ctx().input(|input| {
-                        (
-                            input.pointer.primary_clicked(),
-                            input.pointer.primary_down(),
-                        )
-                    });
-                    if clicked {
-                        let distance_a = (pointer.x - self.cursor_a).abs();
-                        let distance_b = (pointer.x - self.cursor_b).abs();
-                        self.active_cursor = if distance_a <= distance_b {
-                            CursorId::A
-                        } else {
-                            CursorId::B
-                        };
-                    }
-                    if down {
-                        self.move_active_cursor(pointer.x);
-                    }
-                }
             });
+
+        let hover_time = response
+            .response
+            .hover_pos()
+            .map(|pos| response.transform.value_from_position(pos).x);
+
+        if response.response.secondary_clicked() {
+            self.right_click_time = hover_time;
+        }
+        response.response.context_menu(|ui| {
+            if let Some(time) = self.right_click_time {
+                ui.label(format!("Time: {:.9}", time));
+                if ui.button("Fix Cursor A Here").clicked() {
+                    self.set_cursor(CursorId::A, time);
+                    ui.close_menu();
+                }
+                if ui.button("Fix Cursor B Here").clicked() {
+                    self.set_cursor(CursorId::B, time);
+                    ui.close_menu();
+                }
+            } else {
+                ui.label("No plot position selected.");
+            }
+        });
 
         if response.response.hovered() {
             let scroll = ui.ctx().input(|input| input.smooth_scroll_delta.y);
+            let ctrl_down = ui.ctx().input(|input| input.modifiers.ctrl);
             if scroll.abs() > 0.0 {
-                let center = response
-                    .response
-                    .hover_pos()
-                    .map(|pos| response.transform.value_from_position(pos).x)
-                    .unwrap_or((self.view_start + self.view_end) * 0.5);
                 let factor = if scroll > 0.0 { 0.80 } else { 1.25 };
-                self.zoom(center, factor);
+                if ctrl_down {
+                    let center = hover_time.unwrap_or((self.view_start + self.view_end) * 0.5);
+                    self.zoom(center, factor);
+                } else {
+                    let center = response
+                        .response
+                        .hover_pos()
+                        .map(|pos| response.transform.value_from_position(pos).y)
+                        .unwrap_or((plot_y_min + plot_y_max) * 0.5);
+                    self.zoom_y(center, factor);
+                }
             }
 
             let drag_delta = response.response.drag_delta();
@@ -538,6 +765,55 @@ impl ScopeApp {
                 let time_per_pixel = self.visible_time_span() / response.response.rect.width() as f64;
                 self.pan(-(drag_delta.x as f64) * time_per_pixel);
                 ui.ctx().request_repaint();
+            }
+        }
+
+        if response.response.clicked_by(PointerButton::Primary) {
+            if let Some(time) = hover_time {
+                let distance_a = (time - self.cursor_a).abs();
+                let distance_b = (time - self.cursor_b).abs();
+                self.active_cursor = if distance_a <= distance_b {
+                    CursorId::A
+                } else {
+                    CursorId::B
+                };
+                self.move_active_cursor(time);
+            }
+        }
+
+        if response.response.drag_started_by(PointerButton::Primary) {
+            self.zoom_box_start = response.response.interact_pointer_pos();
+            self.zoom_box_current = self.zoom_box_start;
+        }
+
+        if response.response.dragged_by(PointerButton::Primary) {
+            self.zoom_box_current = response.response.interact_pointer_pos();
+            if let (Some(start), Some(current)) = (self.zoom_box_start, self.zoom_box_current) {
+                if (current.x - start.x).abs() >= ZOOM_BOX_MIN_PIXELS {
+                    let rect = egui::Rect::from_two_pos(start, current)
+                        .intersect(response.response.rect);
+                    ui.painter().rect_filled(
+                        rect,
+                        0.0,
+                        Color32::from_rgba_premultiplied(80, 150, 255, 28),
+                    );
+                    ui.painter().rect_stroke(
+                        rect,
+                        0.0,
+                        Stroke::new(1.0, Color32::from_rgb(80, 170, 255)),
+                    );
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+
+        if response.response.drag_stopped_by(PointerButton::Primary) {
+            if let (Some(start), Some(end)) = (self.zoom_box_start.take(), self.zoom_box_current.take()) {
+                if (end.x - start.x).abs() >= ZOOM_BOX_MIN_PIXELS {
+                    let start_plot = response.transform.value_from_position(start);
+                    let end_plot = response.transform.value_from_position(end);
+                    self.zoom_to_range(start_plot.x, end_plot.x);
+                }
             }
         }
     }
