@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use eframe::egui::{self, Color32, PointerButton, RichText, Stroke};
-use egui_plot::{Legend, Line, Plot, PlotPoints, VLine};
+use egui_plot::{Legend, Line, LineStyle, Plot, PlotPoints, VLine};
 
 use crate::{
     data::{CloudCsvDataSource, CsvDataSource, DataSource, DatasetMeta, RangeSummary, SampleBlock},
@@ -32,7 +32,7 @@ pub struct ScopeApp {
     fft_channel: usize,
     needs_fft_reload: bool,
     needs_plot_reload: bool,
-    right_click_time: Option<f64>,
+    cursor_place_mode: Option<CursorId>,
     zoom_box_start: Option<egui::Pos2>,
     zoom_box_current: Option<egui::Pos2>,
 }
@@ -65,7 +65,7 @@ impl ScopeApp {
             fft_channel: 0,
             needs_fft_reload: false,
             needs_plot_reload: false,
-            right_click_time: None,
+            cursor_place_mode: None,
             zoom_box_start: None,
             zoom_box_current: None,
         }
@@ -99,6 +99,7 @@ impl ScopeApp {
         self.source = Some(source);
         self.last_error = None;
         self.needs_plot_reload = true;
+        self.cursor_place_mode = None;
     }
 
     fn open_standard_csv(&mut self, path: PathBuf) {
@@ -286,6 +287,20 @@ impl ScopeApp {
             CursorId::B => self.cursor_b = clamped,
         }
         self.needs_fft_reload = true;
+    }
+
+    fn cursor_label(cursor: CursorId) -> &'static str {
+        match cursor {
+            CursorId::A => "A",
+            CursorId::B => "B",
+        }
+    }
+
+    fn cursor_color(cursor: CursorId) -> Color32 {
+        match cursor {
+            CursorId::A => Color32::WHITE,
+            CursorId::B => Color32::LIGHT_BLUE,
+        }
     }
 
     fn zoom_to_range(&mut self, start: f64, end: f64) {
@@ -534,6 +549,12 @@ impl ScopeApp {
         if dt > 0.0 {
             ui.label(format!("1/dt: {:.3} Hz", 1.0 / dt));
         }
+        if let Some(cursor) = self.cursor_place_mode {
+            ui.label(format!(
+                "Placing cursor {}: click waveform to fix, Esc to cancel.",
+                Self::cursor_label(cursor)
+            ));
+        }
         ui.separator();
 
         let Some(source) = &self.source else {
@@ -716,6 +737,18 @@ impl ScopeApp {
                 plot_ui.vline(VLine::new(self.cursor_a).name("A").color(Color32::WHITE));
                 plot_ui.vline(VLine::new(self.cursor_b).name("B").color(Color32::LIGHT_BLUE));
 
+                if let (Some(cursor), Some(pointer)) =
+                    (self.cursor_place_mode, plot_ui.pointer_coordinate())
+                {
+                    plot_ui.vline(
+                        VLine::new(pointer.x)
+                            .name(format!("Place {}", Self::cursor_label(cursor)))
+                            .color(Self::cursor_color(cursor))
+                            .style(LineStyle::Dashed { length: 6.0 })
+                            .width(1.5),
+                    );
+                }
+
             });
 
         let hover_time = response
@@ -723,24 +756,30 @@ impl ScopeApp {
             .hover_pos()
             .map(|pos| response.transform.value_from_position(pos).x);
 
-        if response.response.secondary_clicked() {
-            self.right_click_time = hover_time;
-        }
         response.response.context_menu(|ui| {
-            if let Some(time) = self.right_click_time {
-                ui.label(format!("Time: {:.9}", time));
-                if ui.button("Fix Cursor A Here").clicked() {
-                    self.set_cursor(CursorId::A, time);
-                    ui.close_menu();
-                }
-                if ui.button("Fix Cursor B Here").clicked() {
-                    self.set_cursor(CursorId::B, time);
-                    ui.close_menu();
-                }
-            } else {
-                ui.label("No plot position selected.");
+            if ui.button("Place Cursor A").clicked() {
+                self.cursor_place_mode = Some(CursorId::A);
+                self.zoom_box_start = None;
+                self.zoom_box_current = None;
+                ui.close_menu();
+            }
+            if ui.button("Place Cursor B").clicked() {
+                self.cursor_place_mode = Some(CursorId::B);
+                self.zoom_box_start = None;
+                self.zoom_box_current = None;
+                ui.close_menu();
+            }
+            if self.cursor_place_mode.is_some() && ui.button("Cancel Placement").clicked() {
+                self.cursor_place_mode = None;
+                ui.close_menu();
             }
         });
+
+        if ui.ctx().input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.cursor_place_mode = None;
+            self.zoom_box_start = None;
+            self.zoom_box_current = None;
+        }
 
         if response.response.hovered() {
             let scroll = ui.ctx().input(|input| input.smooth_scroll_delta.y);
@@ -770,23 +809,28 @@ impl ScopeApp {
 
         if response.response.clicked_by(PointerButton::Primary) {
             if let Some(time) = hover_time {
-                let distance_a = (time - self.cursor_a).abs();
-                let distance_b = (time - self.cursor_b).abs();
-                self.active_cursor = if distance_a <= distance_b {
-                    CursorId::A
+                if let Some(cursor) = self.cursor_place_mode.take() {
+                    self.active_cursor = cursor;
+                    self.set_cursor(cursor, time);
                 } else {
-                    CursorId::B
-                };
-                self.move_active_cursor(time);
+                    let distance_a = (time - self.cursor_a).abs();
+                    let distance_b = (time - self.cursor_b).abs();
+                    self.active_cursor = if distance_a <= distance_b {
+                        CursorId::A
+                    } else {
+                        CursorId::B
+                    };
+                    self.move_active_cursor(time);
+                }
             }
         }
 
-        if response.response.drag_started_by(PointerButton::Primary) {
+        if self.cursor_place_mode.is_none() && response.response.drag_started_by(PointerButton::Primary) {
             self.zoom_box_start = response.response.interact_pointer_pos();
             self.zoom_box_current = self.zoom_box_start;
         }
 
-        if response.response.dragged_by(PointerButton::Primary) {
+        if self.cursor_place_mode.is_none() && response.response.dragged_by(PointerButton::Primary) {
             self.zoom_box_current = response.response.interact_pointer_pos();
             if let (Some(start), Some(current)) = (self.zoom_box_start, self.zoom_box_current) {
                 if (current.x - start.x).abs() >= ZOOM_BOX_MIN_PIXELS {
@@ -807,7 +851,7 @@ impl ScopeApp {
             }
         }
 
-        if response.response.drag_stopped_by(PointerButton::Primary) {
+        if self.cursor_place_mode.is_none() && response.response.drag_stopped_by(PointerButton::Primary) {
             if let (Some(start), Some(end)) = (self.zoom_box_start.take(), self.zoom_box_current.take()) {
                 if (end.x - start.x).abs() >= ZOOM_BOX_MIN_PIXELS {
                     let start_plot = response.transform.value_from_position(start);
