@@ -15,6 +15,7 @@ use crate::{
 
 const MAX_DRAW_POINTS: usize = 20_000;
 const MAX_FFT_POINTS: usize = 262_144;
+const MAX_AUTO_MEASURE_POINTS: usize = 131_072;
 const ZOOM_BOX_MIN_PIXELS: f32 = 8.0;
 const CONFIG_VERSION: u32 = 1;
 const DEFAULT_WHEEL_ZOOM_SENSITIVITY: f64 = 0.125;
@@ -53,6 +54,26 @@ struct AppConfig {
     language: Language,
 }
 
+#[derive(Clone, Debug)]
+struct AutoMeasurement {
+    first: f32,
+    last: f32,
+    min: f32,
+    max: f32,
+    peak_to_peak: f32,
+    mean: f32,
+    rms: f32,
+    frequency_hz: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+struct MeasurementCache {
+    start: f64,
+    end: f64,
+    channels: Vec<usize>,
+    rows: Vec<(usize, AutoMeasurement)>,
+}
+
 pub struct ScopeApp {
     source: Option<Box<dyn DataSource>>,
     source_kind: Option<SourceKind>,
@@ -80,6 +101,7 @@ pub struct ScopeApp {
     plot_summary: Option<RangeSummary>,
     fft_result: Option<FftResult>,
     sequence_result: Option<SequenceResult>,
+    measurement_cache: Option<MeasurementCache>,
     fft_channel: usize,
     needs_fft_reload: bool,
     needs_plot_reload: bool,
@@ -138,6 +160,7 @@ impl ScopeApp {
             plot_summary: None,
             fft_result: None,
             sequence_result: None,
+            measurement_cache: None,
             fft_channel: 0,
             needs_fft_reload: false,
             needs_plot_reload: false,
@@ -176,6 +199,7 @@ impl ScopeApp {
         self.fft_channel = 0;
         self.fft_result = None;
         self.sequence_result = None;
+        self.measurement_cache = None;
         self.needs_fft_reload = true;
         self.plot_cache = SampleBlock::default();
         self.plot_summary = None;
@@ -535,6 +559,7 @@ impl ScopeApp {
                 self.show_cursor_b = true;
             }
         }
+        self.measurement_cache = None;
         self.needs_fft_reload = true;
     }
 
@@ -553,6 +578,7 @@ impl ScopeApp {
                 self.show_cursor_b = true;
             }
         }
+        self.measurement_cache = None;
         self.needs_fft_reload = true;
     }
 
@@ -840,6 +866,7 @@ impl ScopeApp {
                         ui.label("隐藏/显示光标 A/B：只切换显示状态，不改变光标位置和测量结果。");
                         ui.label("右键拖拽波形：平移当前视图。");
                         ui.label("适配光标：缩放到光标 A/B 的时间范围。");
+                        ui.label("自动测量：右侧光标面板会对 A/B 区间内的已选通道显示 yA/yB/dy、峰峰值、RMS、平均值、最大/最小值和频率估算。");
 
                         ui.separator();
                         ui.heading("FFT、THD 和序分量");
@@ -885,6 +912,7 @@ impl ScopeApp {
                         ui.label("Hide/Show Cursor A/B: toggles cursor visibility without changing cursor position or measurements.");
                         ui.label("Right drag plot: pan the current view.");
                         ui.label("Fit Cursors: zoom to the time range between cursor A and cursor B.");
+                        ui.label("Auto measurements: the right cursor panel shows yA/yB/dy, peak-to-peak, RMS, average, min/max, and estimated frequency for selected channels in the A-B range.");
 
                         ui.separator();
                         ui.heading("FFT, THD, and Sequence");
@@ -985,6 +1013,99 @@ impl ScopeApp {
 
     fn ctrl_zoom_factor(&self, zoom_delta: f32) -> f64 {
         (zoom_delta as f64).powf(-self.wheel_zoom_sensitivity * 4.0)
+    }
+
+    fn auto_measure(times: &[f64], samples: &[f32]) -> Option<AutoMeasurement> {
+        if times.len() < 2 || samples.len() < 2 {
+            return None;
+        }
+        let sample_count = times.len().min(samples.len());
+        let samples = &samples[..sample_count];
+        let mut min = f32::INFINITY;
+        let mut max = f32::NEG_INFINITY;
+        let mut sum = 0.0_f64;
+        let mut sum_squares = 0.0_f64;
+
+        for &sample in samples {
+            min = min.min(sample);
+            max = max.max(sample);
+            let sample = sample as f64;
+            sum += sample;
+            sum_squares += sample * sample;
+        }
+
+        if !min.is_finite() || !max.is_finite() {
+            return None;
+        }
+
+        let mean = sum / sample_count as f64;
+        let rms = (sum_squares / sample_count as f64).sqrt();
+        let frequency_hz = Self::estimate_frequency(&times[..sample_count], samples, mean as f32);
+
+        Some(AutoMeasurement {
+            first: samples[0],
+            last: samples[sample_count - 1],
+            min,
+            max,
+            peak_to_peak: max - min,
+            mean: mean as f32,
+            rms: rms as f32,
+            frequency_hz,
+        })
+    }
+
+    fn estimate_frequency(times: &[f64], samples: &[f32], threshold: f32) -> Option<f64> {
+        if times.len() < 3 || samples.len() < 3 {
+            return None;
+        }
+
+        let amplitude = samples
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), &sample| {
+                (min.min(sample), max.max(sample))
+            });
+        if amplitude.1 - amplitude.0 <= f32::EPSILON {
+            return None;
+        }
+
+        let mut crossings = Vec::new();
+        for index in 1..times.len().min(samples.len()) {
+            let previous = samples[index - 1];
+            let current = samples[index];
+            if previous < threshold && current >= threshold && current > previous {
+                let fraction = ((threshold - previous) / (current - previous)).clamp(0.0, 1.0);
+                let time = times[index - 1] + (times[index] - times[index - 1]) * fraction as f64;
+                let is_new_crossing = match crossings.last() {
+                    Some(last) => (time - *last).abs() > f64::EPSILON,
+                    None => true,
+                };
+                if is_new_crossing {
+                    crossings.push(time);
+                }
+            }
+        }
+
+        if crossings.len() < 2 {
+            return None;
+        }
+        let mut period_sum = 0.0_f64;
+        let mut period_count = 0_usize;
+        for pair in crossings.windows(2) {
+            let period = pair[1] - pair[0];
+            if period.is_finite() && period > 0.0 {
+                period_sum += period;
+                period_count += 1;
+            }
+        }
+        if period_count == 0 {
+            return None;
+        }
+        let average_period = period_sum / period_count as f64;
+        if average_period > 0.0 {
+            Some(1.0 / average_period)
+        } else {
+            None
+        }
     }
 
     fn channel_panel(&mut self, ui: &mut egui::Ui) {
@@ -1099,38 +1220,103 @@ impl ScopeApp {
         }
         ui.separator();
 
-        let Some(source) = &self.source else {
+        if self.source.is_none() {
             return;
-        };
+        }
         let channels = self.selected_channels();
         if channels.is_empty() {
             return;
         }
+        let measurement_channels = channels.iter().copied().take(12).collect::<Vec<_>>();
         let start = self.cursor_a.min(self.cursor_b);
         let end = self.cursor_a.max(self.cursor_b);
-        if let Ok(block) = source.read_range(start, end, &channels, 2) {
-            for (out_index, &channel_index) in channels.iter().enumerate().take(12) {
-                let values = &block.channels[out_index];
-                if let (Some(first), Some(last)) = (values.first(), values.last()) {
-                    let name = self.channel_name(channel_index);
-                    let text = format!(
-                        "{}  yA={:.5}  yB={:.5}  dy={:.5}",
-                        name,
-                        first,
-                        last,
-                        last - first
-                    );
-                    if self.hovered_channel == Some(channel_index) {
-                        ui.label(
-                            RichText::new(text)
-                                .strong()
-                                .color(Self::channel_color(channel_index))
-                                .background_color(Color32::from_rgba_premultiplied(255, 240, 160, 80)),
-                        );
-                    } else {
-                        ui.label(text);
+        ui.strong(self.tr("自动测量（A-B）", "Auto Measurements (A-B)"));
+
+        let cache_matches = match &self.measurement_cache {
+            Some(cache) => {
+                cache.start == start && cache.end == end && cache.channels == measurement_channels
+            }
+            None => false,
+        };
+        if !cache_matches {
+            let mut rows = Vec::new();
+            if let Some(source) = self.source.as_ref() {
+                if let Ok(block) =
+                    source.read_range(start, end, &measurement_channels, MAX_AUTO_MEASURE_POINTS)
+                {
+                    for (out_index, &channel_index) in measurement_channels.iter().enumerate() {
+                        let Some(values) = block.channels.get(out_index) else {
+                            continue;
+                        };
+                        if let Some(measurement) = Self::auto_measure(&block.times, values) {
+                            rows.push((channel_index, measurement));
+                        }
                     }
                 }
+            }
+            self.measurement_cache = Some(MeasurementCache {
+                start,
+                end,
+                channels: measurement_channels,
+                rows,
+            });
+        }
+
+        let Some(cache) = &self.measurement_cache else {
+            return;
+        };
+        for (channel_index, measurement) in &cache.rows {
+            let name = self.channel_name(*channel_index);
+            let cursor_text = format!(
+                "{}  yA={:.5}  yB={:.5}  dy={:.5}",
+                name,
+                measurement.first,
+                measurement.last,
+                measurement.last - measurement.first
+            );
+            let frequency_text = measurement
+                .frequency_hz
+                .map(|frequency| format!("{frequency:.3} Hz"))
+                .unwrap_or_else(|| "--".to_owned());
+            let stats_text = if self.language == Language::Zh {
+                format!(
+                    "峰峰={:.5}  RMS={:.5}  平均={:.5}  最小={:.5}  最大={:.5}  频率={}",
+                    measurement.peak_to_peak,
+                    measurement.rms,
+                    measurement.mean,
+                    measurement.min,
+                    measurement.max,
+                    frequency_text
+                )
+            } else {
+                format!(
+                    "pp={:.5}  rms={:.5}  avg={:.5}  min={:.5}  max={:.5}  f={}",
+                    measurement.peak_to_peak,
+                    measurement.rms,
+                    measurement.mean,
+                    measurement.min,
+                    measurement.max,
+                    frequency_text
+                )
+            };
+            if self.hovered_channel == Some(*channel_index) {
+                let color = Self::channel_color(*channel_index);
+                let background = Color32::from_rgba_premultiplied(255, 240, 160, 80);
+                ui.label(
+                    RichText::new(cursor_text)
+                        .strong()
+                        .color(color)
+                        .background_color(background),
+                );
+                ui.label(
+                    RichText::new(stats_text)
+                        .strong()
+                        .color(color)
+                        .background_color(background),
+                );
+            } else {
+                ui.label(cursor_text);
+                ui.label(RichText::new(stats_text).small());
             }
         }
     }
