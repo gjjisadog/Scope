@@ -36,17 +36,73 @@ impl CsvDataSource {
             .collect()
     }
 
-    fn parse_sample(line: &str, channel_count: usize) -> Option<(f64, Vec<f32>)> {
+    fn parse_sample(line: &str, channel_count: usize) -> Result<(f64, Vec<f32>), String> {
         let mut parts = line.trim_end().split(',');
-        let time = parts.next()?.trim().parse::<f64>().ok()?;
+        let Some(raw_time) = parts.next() else {
+            return Err("字段不足：缺少时间列".to_owned());
+        };
+        let time = raw_time
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| format!("时间列不是有效数字：{}", raw_time.trim()))?;
         let mut values = Vec::with_capacity(channel_count);
-        for raw in parts.take(channel_count) {
-            values.push(raw.trim().parse::<f32>().unwrap_or(f32::NAN));
+        for (index, raw) in parts.take(channel_count).enumerate() {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                values.push(f32::NAN);
+            } else {
+                values.push(
+                    raw.parse::<f32>()
+                        .map_err(|_| format!("第 {} 个通道值不是有效数字：{raw}", index + 1))?,
+                );
+            }
         }
         if values.len() == channel_count {
-            Some((time, values))
+            Ok((time, values))
         } else {
-            None
+            Err(format!(
+                "字段不足：需要 {channel_count} 个通道值，实际只有 {} 个",
+                values.len()
+            ))
+        }
+    }
+
+    fn parse_time(line: &str) -> Result<f64, String> {
+        let Some(raw_time) = line.trim_end().split(',').next() else {
+            return Err("字段不足：缺少时间列".to_owned());
+        };
+        raw_time
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| format!("时间列不是有效数字：{}", raw_time.trim()))
+    }
+
+    fn parse_selected_values(
+        line: &str,
+        channel_count: usize,
+        channels: &[usize],
+    ) -> Result<Vec<f32>, String> {
+        let mut selected = vec![f32::NAN; channels.len()];
+        let mut found = vec![false; channels.len()];
+        let mut parts = line.trim_end().split(',');
+        parts.next();
+        for (index, raw) in parts.take(channel_count).enumerate() {
+            let Some(out_index) = channels.iter().position(|channel| *channel == index) else {
+                continue;
+            };
+            let raw = raw.trim();
+            selected[out_index] = if raw.is_empty() {
+                f32::NAN
+            } else {
+                raw.parse::<f32>()
+                    .map_err(|_| format!("第 {} 个通道值不是有效数字：{raw}", index + 1))?
+            };
+            found[out_index] = true;
+        }
+        if found.iter().all(|present| *present) {
+            Ok(selected)
+        } else {
+            Err("字段不足：请求的通道列不存在或数据列不足".to_owned())
         }
     }
 
@@ -93,6 +149,9 @@ impl DataSource for CsvDataSource {
         let mut blocks = Vec::new();
         let mut current: Option<BlockIndex> = None;
         let mut row_count = 0_u64;
+        let mut skipped_rows = 0_u64;
+        let mut first_parse_error: Option<String> = None;
+        let mut line_number = 1_u64;
         let mut first_time: Option<f64> = None;
         let mut last_time: Option<f64> = None;
         let mut previous_time: Option<f64> = None;
@@ -106,8 +165,15 @@ impl DataSource for CsvDataSource {
             if bytes == 0 {
                 break;
             }
-            let Some((time, values)) = Self::parse_sample(&line, channel_count) else {
-                continue;
+            line_number += 1;
+            let (time, values) = match Self::parse_sample(&line, channel_count) {
+                Ok(sample) => sample,
+                Err(error) => {
+                    skipped_rows += 1;
+                    first_parse_error
+                        .get_or_insert_with(|| format!("第 {line_number} 行：{error}"));
+                    continue;
+                }
             };
 
             if let Some(prev) = previous_time {
@@ -157,6 +223,11 @@ impl DataSource for CsvDataSource {
         }
 
         if row_count == 0 {
+            if let Some(error) = first_parse_error {
+                return Err(DataError::Csv(format!(
+                    "没有解析到有效数据行；跳过 {skipped_rows} 行。第一条错误：{error}"
+                )));
+            }
             return Err(DataError::Empty);
         }
 
@@ -232,8 +303,11 @@ impl DataSource for CsvDataSource {
             ((end_time - start_time) * self.meta.nominal_sample_rate_hz).max(1.0) as usize;
         let stride = (estimated_points / max_points.max(1)).max(1);
         let mut seen = 0_usize;
-        let mut times = Vec::new();
-        let mut channel_values = vec![Vec::new(); channels.len()];
+        let capacity = estimated_points.min(max_points.max(1)) + 1;
+        let mut times = Vec::with_capacity(capacity);
+        let mut channel_values = (0..channels.len())
+            .map(|_| Vec::with_capacity(capacity))
+            .collect::<Vec<_>>();
 
         loop {
             let mut line = String::new();
@@ -241,7 +315,7 @@ impl DataSource for CsvDataSource {
             if bytes == 0 {
                 break;
             }
-            let Some((time, values)) = Self::parse_sample(&line, self.meta.channels.len()) else {
+            let Ok(time) = Self::parse_time(&line) else {
                 continue;
             };
             if time < start_time {
@@ -251,9 +325,14 @@ impl DataSource for CsvDataSource {
                 break;
             }
             if seen % stride == 0 {
+                let Ok(values) =
+                    Self::parse_selected_values(&line, self.meta.channels.len(), channels)
+                else {
+                    continue;
+                };
                 times.push(time);
-                for (out_index, &channel) in channels.iter().enumerate() {
-                    channel_values[out_index].push(values[channel]);
+                for (out_index, value) in values.iter().enumerate() {
+                    channel_values[out_index].push(*value);
                 }
             }
             seen += 1;
@@ -286,10 +365,15 @@ impl DataSource for CsvDataSource {
         let last = self.find_block_for_time(end_time);
         let block_count = last.saturating_sub(first) + 1;
         let group = (block_count / target_bins.max(1)).max(1);
-        let mut bin_start = Vec::new();
-        let mut bin_end = Vec::new();
-        let mut mins = vec![Vec::new(); channels.len()];
-        let mut maxs = vec![Vec::new(); channels.len()];
+        let capacity = target_bins.min(block_count).max(1);
+        let mut bin_start = Vec::with_capacity(capacity);
+        let mut bin_end = Vec::with_capacity(capacity);
+        let mut mins = (0..channels.len())
+            .map(|_| Vec::with_capacity(capacity))
+            .collect::<Vec<_>>();
+        let mut maxs = (0..channels.len())
+            .map(|_| Vec::with_capacity(capacity))
+            .collect::<Vec<_>>();
 
         let mut index = first;
         while index <= last {

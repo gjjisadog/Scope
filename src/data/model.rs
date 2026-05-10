@@ -6,17 +6,17 @@ pub type DataResult<T> = Result<T, DataError>;
 
 #[derive(Debug, Error)]
 pub enum DataError {
-    #[error("I/O error: {0}")]
+    #[error("文件读写错误：{0}")]
     Io(#[from] std::io::Error),
-    #[error("CSV format error: {0}")]
+    #[error("CSV 格式错误：{0}")]
     Csv(String),
-    #[error("No numeric channels were found")]
+    #[error("字段不足：没有找到数值通道。请确认第一行包含时间列和至少 1 个通道列。")]
     NoChannels,
-    #[error("The file contains no samples")]
+    #[error("空文件或没有有效采样点。请确认文件不是空文件，且数据行格式正确。")]
     Empty,
-    #[error("Requested channel index is out of range")]
+    #[error("通道索引超出范围。当前文件的通道数量少于请求的通道。")]
     BadChannel,
-    #[error("This file format is not implemented yet: {0}")]
+    #[error("暂不支持该文件格式：{0}")]
     UnsupportedFormat(String),
 }
 
