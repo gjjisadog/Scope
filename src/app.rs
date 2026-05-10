@@ -1,7 +1,12 @@
-use std::{fs::File, io::{BufRead, BufReader}, path::{Path, PathBuf}};
+use std::{
+    fs::File,
+    io::{BufRead, BufReader},
+    path::{Path, PathBuf},
+};
 
 use eframe::egui::{self, Color32, PointerButton, RichText, Stroke};
 use egui_plot::{Line, LineStyle, Plot, PlotBounds, PlotPoint, PlotPoints, Text, VLine};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     data::{CloudCsvDataSource, CsvDataSource, DataSource, DatasetMeta, RangeSummary, SampleBlock},
@@ -11,9 +16,46 @@ use crate::{
 const MAX_DRAW_POINTS: usize = 20_000;
 const MAX_FFT_POINTS: usize = 262_144;
 const ZOOM_BOX_MIN_PIXELS: f32 = 8.0;
+const CONFIG_VERSION: u32 = 1;
+const DEFAULT_WHEEL_ZOOM_SENSITIVITY: f64 = 0.125;
+const MIN_WHEEL_ZOOM_SENSITIVITY: f64 = 0.025;
+const MAX_WHEEL_ZOOM_SENSITIVITY: f64 = 0.40;
+
+fn default_sample_rate_hz() -> f64 {
+    1000.0
+}
+
+fn default_wheel_zoom_sensitivity() -> f64 {
+    DEFAULT_WHEEL_ZOOM_SENSITIVITY
+}
+
+fn default_language() -> Language {
+    Language::Zh
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+enum Language {
+    Zh,
+    En,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AppConfig {
+    version: u32,
+    display_names: Vec<String>,
+    visible: Vec<bool>,
+    fft_channel: usize,
+    #[serde(default = "default_wheel_zoom_sensitivity")]
+    wheel_zoom_sensitivity: f64,
+    #[serde(default = "default_sample_rate_hz")]
+    sample_rate_hz: f64,
+    #[serde(default = "default_language")]
+    language: Language,
+}
 
 pub struct ScopeApp {
     source: Option<Box<dyn DataSource>>,
+    source_kind: Option<SourceKind>,
     visible: Vec<bool>,
     display_names: Vec<String>,
     hovered_channel: Option<usize>,
@@ -30,6 +72,8 @@ pub struct ScopeApp {
     show_help: bool,
     show_options: bool,
     wheel_zoom_sensitivity: f64,
+    sample_rate_hz: f64,
+    language: Language,
     last_error: Option<String>,
     loaded_path: Option<PathBuf>,
     plot_cache: SampleBlock,
@@ -50,10 +94,26 @@ enum CursorId {
     B,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourceKind {
+    Cloud,
+    Local,
+}
+
+impl Language {
+    fn label(self) -> &'static str {
+        match self {
+            Language::Zh => "中文",
+            Language::En => "English",
+        }
+    }
+}
+
 impl ScopeApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self {
             source: None,
+            source_kind: None,
             visible: Vec::new(),
             display_names: Vec::new(),
             hovered_channel: None,
@@ -69,7 +129,9 @@ impl ScopeApp {
             channel_filter: String::new(),
             show_help: false,
             show_options: false,
-            wheel_zoom_sensitivity: 0.25,
+            wheel_zoom_sensitivity: DEFAULT_WHEEL_ZOOM_SENSITIVITY,
+            sample_rate_hz: default_sample_rate_hz(),
+            language: default_language(),
             last_error: None,
             loaded_path: None,
             plot_cache: SampleBlock::default(),
@@ -89,7 +151,7 @@ impl ScopeApp {
         self.source.as_ref().map(|source| source.metadata())
     }
 
-    fn set_source(&mut self, source: Box<dyn DataSource>, path: PathBuf) {
+    fn set_source(&mut self, source: Box<dyn DataSource>, path: PathBuf, kind: SourceKind) {
         let meta = source.metadata().clone();
         self.visible = meta
             .channels
@@ -119,6 +181,7 @@ impl ScopeApp {
         self.plot_summary = None;
         self.loaded_path = Some(path);
         self.source = Some(source);
+        self.source_kind = Some(kind);
         self.last_error = None;
         self.needs_plot_reload = true;
         self.cursor_place_mode = None;
@@ -126,14 +189,14 @@ impl ScopeApp {
 
     fn open_standard_csv(&mut self, path: PathBuf) {
         match CsvDataSource::open(&path) {
-            Ok(source) => self.set_source(Box::new(source), path),
+            Ok(source) => self.set_source(Box::new(source), path, SourceKind::Local),
             Err(error) => self.last_error = Some(error.to_string()),
         }
     }
 
     fn open_cloud_csv(&mut self, path: PathBuf) {
-        match CloudCsvDataSource::open(&path) {
-            Ok(source) => self.set_source(Box::new(source), path),
+        match CloudCsvDataSource::open_with_sample_rate(&path, self.sample_rate_hz) {
+            Ok(source) => self.set_source(Box::new(source), path, SourceKind::Cloud),
             Err(error) => self.last_error = Some(error.to_string()),
         }
     }
@@ -165,6 +228,134 @@ impl ScopeApp {
             .trim()
             .trim_matches('"');
         Ok(first_column.eq_ignore_ascii_case("Content"))
+    }
+
+    fn current_config(&self) -> AppConfig {
+        AppConfig {
+            version: CONFIG_VERSION,
+            display_names: self.display_names.clone(),
+            visible: self.visible.clone(),
+            fft_channel: self.fft_channel,
+            wheel_zoom_sensitivity: self.wheel_zoom_sensitivity,
+            sample_rate_hz: self.sample_rate_hz,
+            language: self.language,
+        }
+    }
+
+    fn apply_config(&mut self, config: AppConfig) {
+        self.language = config.language;
+        let channel_count = self.display_names.len();
+        for (index, name) in config.display_names.into_iter().enumerate().take(channel_count) {
+            self.display_names[index] = name;
+        }
+        for (index, visible) in config.visible.into_iter().enumerate().take(self.visible.len()) {
+            self.visible[index] = visible;
+        }
+        if channel_count > 0 {
+            self.fft_channel = config.fft_channel.min(channel_count - 1);
+        }
+        self.wheel_zoom_sensitivity = config
+            .wheel_zoom_sensitivity
+            .clamp(MIN_WHEEL_ZOOM_SENSITIVITY, MAX_WHEEL_ZOOM_SENSITIVITY);
+        self.sample_rate_hz = config.sample_rate_hz.clamp(1.0, 10_000_000.0);
+        self.hovered_channel = None;
+        self.needs_plot_reload = true;
+        self.needs_fft_reload = true;
+    }
+
+    fn reload_cloud_with_current_sample_rate(&mut self) {
+        if self.source_kind != Some(SourceKind::Cloud) {
+            self.needs_fft_reload = true;
+            return;
+        }
+        let Some(path) = self.loaded_path.clone() else {
+            return;
+        };
+        let config = self.current_config();
+        match CloudCsvDataSource::open_with_sample_rate(&path, self.sample_rate_hz) {
+            Ok(source) => {
+                self.set_source(Box::new(source), path, SourceKind::Cloud);
+                self.apply_config(config);
+            }
+            Err(error) => self.last_error = Some(error.to_string()),
+        }
+    }
+
+    fn export_config(&mut self) {
+        if self.display_names.is_empty() {
+            self.last_error = Some(
+                self.tr(
+                    "请先打开波形 CSV，再导出配置。",
+                    "Open a waveform CSV before exporting config.",
+                )
+                .to_owned(),
+            );
+            return;
+        }
+        let filter_name = self.tr("Scope 配置", "Scope config");
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(filter_name, &["json"])
+            .set_file_name("scope-config.json")
+            .save_file()
+        else {
+            return;
+        };
+        match serde_json::to_string_pretty(&self.current_config()) {
+            Ok(json) => {
+                if let Err(error) = std::fs::write(&path, json) {
+                    self.last_error = Some(match self.language {
+                        Language::Zh => format!("导出配置失败: {error}"),
+                        Language::En => format!("Failed to export config: {error}"),
+                    });
+                }
+            }
+            Err(error) => {
+                self.last_error = Some(match self.language {
+                    Language::Zh => format!("序列化配置失败: {error}"),
+                    Language::En => format!("Failed to serialize config: {error}"),
+                });
+            }
+        }
+    }
+
+    fn import_config(&mut self) {
+        if self.display_names.is_empty() {
+            self.last_error = Some(
+                self.tr(
+                    "请先打开波形 CSV，再导入配置。",
+                    "Open a waveform CSV before importing config.",
+                )
+                .to_owned(),
+            );
+            return;
+        }
+        let filter_name = self.tr("Scope 配置", "Scope config");
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(filter_name, &["json"])
+            .pick_file()
+        else {
+            return;
+        };
+        let old_sample_rate = self.sample_rate_hz;
+        match std::fs::read_to_string(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|text| serde_json::from_str::<AppConfig>(&text).map_err(|error| error.to_string()))
+        {
+            Ok(config) => {
+                self.apply_config(config);
+                if self.source_kind == Some(SourceKind::Cloud)
+                    && (self.sample_rate_hz - old_sample_rate).abs() > f64::EPSILON
+                {
+                    self.reload_cloud_with_current_sample_rate();
+                }
+            }
+            Err(error) => {
+                self.last_error = Some(match self.language {
+                    Language::Zh => format!("导入配置失败: {error}"),
+                    Language::En => format!("Failed to import config: {error}"),
+                });
+            }
+        }
     }
 
     fn selected_channels(&self) -> Vec<usize> {
@@ -422,7 +613,7 @@ impl ScopeApp {
         let start = self.cursor_a.min(self.cursor_b);
         let end = self.cursor_a.max(self.cursor_b);
         let channel_name = self.channel_name(fft_channel);
-        let sample_rate_hz = meta.channels[fft_channel].sample_rate_hz;
+        let sample_rate_hz = self.sample_rate_hz.max(1.0);
         let sequence_group = self.sequence_group_for_channel(fft_channel);
 
         let Some(source) = &self.source else {
@@ -456,7 +647,13 @@ impl ScopeApp {
                 }
 
                 if next_fft.is_none() {
-                    next_error = Some("FFT needs at least 16 samples in the cursor range.".to_owned());
+                    next_error = Some(
+                        self.tr(
+                            "FFT 需要光标区间内至少 16 个样本。",
+                            "FFT needs at least 16 samples in the cursor range.",
+                        )
+                        .to_owned(),
+                    );
                 }
             }
             Err(error) => next_error = Some(error.to_string()),
@@ -470,7 +667,9 @@ impl ScopeApp {
         } else if self
             .last_error
             .as_deref()
-            .is_some_and(|error| error.starts_with("FFT needs"))
+            .is_some_and(|error| {
+                error.starts_with("FFT needs") || error.starts_with("FFT 需要")
+            })
         {
             self.last_error = None;
         }
@@ -479,9 +678,18 @@ impl ScopeApp {
     fn sequence_group_for_channel(&self, channel: usize) -> Option<(String, [usize; 3])> {
         let meta = self.meta()?;
         let groups = [
-            ("Grid Voltage", ["stVg_0.iA", "stVg_0.iB", "stVg_0.iC"]),
-            ("Grid Current", ["stIg_0.iA", "stIg_0.iB", "stIg_0.iC"]),
-            ("Inverter Voltage", ["stVinv_0.iA", "stVinv_0.iB", "stVinv_0.iC"]),
+            (
+                self.tr("电网电压", "Grid Voltage"),
+                ["stVg_0.iA", "stVg_0.iB", "stVg_0.iC"],
+            ),
+            (
+                self.tr("电网电流", "Grid Current"),
+                ["stIg_0.iA", "stIg_0.iB", "stIg_0.iC"],
+            ),
+            (
+                self.tr("逆变电压", "Inverter Voltage"),
+                ["stVinv_0.iA", "stVinv_0.iB", "stVinv_0.iC"],
+            ),
         ];
 
         for (label, names) in groups {
@@ -524,122 +732,247 @@ impl ScopeApp {
         COLORS[index % COLORS.len()]
     }
 
+    fn tr(&self, zh: &'static str, en: &'static str) -> &'static str {
+        match self.language {
+            Language::Zh => zh,
+            Language::En => en,
+        }
+    }
+
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if ui.button("Open CSV").clicked() {
+            if ui.button(self.tr("打开 CSV", "Open CSV")).clicked() {
+                let filter_name = self.tr("波形 CSV", "Waveform CSV");
                 if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Waveform CSV", &["csv"])
+                    .add_filter(filter_name, &["csv"])
                     .pick_file()
                 {
                     self.open_auto_csv(path);
                 }
             }
-            if ui.button("Reset View").clicked() {
+            if ui.button(self.tr("重置视图", "Reset View")).clicked() {
                 self.reset_view();
             }
-            if ui.button("Fit Cursors").clicked() {
+            if ui.button(self.tr("适配光标", "Fit Cursors")).clicked() {
                 self.view_start = self.cursor_a.min(self.cursor_b);
                 self.view_end = self.cursor_a.max(self.cursor_b);
                 self.needs_plot_reload = true;
             }
-            if ui.button("Help").clicked() {
+            if ui.button(self.tr("导入配置", "Import Config")).clicked() {
+                self.import_config();
+            }
+            if ui.button(self.tr("导出配置", "Export Config")).clicked() {
+                self.export_config();
+            }
+            if ui.button(self.tr("帮助", "Help")).clicked() {
                 self.show_help = true;
             }
-            if ui.button("Options").clicked() {
+            if ui.button(self.tr("选项", "Options")).clicked() {
                 self.show_options = true;
             }
             ui.separator();
             if let Some(meta) = self.meta() {
-                ui.label(format!(
-                    "{} | {} samples | {:.3}s | {:.1} Hz",
-                    meta.source_name,
-                    meta.sample_count,
-                    meta.duration(),
-                    meta.nominal_sample_rate_hz
-                ));
+                if self.language == Language::Zh {
+                    ui.label(format!(
+                        "{} | {} 点 | {:.3}s | 数据 {:.1} Hz | 设置 Fs {:.1} Hz",
+                        meta.source_name,
+                        meta.sample_count,
+                        meta.duration(),
+                        meta.nominal_sample_rate_hz,
+                        self.sample_rate_hz
+                    ));
+                } else {
+                    ui.label(format!(
+                        "{} | {} samples | {:.3}s | data {:.1} Hz | Fs set {:.1} Hz",
+                        meta.source_name,
+                        meta.sample_count,
+                        meta.duration(),
+                        meta.nominal_sample_rate_hz,
+                        self.sample_rate_hz
+                    ));
+                }
             } else {
-                ui.label("Open a waveform CSV to begin. Content files are detected automatically.");
+                ui.label(self.tr(
+                    "打开 CSV 文件开始分析；软件会自动识别云端 Content 或本地数值 CSV。",
+                    "Open a waveform CSV to begin. Content files are detected automatically.",
+                ));
             }
         });
     }
 
     fn help_window(&mut self, ctx: &egui::Context) {
-        egui::Window::new("Help")
+        let title = self.tr("帮助", "Help");
+        let language = self.language;
+        egui::Window::new(title)
             .open(&mut self.show_help)
             .default_width(720.0)
             .default_height(620.0)
             .resizable(true)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.heading("Scope Analyzer");
-                    ui.label("Windows offline waveform analyzer with channel selection, oscilloscope-style zooming, cursor measurement, FFT, THD, and sequence components.");
+                    if language == Language::Zh {
+                        ui.heading("Scope Analyzer");
+                        ui.label("Windows 离线波形分析工具，支持通道勾选、示波器式缩放、双光标测量、FFT、THD 和三相序分量分析。");
 
-                    ui.separator();
-                    ui.heading("Supported CSV Formats");
-                    ui.label("Use Open CSV. The software reads the first CSV header and automatically chooses the cloud Content parser or the local numeric CSV parser.");
-                    ui.strong("Cloud Content CSV");
-                    ui.label("The first row is Content. Each following row is a hexadecimal record. Each record is decoded into two samples. Each sample contains 30 analog channels plus 30 digital/status channels. Analog channels use little-endian int16. The 31st and 32nd raw words are expanded into digital/status channels according to the original MATLAB script.");
-                    ui.add_space(6.0);
-                    ui.strong("Local / Numeric CSV");
-                    ui.label("The first column is time in seconds. Remaining columns are channel values. Up to 128 numeric channels are loaded. The file is indexed in blocks and the plot reads only the current view or min/max summaries.");
-                    ui.monospace("time,CH1,CH2,CH3\n0.000000,0.0,0.1,0.2\n0.000010,0.1,0.2,0.3");
+                        ui.separator();
+                        ui.heading("支持的 CSV 格式");
+                        ui.label("使用顶部“打开 CSV”入口。软件读取第一行表头后，会自动选择云端 Content 解析器或本地数值 CSV 解析器。");
+                        ui.strong("云端 Content CSV");
+                        ui.label("第一行为 Content。后续每行是一条十六进制报文，每条报文解析为 2 个采样点。每个采样点包含 30 个模拟量通道和 30 个数字/状态通道。模拟量按 little-endian int16 解析，第 31/32 个 raw word 按原 MATLAB 脚本规则拆成数字/状态通道。");
+                        ui.add_space(6.0);
+                        ui.strong("本地/数值 CSV");
+                        ui.label("第一列为时间，单位秒；后续列为通道值，最多读取 128 个数值通道。文件打开时建立分块索引和 min/max 摘要，绘图只读取当前视窗或摘要。");
+                        ui.monospace("time,CH1,CH2,CH3\n0.000000,0.0,0.1,0.2\n0.000010,0.1,0.2,0.3");
 
-                    ui.separator();
-                    ui.heading("Waveform Controls");
-                    ui.label("Mouse wheel: zoom vertical amplitude range around the pointer.");
-                    ui.label("Ctrl + mouse wheel: zoom horizontal time range around the pointer.");
-                    ui.label("Options: adjust mouse wheel zoom sensitivity.");
-                    ui.label("Left channel list: select channels, edit display names, search variables, and use it as the legend.");
-                    ui.label("Hover a variable in the left list: the corresponding waveform becomes thicker.");
-                    ui.label("Left click plot: move the nearest cursor to the clicked position.");
-                    ui.label("Left drag plot: box-select a time range and zoom in.");
-                    ui.label("Right click plot: open cursor menu.");
-                    ui.label("Place Cursor A/B: shows a red dashed preview cursor; left click confirms, Esc cancels.");
-                    ui.label("Hide/Show Cursor A/B: toggles cursor visibility without changing cursor position or measurements.");
-                    ui.label("Right drag plot: pan the current view.");
-                    ui.label("Fit Cursors: zoom to the time range between cursor A and cursor B.");
+                        ui.separator();
+                        ui.heading("波形操作");
+                        ui.label("选项：设置采样频率，默认 1000 Hz。云端 Content CSV 用它生成秒级时间轴，FFT 也使用该设置。");
+                        ui.label("鼠标滚轮：以鼠标位置为中心缩放纵轴幅值范围。");
+                        ui.label("Ctrl + 鼠标滚轮：以鼠标位置为中心缩放横轴时间范围。");
+                        ui.label("选项：可调整滚轮缩放敏感度，也可切换中文/英文界面。");
+                        ui.label("左侧变量栏：勾选通道、编辑显示名、搜索变量，并作为图例使用。");
+                        ui.label("鼠标悬停左侧变量：对应波形会加粗高亮。");
+                        ui.label("导入/导出配置：保存和恢复变量名、通道显示、FFT 通道、采样频率、缩放敏感度和界面语言。");
+                        ui.label("左键单击波形：移动距离最近的光标。");
+                        ui.label("左键拖拽波形：框选时间区域并放大。");
+                        ui.label("右键单击波形：打开光标菜单。");
+                        ui.label("放置光标 A/B：显示红色虚线预览光标，左键确认，Esc 取消。");
+                        ui.label("隐藏/显示光标 A/B：只切换显示状态，不改变光标位置和测量结果。");
+                        ui.label("右键拖拽波形：平移当前视图。");
+                        ui.label("适配光标：缩放到光标 A/B 的时间范围。");
 
-                    ui.separator();
-                    ui.heading("FFT, THD, and Sequence");
-                    ui.label("The FFT panel automatically analyzes the selected FFT channel between cursor A and cursor B.");
-                    ui.label("The harmonic table shows frequency, amplitude, phase, dBc, and THD.");
-                    ui.label("If the FFT channel belongs to stVg_0.iA/iB/iC, stIg_0.iA/iB/iC, or stVinv_0.iA/iB/iC, the software also shows zero, positive, and negative sequence components.");
-                    ui.label("Single-channel FFT phase depends on cursor start time. Sequence analysis uses the A-B-C positive-sequence convention; focus on relative phase and positive/negative/zero sequence magnitude ratios.");
+                        ui.separator();
+                        ui.heading("FFT、THD 和序分量");
+                        ui.label("FFT 面板会自动分析光标 A/B 之间选中 FFT 通道的波形。");
+                        ui.label("谐波表显示频率、幅值、相位、dBc 和 THD。");
+                        ui.label("当 FFT 通道属于 stVg_0.iA/iB/iC、stIg_0.iA/iB/iC 或 stVinv_0.iA/iB/iC 时，软件同时显示零序、正序和负序分量。");
+                        ui.label("单通道 FFT 相位会随光标起点变化；序分量按 A-B-C 正序约定计算，重点看相对相位和正/负/零序幅值比例。");
 
-                    ui.separator();
-                    ui.heading("Build / Packaging");
-                    ui.label("Run locally with:");
-                    ui.monospace("cargo run --release");
-                    ui.label("Create a Windows portable package with:");
-                    ui.monospace("powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1");
-                    ui.label("Output: dist/ScopeAnalyzer-0.1.0-win-x64.zip");
+                        ui.separator();
+                        ui.heading("构建 / 打包");
+                        ui.label("本地运行：");
+                        ui.monospace("cargo run --release");
+                        ui.label("创建 Windows 便携包：");
+                        ui.monospace("powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1");
+                        ui.label("输出：dist/ScopeAnalyzer-0.1.0-win-x64.zip");
+                    } else {
+                        ui.heading("Scope Analyzer");
+                        ui.label("Windows offline waveform analyzer with channel selection, oscilloscope-style zooming, cursor measurement, FFT, THD, and sequence components.");
+
+                        ui.separator();
+                        ui.heading("Supported CSV Formats");
+                        ui.label("Use Open CSV. The software reads the first CSV header and automatically chooses the cloud Content parser or the local numeric CSV parser.");
+                        ui.strong("Cloud Content CSV");
+                        ui.label("The first row is Content. Each following row is a hexadecimal record. Each record is decoded into two samples. Each sample contains 30 analog channels plus 30 digital/status channels. Analog channels use little-endian int16. The 31st and 32nd raw words are expanded into digital/status channels according to the original MATLAB script.");
+                        ui.add_space(6.0);
+                        ui.strong("Local / Numeric CSV");
+                        ui.label("The first column is time in seconds. Remaining columns are channel values. Up to 128 numeric channels are loaded. The file is indexed in blocks and the plot reads only the current view or min/max summaries.");
+                        ui.monospace("time,CH1,CH2,CH3\n0.000000,0.0,0.1,0.2\n0.000010,0.1,0.2,0.3");
+
+                        ui.separator();
+                        ui.heading("Waveform Controls");
+                        ui.label("Options: set sample rate. Default is 1000 Hz. Cloud Content CSV uses it to convert sample index to seconds; FFT also uses this setting.");
+                        ui.label("Mouse wheel: zoom vertical amplitude range around the pointer.");
+                        ui.label("Ctrl + mouse wheel: zoom horizontal time range around the pointer.");
+                        ui.label("Options: adjust mouse wheel zoom sensitivity and choose Chinese or English UI language.");
+                        ui.label("Left channel list: select channels, edit display names, search variables, and use it as the legend.");
+                        ui.label("Hover a variable in the left list: the corresponding waveform becomes thicker.");
+                        ui.label("Import/Export Config: save and restore display names, channel visibility, FFT channel, sample rate, wheel zoom sensitivity, and UI language.");
+                        ui.label("Left click plot: move the nearest cursor to the clicked position.");
+                        ui.label("Left drag plot: box-select a time range and zoom in.");
+                        ui.label("Right click plot: open cursor menu.");
+                        ui.label("Place Cursor A/B: shows a red dashed preview cursor; left click confirms, Esc cancels.");
+                        ui.label("Hide/Show Cursor A/B: toggles cursor visibility without changing cursor position or measurements.");
+                        ui.label("Right drag plot: pan the current view.");
+                        ui.label("Fit Cursors: zoom to the time range between cursor A and cursor B.");
+
+                        ui.separator();
+                        ui.heading("FFT, THD, and Sequence");
+                        ui.label("The FFT panel automatically analyzes the selected FFT channel between cursor A and cursor B.");
+                        ui.label("The harmonic table shows frequency, amplitude, phase, dBc, and THD.");
+                        ui.label("If the FFT channel belongs to stVg_0.iA/iB/iC, stIg_0.iA/iB/iC, or stVinv_0.iA/iB/iC, the software also shows zero, positive, and negative sequence components.");
+                        ui.label("Single-channel FFT phase depends on cursor start time. Sequence analysis uses the A-B-C positive-sequence convention; focus on relative phase and positive/negative/zero sequence magnitude ratios.");
+
+                        ui.separator();
+                        ui.heading("Build / Packaging");
+                        ui.label("Run locally with:");
+                        ui.monospace("cargo run --release");
+                        ui.label("Create a Windows portable package with:");
+                        ui.monospace("powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1");
+                        ui.label("Output: dist/ScopeAnalyzer-0.1.0-win-x64.zip");
+                    }
                 });
             });
     }
 
     fn options_window(&mut self, ctx: &egui::Context) {
-        egui::Window::new("Options")
-            .open(&mut self.show_options)
+        let title = self.tr("选项", "Options");
+        let mut open = self.show_options;
+        egui::Window::new(title)
+            .open(&mut open)
             .default_width(360.0)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.heading("Interaction");
+                ui.heading(self.tr("交互", "Interaction"));
+                ui.horizontal(|ui| {
+                    ui.label(self.tr("系统语言", "Language"));
+                    egui::ComboBox::from_id_source("language_select")
+                        .selected_text(self.language.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.language, Language::Zh, "中文");
+                            ui.selectable_value(&mut self.language, Language::En, "English");
+                        });
+                });
+                ui.separator();
+                let old_sample_rate = self.sample_rate_hz;
+                let sample_rate_prefix = self.tr("采样频率: ", "Sample rate: ");
                 ui.add(
-                    egui::Slider::new(&mut self.wheel_zoom_sensitivity, 0.05..=0.80)
-                        .text("Wheel zoom sensitivity")
+                    egui::DragValue::new(&mut self.sample_rate_hz)
+                        .speed(10.0)
+                        .clamp_range(1.0..=10_000_000.0)
+                        .suffix(" Hz")
+                        .prefix(sample_rate_prefix),
+                );
+                if (self.sample_rate_hz - old_sample_rate).abs() > f64::EPSILON {
+                    self.sample_rate_hz = self.sample_rate_hz.clamp(1.0, 10_000_000.0);
+                    self.reload_cloud_with_current_sample_rate();
+                }
+                ui.label(self.tr(
+                    "默认采样频率为 1000 Hz。云端 Content CSV 会用该值生成时间轴，FFT 也使用该值。",
+                    "Default sample rate is 1000 Hz. Cloud Content CSV uses this value for the time axis and FFT.",
+                ));
+                ui.separator();
+                let zoom_label = self.tr("滚轮缩放敏感度", "Wheel zoom sensitivity");
+                ui.add(
+                    egui::Slider::new(
+                        &mut self.wheel_zoom_sensitivity,
+                        MIN_WHEEL_ZOOM_SENSITIVITY..=MAX_WHEEL_ZOOM_SENSITIVITY,
+                    )
+                        .text(zoom_label)
                         .logarithmic(false),
                 );
-                ui.label(format!(
-                    "Current: {:.0}% per wheel step",
-                    self.wheel_zoom_sensitivity * 100.0
-                ));
-                if ui.button("Reset Sensitivity").clicked() {
-                    self.wheel_zoom_sensitivity = 0.25;
+                if self.language == Language::Zh {
+                    ui.label(format!("当前: 每格滚轮 {:.0}%", self.wheel_zoom_sensitivity * 100.0));
+                } else {
+                    ui.label(format!(
+                        "Current: {:.0}% per wheel step",
+                        self.wheel_zoom_sensitivity * 100.0
+                    ));
+                }
+                if ui.button(self.tr("重置敏感度", "Reset Sensitivity")).clicked() {
+                    self.wheel_zoom_sensitivity = DEFAULT_WHEEL_ZOOM_SENSITIVITY;
                 }
                 ui.separator();
-                ui.label("Mouse wheel zooms the vertical axis.");
-                ui.label("Ctrl + mouse wheel zooms the horizontal axis.");
+                ui.label(self.tr(
+                    "鼠标滚轮缩放纵轴。",
+                    "Mouse wheel zooms the vertical axis.",
+                ));
+                ui.label(self.tr(
+                    "Ctrl + 鼠标滚轮缩放横轴。",
+                    "Ctrl + mouse wheel zooms the horizontal axis.",
+                ));
             });
+        self.show_options = open;
     }
 
     fn wheel_zoom_factor(&self, scroll_delta: f32) -> f64 {
@@ -650,31 +983,37 @@ impl ScopeApp {
         }
     }
 
+    fn ctrl_zoom_factor(&self, zoom_delta: f32) -> f64 {
+        (zoom_delta as f64).powf(-self.wheel_zoom_sensitivity * 4.0)
+    }
+
     fn channel_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Channels");
+        ui.heading(self.tr("变量", "Channels"));
         ui.horizontal(|ui| {
-            if ui.button("All").clicked() {
+            if ui.button(self.tr("全选", "All")).clicked() {
                 self.visible.fill(true);
                 self.needs_plot_reload = true;
             }
-            if ui.button("None").clicked() {
+            if ui.button(self.tr("全不选", "None")).clicked() {
                 self.visible.fill(false);
                 self.needs_plot_reload = true;
             }
         });
+        let filter_hint = self.tr("筛选", "Filter");
         ui.add(
             egui::TextEdit::singleline(&mut self.channel_filter)
-                .hint_text("Filter")
+                .hint_text(filter_hint)
                 .desired_width(f32::INFINITY),
         );
         ui.separator();
 
         let Some(meta) = self.meta().cloned() else {
-            ui.label("No data loaded.");
+            ui.label(self.tr("未加载数据。", "No data loaded."));
             return;
         };
         let filter = self.channel_filter.to_lowercase();
         let mut hovered_channel = None;
+        let source_label = self.tr("原始", "src");
         egui::ScrollArea::vertical().show(ui, |ui| {
             for channel in &meta.channels {
                 let display_name = self.channel_name(channel.index);
@@ -686,31 +1025,36 @@ impl ScopeApp {
                 }
                 let row_response = ui
                     .horizontal(|ui| {
-                    let color = Self::channel_color(channel.index);
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                    ui.painter().rect_filled(rect, 2.0, color);
-                    let changed = ui
-                        .checkbox(&mut self.visible[channel.index], "")
-                        .changed();
-                    if changed {
-                        self.needs_plot_reload = true;
-                    }
-                    if let Some(name) = self.display_names.get_mut(channel.index) {
-                        ui.add(
-                            egui::TextEdit::singleline(name)
-                                .desired_width(150.0),
-                        );
-                    }
-                    if !channel.unit.is_empty() {
-                        ui.label(format!("({})", channel.unit));
-                    }
-                    if display_name != channel.name {
-                        ui.label(RichText::new(format!("src: {}", channel.name)).small());
-                    }
-                    })
-                    .response;
-                if row_response.hovered() {
+                        let mut row_hovered = false;
+                        let color = Self::channel_color(channel.index);
+                        let (rect, color_response) =
+                            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                        row_hovered |= color_response.hovered();
+                        ui.painter().rect_filled(rect, 2.0, color);
+                        let checkbox_response = ui.checkbox(&mut self.visible[channel.index], "");
+                        row_hovered |= checkbox_response.hovered();
+                        if checkbox_response.changed() {
+                            self.needs_plot_reload = true;
+                        }
+                        if let Some(name) = self.display_names.get_mut(channel.index) {
+                            let name_response =
+                                ui.add(egui::TextEdit::singleline(name).desired_width(150.0));
+                            row_hovered |= name_response.hovered() || name_response.has_focus();
+                        }
+                        if !channel.unit.is_empty() {
+                            row_hovered |= ui.label(format!("({})", channel.unit)).hovered();
+                        }
+                        if display_name != channel.name {
+                            row_hovered |= ui
+                                .label(
+                                    RichText::new(format!("{source_label}: {}", channel.name))
+                                        .small(),
+                                )
+                                .hovered();
+                        }
+                        row_hovered
+                    });
+                if row_response.response.hovered() || row_response.inner {
                     hovered_channel = Some(channel.index);
                 }
             }
@@ -719,20 +1063,21 @@ impl ScopeApp {
     }
 
     fn measurements_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Cursors");
+        ui.heading(self.tr("光标", "Cursors"));
         ui.horizontal(|ui| {
             ui.radio_value(&mut self.active_cursor, CursorId::A, "A");
             ui.radio_value(&mut self.active_cursor, CursorId::B, "B");
         });
+        let hidden_label = self.tr("（隐藏）", " (hidden)");
         ui.label(format!(
             "A: {:.9}s{}",
             self.cursor_a,
-            if self.show_cursor_a { "" } else { " (hidden)" }
+            if self.show_cursor_a { "" } else { hidden_label }
         ));
         ui.label(format!(
             "B: {:.9}s{}",
             self.cursor_b,
-            if self.show_cursor_b { "" } else { " (hidden)" }
+            if self.show_cursor_b { "" } else { hidden_label }
         ));
         let dt = (self.cursor_b - self.cursor_a).abs();
         ui.label(format!("dt: {:.9}s", dt));
@@ -740,10 +1085,17 @@ impl ScopeApp {
             ui.label(format!("1/dt: {:.3} Hz", 1.0 / dt));
         }
         if let Some(cursor) = self.cursor_place_mode {
-            ui.label(format!(
-                "Placing cursor {}: click waveform to fix, Esc to cancel.",
-                Self::cursor_label(cursor)
-            ));
+            if self.language == Language::Zh {
+                ui.label(format!(
+                    "正在放置光标 {}：单击波形固定，Esc 取消。",
+                    Self::cursor_label(cursor)
+                ));
+            } else {
+                ui.label(format!(
+                    "Placing cursor {}: click waveform to fix, Esc to cancel.",
+                    Self::cursor_label(cursor)
+                ));
+            }
         }
         ui.separator();
 
@@ -760,14 +1112,24 @@ impl ScopeApp {
             for (out_index, &channel_index) in channels.iter().enumerate().take(12) {
                 let values = &block.channels[out_index];
                 if let (Some(first), Some(last)) = (values.first(), values.last()) {
-                    let name = &source.metadata().channels[channel_index].name;
-                    ui.label(format!(
+                    let name = self.channel_name(channel_index);
+                    let text = format!(
                         "{}  yA={:.5}  yB={:.5}  dy={:.5}",
                         name,
                         first,
                         last,
                         last - first
-                    ));
+                    );
+                    if self.hovered_channel == Some(channel_index) {
+                        ui.label(
+                            RichText::new(text)
+                                .strong()
+                                .color(Self::channel_color(channel_index))
+                                .background_color(Color32::from_rgba_premultiplied(255, 240, 160, 80)),
+                        );
+                    } else {
+                        ui.label(text);
+                    }
                 }
             }
         }
@@ -776,12 +1138,13 @@ impl ScopeApp {
     fn fft_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("FFT");
         let Some(meta) = self.meta().cloned() else {
-            ui.label("No data loaded.");
+            ui.label(self.tr("未加载数据。", "No data loaded."));
             return;
         };
 
         let mut fft_channel_changed = false;
-        egui::ComboBox::from_label("Channel")
+        let channel_label = self.tr("通道", "Channel");
+        egui::ComboBox::from_label(channel_label)
             .selected_text(
                 meta.channels
                     .get(self.fft_channel)
@@ -807,22 +1170,31 @@ impl ScopeApp {
             self.needs_fft_reload = true;
         }
 
-        ui.label("Auto analyzes the cursor A-B range.");
+        ui.label(self.tr(
+            "自动分析光标 A-B 区间。",
+            "Auto analyzes the cursor A-B range.",
+        ));
         if self.needs_fft_reload {
             self.run_fft();
         }
 
         if let Some(result) = &self.fft_result {
             ui.separator();
-            ui.label(format!("Channel: {}", result.channel_name));
-            ui.label(format!("Samples: {}", result.sample_count));
-            ui.label(format!("Fundamental: {:.3} Hz", result.fundamental_hz));
+            if self.language == Language::Zh {
+                ui.label(format!("通道: {}", result.channel_name));
+                ui.label(format!("样本数: {}", result.sample_count));
+                ui.label(format!("基波: {:.3} Hz", result.fundamental_hz));
+            } else {
+                ui.label(format!("Channel: {}", result.channel_name));
+                ui.label(format!("Samples: {}", result.sample_count));
+                ui.label(format!("Fundamental: {:.3} Hz", result.fundamental_hz));
+            }
             ui.label(format!("THD: {:.3}%", result.thd_percent));
             egui::Grid::new("harmonics").striped(true).show(ui, |ui| {
                 ui.strong("N");
                 ui.strong("Hz");
-                ui.strong("Amp");
-                ui.strong("Phase");
+                ui.strong(self.tr("幅值", "Amp"));
+                ui.strong(self.tr("相位", "Phase"));
                 ui.strong("dBc");
                 ui.end_row();
                 for row in &result.harmonics {
@@ -838,27 +1210,48 @@ impl ScopeApp {
 
         if let Some(sequence) = &self.sequence_result {
             ui.separator();
-            ui.heading("Sequence");
-            ui.label(format!(
-                "{} | Fundamental: {:.3} Hz",
-                sequence.group_name, sequence.fundamental_hz
-            ));
-            ui.label(format!(
-                "Phase A/B/C: {:.2} deg / {:.2} deg / {:.2} deg",
-                sequence.phase_a_deg, sequence.phase_b_deg, sequence.phase_c_deg
-            ));
+            ui.heading(self.tr("序分量", "Sequence"));
+            if self.language == Language::Zh {
+                ui.label(format!(
+                    "{} | 基波: {:.3} Hz",
+                    sequence.group_name, sequence.fundamental_hz
+                ));
+                ui.label(format!(
+                    "A/B/C 相位: {:.2} deg / {:.2} deg / {:.2} deg",
+                    sequence.phase_a_deg, sequence.phase_b_deg, sequence.phase_c_deg
+                ));
+            } else {
+                ui.label(format!(
+                    "{} | Fundamental: {:.3} Hz",
+                    sequence.group_name, sequence.fundamental_hz
+                ));
+                ui.label(format!(
+                    "Phase A/B/C: {:.2} deg / {:.2} deg / {:.2} deg",
+                    sequence.phase_a_deg, sequence.phase_b_deg, sequence.phase_c_deg
+                ));
+            }
             egui::Grid::new("sequence_components").striped(true).show(ui, |ui| {
-                ui.strong("Seq");
-                ui.strong("Amp");
-                ui.strong("Phase");
-                ui.strong("% Pos");
+                ui.strong(self.tr("序", "Seq"));
+                ui.strong(self.tr("幅值", "Amp"));
+                ui.strong(self.tr("相位", "Phase"));
+                ui.strong(self.tr("占正序", "% Pos"));
                 ui.end_row();
                 for component in [
                     &sequence.zero,
                     &sequence.positive,
                     &sequence.negative,
                 ] {
-                    ui.label(component.name);
+                    let component_name = if self.language == Language::Zh {
+                        match component.name {
+                            "Zero" => "零序",
+                            "Positive" => "正序",
+                            "Negative" => "负序",
+                            name => name,
+                        }
+                    } else {
+                        component.name
+                    };
+                    ui.label(component_name);
                     ui.label(format!("{:.5}", component.amplitude));
                     ui.label(format!("{:.2} deg", component.phase_deg));
                     ui.label(format!("{:.2}%", component.percent_of_positive));
@@ -901,7 +1294,7 @@ impl ScopeApp {
                             .name(self.channel_name(*channel_index))
                             .color(Self::channel_color(*channel_index))
                             .width(if self.hovered_channel == Some(*channel_index) {
-                                3.0
+                                4.0
                             } else {
                                 1.4
                             }),
@@ -924,7 +1317,7 @@ impl ScopeApp {
                                 .name(format!("{} min/max", self.channel_name(*channel_index)))
                                 .color(Self::channel_color(*channel_index))
                                 .width(if self.hovered_channel == Some(*channel_index) {
-                                    3.0
+                                    4.0
                                 } else {
                                     1.4
                                 }),
@@ -969,9 +1362,13 @@ impl ScopeApp {
                 if let (Some(cursor), Some(pointer)) =
                     (self.cursor_place_mode, plot_ui.pointer_coordinate())
                 {
+                    let place_name = match self.language {
+                        Language::Zh => format!("放置 {}", Self::cursor_label(cursor)),
+                        Language::En => format!("Place {}", Self::cursor_label(cursor)),
+                    };
                     plot_ui.vline(
                         VLine::new(pointer.x)
-                            .name(format!("Place {}", Self::cursor_label(cursor)))
+                            .name(place_name)
                             .color(Self::cursor_color(cursor))
                             .style(LineStyle::Dashed { length: 6.0 })
                             .width(2.5),
@@ -986,38 +1383,40 @@ impl ScopeApp {
             .map(|pos| response.transform.value_from_position(pos).x);
 
         response.response.context_menu(|ui| {
-            if ui.button("Place Cursor A").clicked() {
+            if ui.button(self.tr("放置光标 A", "Place Cursor A")).clicked() {
                 self.cursor_place_mode = Some(CursorId::A);
                 self.zoom_box_start = None;
                 self.zoom_box_current = None;
                 ui.close_menu();
             }
-            if ui.button("Place Cursor B").clicked() {
+            if ui.button(self.tr("放置光标 B", "Place Cursor B")).clicked() {
                 self.cursor_place_mode = Some(CursorId::B);
                 self.zoom_box_start = None;
                 self.zoom_box_current = None;
                 ui.close_menu();
             }
-            if self.cursor_place_mode.is_some() && ui.button("Cancel Placement").clicked() {
+            if self.cursor_place_mode.is_some()
+                && ui.button(self.tr("取消放置", "Cancel Placement")).clicked()
+            {
                 self.cursor_place_mode = None;
                 ui.close_menu();
             }
             ui.separator();
             if self.show_cursor_a {
-                if ui.button("Hide Cursor A").clicked() {
+                if ui.button(self.tr("隐藏光标 A", "Hide Cursor A")).clicked() {
                     self.show_cursor_a = false;
                     ui.close_menu();
                 }
-            } else if ui.button("Show Cursor A").clicked() {
+            } else if ui.button(self.tr("显示光标 A", "Show Cursor A")).clicked() {
                 self.show_cursor_a = true;
                 ui.close_menu();
             }
             if self.show_cursor_b {
-                if ui.button("Hide Cursor B").clicked() {
+                if ui.button(self.tr("隐藏光标 B", "Hide Cursor B")).clicked() {
                     self.show_cursor_b = false;
                     ui.close_menu();
                 }
-            } else if ui.button("Show Cursor B").clicked() {
+            } else if ui.button(self.tr("显示光标 B", "Show Cursor B")).clicked() {
                 self.show_cursor_b = true;
                 ui.close_menu();
             }
@@ -1030,20 +1429,36 @@ impl ScopeApp {
         }
 
         if response.response.hovered() {
-            let scroll = ui.ctx().input(|input| input.smooth_scroll_delta.y);
-            let ctrl_down = ui.ctx().input(|input| input.modifiers.ctrl);
-            if scroll.abs() > 0.0 {
+            let (raw_scroll, smooth_scroll, ctrl_down, zoom_delta) = ui.ctx().input(|input| {
+                (
+                    input.raw_scroll_delta.y,
+                    input.smooth_scroll_delta.y,
+                    input.modifiers.ctrl,
+                    input.zoom_delta(),
+                )
+            });
+            let scroll = if raw_scroll.abs() > 0.0 {
+                raw_scroll
+            } else {
+                smooth_scroll
+            };
+            let center_x = hover_time.unwrap_or((self.view_start + self.view_end) * 0.5);
+            if (zoom_delta - 1.0).abs() > f32::EPSILON {
+                self.zoom(center_x, self.ctrl_zoom_factor(zoom_delta));
+                ui.ctx().request_repaint();
+            } else if scroll.abs() > 0.0 {
                 let factor = self.wheel_zoom_factor(scroll);
                 if ctrl_down {
-                    let center = hover_time.unwrap_or((self.view_start + self.view_end) * 0.5);
-                    self.zoom(center, factor);
+                    self.zoom(center_x, factor);
+                    ui.ctx().request_repaint();
                 } else {
-                    let center = response
+                    let center_y = response
                         .response
                         .hover_pos()
                         .map(|pos| response.transform.value_from_position(pos).y)
                         .unwrap_or((plot_y_min + plot_y_max) * 0.5);
-                    self.zoom_y(center, factor);
+                    self.zoom_y(center_y, factor);
+                    ui.ctx().request_repaint();
                 }
             }
 
@@ -1143,6 +1558,7 @@ impl eframe::App for ScopeApp {
 
             if let Some(result) = &self.fft_result {
                 ui.separator();
+                let spectrum_label = self.tr("频谱", "Spectrum");
                 Plot::new("fft_plot")
                     .height(180.0)
                     .include_y(0.0)
@@ -1152,7 +1568,7 @@ impl eframe::App for ScopeApp {
                             .iter()
                             .copied()
                             .collect::<Vec<_>>();
-                        plot_ui.line(Line::new(PlotPoints::from(points)).name("Spectrum").color(Color32::LIGHT_GREEN));
+                        plot_ui.line(Line::new(PlotPoints::from(points)).name(spectrum_label).color(Color32::LIGHT_GREEN));
                     });
             }
         });

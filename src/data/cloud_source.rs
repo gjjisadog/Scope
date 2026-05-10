@@ -17,6 +17,7 @@ const INDEX_BLOCK_RECORDS: u64 = 4096;
 #[derive(Clone, Debug)]
 struct BlockIndex {
     offset: u64,
+    start_sample: u64,
     records: u64,
     start_time: f64,
     end_time: f64,
@@ -27,6 +28,7 @@ struct BlockIndex {
 pub struct CloudCsvDataSource {
     path: PathBuf,
     header_offset: u64,
+    sample_rate_hz: f64,
     meta: DatasetMeta,
     blocks: Vec<BlockIndex>,
 }
@@ -116,20 +118,125 @@ impl CloudCsvDataSource {
         Ok([Self::expand_words(&words1), Self::expand_words(&words2)])
     }
 
-    fn new_block(offset: u64, start_sample: u64) -> BlockIndex {
+    pub fn open_with_sample_rate(path: &Path, sample_rate_hz: f64) -> DataResult<Self> {
+        let sample_rate_hz = sample_rate_hz.max(1.0);
+        let mut file = File::open(path)?;
+        let mut reader = BufReader::new(&mut file);
+        let mut header = String::new();
+        let header_bytes = reader.read_line(&mut header)?;
+        if header_bytes == 0 {
+            return Err(DataError::Empty);
+        }
+        if !header
+            .trim_start_matches('\u{feff}')
+            .trim()
+            .eq_ignore_ascii_case("content")
+        {
+            return Err(DataError::Csv(
+                "cloud waveform CSV must have a single Content column".to_owned(),
+            ));
+        }
+
+        let mut blocks = Vec::new();
+        let mut current: Option<BlockIndex> = None;
+        let mut parsed_records = 0_u64;
+        let mut skipped_records = 0_u64;
+
+        loop {
+            let offset = reader.stream_position()?;
+            let mut line = String::new();
+            let bytes = reader.read_line(&mut line)?;
+            if bytes == 0 {
+                break;
+            }
+            let frames = match Self::parse_record(&line) {
+                Ok(frames) => frames,
+                Err(_) => {
+                    skipped_records += 1;
+                    continue;
+                }
+            };
+
+            let needs_new = current
+                .as_ref()
+                .map_or(true, |block| block.records >= INDEX_BLOCK_RECORDS);
+            if needs_new {
+                if let Some(block) = current.take() {
+                    blocks.push(block);
+                }
+                current = Some(Self::new_block(offset, parsed_records * 2, sample_rate_hz));
+            }
+
+            if let Some(block) = current.as_mut() {
+                Self::update_block(block, &frames, sample_rate_hz);
+            }
+            parsed_records += 1;
+        }
+
+        if let Some(block) = current.take() {
+            blocks.push(block);
+        }
+        if parsed_records == 0 {
+            return Err(DataError::Csv(format!(
+                "no valid cloud records were parsed; skipped {skipped_records} rows"
+            )));
+        }
+
+        let channels = VARIABLE_NAMES
+            .iter()
+            .enumerate()
+            .map(|(index, name)| ChannelMeta {
+                index,
+                name: (*name).to_owned(),
+                unit: String::new(),
+                sample_rate_hz,
+                scale: 1.0,
+                default_visible: index < 30,
+            })
+            .collect::<Vec<_>>();
+
+        let source_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("cloud_wave.csv")
+            .to_owned();
+        let sample_count = parsed_records * 2;
+
+        Ok(Self {
+            path: path.to_owned(),
+            header_offset: header_bytes as u64,
+            sample_rate_hz,
+            meta: DatasetMeta {
+                source_name,
+                channels,
+                start_time: 0.0,
+                end_time: sample_count.saturating_sub(1) as f64 / sample_rate_hz,
+                sample_count,
+                nominal_sample_rate_hz: sample_rate_hz,
+            },
+            blocks,
+        })
+    }
+
+    fn new_block(offset: u64, start_sample: u64, sample_rate_hz: f64) -> BlockIndex {
         BlockIndex {
             offset,
+            start_sample,
             records: 0,
-            start_time: start_sample as f64,
-            end_time: start_sample as f64,
+            start_time: start_sample as f64 / sample_rate_hz,
+            end_time: start_sample as f64 / sample_rate_hz,
             min: [f32::INFINITY; CHANNEL_COUNT],
             max: [f32::NEG_INFINITY; CHANNEL_COUNT],
         }
     }
 
-    fn update_block(block: &mut BlockIndex, frames: &[[f32; CHANNEL_COUNT]; 2]) {
+    fn update_block(
+        block: &mut BlockIndex,
+        frames: &[[f32; CHANNEL_COUNT]; 2],
+        sample_rate_hz: f64,
+    ) {
         block.records += 1;
-        block.end_time = block.start_time + block.records as f64 * 2.0 - 1.0;
+        block.end_time = (block.start_sample + block.records * 2 - 1) as f64 / sample_rate_hz;
         for frame in frames {
             for channel in 0..CHANNEL_COUNT {
                 block.min[channel] = block.min[channel].min(frame[channel]);
@@ -163,96 +270,7 @@ impl CloudCsvDataSource {
 
 impl DataSource for CloudCsvDataSource {
     fn open(path: &Path) -> DataResult<Self> {
-        let mut file = File::open(path)?;
-        let mut reader = BufReader::new(&mut file);
-        let mut header = String::new();
-        let header_bytes = reader.read_line(&mut header)?;
-        if header_bytes == 0 {
-            return Err(DataError::Empty);
-        }
-        if !header.trim().eq_ignore_ascii_case("content") {
-            return Err(DataError::Csv(
-                "cloud waveform CSV must have a single Content column".to_owned(),
-            ));
-        }
-
-        let mut blocks = Vec::new();
-        let mut current: Option<BlockIndex> = None;
-        let mut parsed_records = 0_u64;
-        let mut skipped_records = 0_u64;
-
-        loop {
-            let offset = reader.stream_position()?;
-            let mut line = String::new();
-            let bytes = reader.read_line(&mut line)?;
-            if bytes == 0 {
-                break;
-            }
-            let frames = match Self::parse_record(&line) {
-                Ok(frames) => frames,
-                Err(_) => {
-                    skipped_records += 1;
-                    continue;
-                }
-            };
-
-            let needs_new = current
-                .as_ref()
-                .map_or(true, |block| block.records >= INDEX_BLOCK_RECORDS);
-            if needs_new {
-                if let Some(block) = current.take() {
-                    blocks.push(block);
-                }
-                current = Some(Self::new_block(offset, parsed_records * 2 + 1));
-            }
-
-            if let Some(block) = current.as_mut() {
-                Self::update_block(block, &frames);
-            }
-            parsed_records += 1;
-        }
-
-        if let Some(block) = current.take() {
-            blocks.push(block);
-        }
-        if parsed_records == 0 {
-            return Err(DataError::Csv(format!(
-                "no valid cloud records were parsed; skipped {skipped_records} rows"
-            )));
-        }
-
-        let channels = VARIABLE_NAMES
-            .iter()
-            .enumerate()
-            .map(|(index, name)| ChannelMeta {
-                index,
-                name: (*name).to_owned(),
-                unit: String::new(),
-                sample_rate_hz: 1.0,
-                scale: 1.0,
-                default_visible: index < 30,
-            })
-            .collect::<Vec<_>>();
-
-        let source_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("cloud_wave.csv")
-            .to_owned();
-
-        Ok(Self {
-            path: path.to_owned(),
-            header_offset: header_bytes as u64,
-            meta: DatasetMeta {
-                source_name,
-                channels,
-                start_time: 1.0,
-                end_time: (parsed_records * 2) as f64,
-                sample_count: parsed_records * 2,
-                nominal_sample_rate_hz: 1.0,
-            },
-            blocks,
-        })
+        Self::open_with_sample_rate(path, 1000.0)
     }
 
     fn metadata(&self) -> &DatasetMeta {
@@ -275,9 +293,10 @@ impl DataSource for CloudCsvDataSource {
         let mut file = File::open(&self.path)?;
         file.seek(SeekFrom::Start(self.blocks[first_block].offset.max(self.header_offset)))?;
         let mut reader = BufReader::new(file);
-        let estimated_points = (end_time - start_time + 1.0).max(1.0) as usize;
+        let estimated_points =
+            ((end_time - start_time) * self.sample_rate_hz + 1.0).max(1.0) as usize;
         let stride = (estimated_points / max_points.max(1)).max(1);
-        let mut sample_index = self.blocks[first_block].start_time as u64;
+        let mut sample_index = self.blocks[first_block].start_sample;
         let mut seen = 0_usize;
         let mut times = Vec::new();
         let mut channel_values = vec![Vec::new(); channels.len()];
@@ -293,7 +312,7 @@ impl DataSource for CloudCsvDataSource {
             };
 
             for frame in &frames {
-                let time = sample_index as f64;
+                let time = sample_index as f64 / self.sample_rate_hz;
                 sample_index += 1;
                 if time < start_time {
                     continue;
