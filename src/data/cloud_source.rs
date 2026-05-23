@@ -1,9 +1,9 @@
 use std::{
     cmp::Ordering,
-    fs::File,
-    io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
+
+use csv::{Position, ReaderBuilder, StringRecord, Trim};
 
 use super::{
     channel_names::VARIABLE_NAMES, ChannelMeta, DataError, DataResult, DataSource, DatasetMeta,
@@ -16,7 +16,7 @@ const INDEX_BLOCK_RECORDS: u64 = 4096;
 
 #[derive(Clone, Debug)]
 struct BlockIndex {
-    offset: u64,
+    position: Position,
     start_sample: u64,
     records: u64,
     start_time: f64,
@@ -27,40 +27,43 @@ struct BlockIndex {
 
 pub struct CloudCsvDataSource {
     path: PathBuf,
-    header_offset: u64,
+    content_column: usize,
     sample_rate_hz: f64,
     meta: DatasetMeta,
     blocks: Vec<BlockIndex>,
 }
 
 impl CloudCsvDataSource {
-    fn content_field(line: &str) -> &str {
-        line.trim()
-            .split(',')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .trim_matches('"')
+    fn reader_from_path(path: &Path) -> DataResult<csv::Reader<std::fs::File>> {
+        Ok(ReaderBuilder::new()
+            .flexible(true)
+            .trim(Trim::All)
+            .from_path(path)?)
+    }
+
+    fn content_from_record(record: &StringRecord, content_column: usize) -> DataResult<&str> {
+        record
+            .get(content_column)
+            .filter(|content| !content.is_empty())
+            .ok_or_else(|| DataError::Csv("Content field is empty".to_owned()))
     }
 
     fn hex_byte_at(raw: &str, char_index: usize) -> DataResult<u8> {
         let end = char_index + 2;
-        let pair = raw
-            .get(char_index..end)
-            .ok_or_else(|| {
-                DataError::Csv(format!(
-                    "报文长度异常：需要读取第 {char_index}-{end} 个十六进制字符，但当前报文只有 {} 个字符",
-                    raw.len()
-                ))
-            })?;
+        let pair = raw.get(char_index..end).ok_or_else(|| {
+            DataError::Csv(format!(
+                "Invalid record length: need characters {char_index}-{end}, got {}",
+                raw.len()
+            ))
+        })?;
         u8::from_str_radix(pair, 16)
-            .map_err(|_| DataError::Csv(format!("文件格式错误：发现非法十六进制字节 `{pair}`")))
+            .map_err(|_| DataError::Csv(format!("Invalid hexadecimal byte `{pair}`")))
     }
 
     fn parse_words(raw: &str, start: usize, word_count: usize) -> DataResult<[u16; RAW_WORDS]> {
         if word_count != RAW_WORDS {
             return Err(DataError::Csv(format!(
-                "报文字段不足或长度异常：每个截面需要 {RAW_WORDS} 个 16-bit word，实际解析到 {word_count} 个"
+                "Invalid record word count: expected {RAW_WORDS}, got {word_count}"
             )));
         }
         let mut words = [0_u16; RAW_WORDS];
@@ -88,37 +91,37 @@ impl CloudCsvDataSource {
         values[30] = (hex1 & 0x0007) as f32;
 
         let mut bit = 3_u16;
-        for channel in 31..43 {
-            values[channel] = ((hex1 >> bit) & 1) as f32;
+        for value in values.iter_mut().take(43).skip(31) {
+            *value = ((hex1 >> bit) & 1) as f32;
             bit += 1;
         }
 
-        for channel in 43..CHANNEL_COUNT {
+        for value in values.iter_mut().take(CHANNEL_COUNT).skip(43) {
             if bit > 15 {
                 bit = 0;
             }
-            values[channel] = ((hex2 >> bit) & 1) as f32;
+            *value = ((hex2 >> bit) & 1) as f32;
             bit += 1;
         }
 
         values
     }
 
-    fn parse_record(line: &str) -> DataResult<[[f32; CHANNEL_COUNT]; 2]> {
-        let raw = Self::content_field(line);
+    fn parse_record(raw: &str) -> DataResult<[[f32; CHANNEL_COUNT]; 2]> {
+        let raw = raw.trim();
         if raw.is_empty() {
-            return Err(DataError::Csv("字段不足：Content 为空".to_owned()));
+            return Err(DataError::Csv("Content field is empty".to_owned()));
         }
 
         let frame_len = Self::hex_byte_at(raw, 6)? as usize;
         let sublength = frame_len.checked_sub(5).ok_or_else(|| {
             DataError::Csv(format!(
-                "报文长度异常：长度字段为 {frame_len}，小于最小头部长度 5"
+                "Invalid frame length {frame_len}: shorter than the 5-byte header"
             ))
         })?;
         if sublength % 2 != 0 {
             return Err(DataError::Csv(format!(
-                "报文长度异常：数据区字节数 {sublength} 不是 16-bit word 的整数倍"
+                "Invalid payload byte count {sublength}: not a whole number of 16-bit words"
             )));
         }
         let word_count = sublength / 2;
@@ -130,58 +133,63 @@ impl CloudCsvDataSource {
         Ok([Self::expand_words(&words1), Self::expand_words(&words2)])
     }
 
+    fn parse_record_from_csv(
+        record: &StringRecord,
+        content_column: usize,
+    ) -> DataResult<[[f32; CHANNEL_COUNT]; 2]> {
+        let raw = Self::content_from_record(record, content_column)?;
+        Self::parse_record(raw)
+    }
+
     pub fn open_with_sample_rate(path: &Path, sample_rate_hz: f64) -> DataResult<Self> {
         let sample_rate_hz = sample_rate_hz.max(1.0);
-        let mut file = File::open(path)?;
-        let mut reader = BufReader::new(&mut file);
-        let mut header = String::new();
-        let header_bytes = reader.read_line(&mut header)?;
-        if header_bytes == 0 {
-            return Err(DataError::Empty);
-        }
-        let normalized_header = header
-            .trim_start_matches('\u{feff}')
-            .trim()
-            .trim_matches('"');
-        if !normalized_header.eq_ignore_ascii_case("content") {
+        let mut reader = Self::reader_from_path(path)?;
+        let headers = reader.headers()?;
+        let Some(content_column) = headers.iter().position(|header| {
+            header
+                .trim_start_matches('\u{feff}')
+                .eq_ignore_ascii_case("content")
+        }) else {
             return Err(DataError::Csv(format!(
-                "文件格式错误：云端录波 CSV 第一行必须是单列 `Content`，当前为 `{normalized_header}`"
+                "Cloud Content CSV must include a `Content` header, found `{}`",
+                headers.iter().collect::<Vec<_>>().join(",")
             )));
-        }
+        };
 
         let mut blocks = Vec::new();
         let mut current: Option<BlockIndex> = None;
         let mut parsed_records = 0_u64;
         let mut skipped_records = 0_u64;
         let mut first_parse_error: Option<String> = None;
-        let mut line_number = 1_u64;
+        let mut record = StringRecord::new();
 
         loop {
-            let offset = reader.stream_position()?;
-            let mut line = String::new();
-            let bytes = reader.read_line(&mut line)?;
-            if bytes == 0 {
+            let position = reader.position().clone();
+            if !reader.read_record(&mut record)? {
                 break;
             }
-            line_number += 1;
-            let frames = match Self::parse_record(&line) {
+            let line_number = record.position().map(|pos| pos.line()).unwrap_or(0);
+            let frames = match Self::parse_record_from_csv(&record, content_column) {
                 Ok(frames) => frames,
                 Err(error) => {
                     skipped_records += 1;
-                    first_parse_error
-                        .get_or_insert_with(|| format!("第 {line_number} 行：{error}"));
+                    first_parse_error.get_or_insert_with(|| format!("line {line_number}: {error}"));
                     continue;
                 }
             };
 
             let needs_new = current
                 .as_ref()
-                .map_or(true, |block| block.records >= INDEX_BLOCK_RECORDS);
+                .is_none_or(|block| block.records >= INDEX_BLOCK_RECORDS);
             if needs_new {
                 if let Some(block) = current.take() {
                     blocks.push(block);
                 }
-                current = Some(Self::new_block(offset, parsed_records * 2, sample_rate_hz));
+                current = Some(Self::new_block(
+                    position,
+                    parsed_records * 2,
+                    sample_rate_hz,
+                ));
             }
 
             if let Some(block) = current.as_mut() {
@@ -195,10 +203,10 @@ impl CloudCsvDataSource {
         }
         if parsed_records == 0 {
             let detail = first_parse_error
-                .map(|error| format!("第一条错误：{error}"))
-                .unwrap_or_else(|| "未发现 Content 数据行".to_owned());
+                .map(|error| format!("First error: {error}"))
+                .unwrap_or_else(|| "No Content data rows found.".to_owned());
             return Err(DataError::Csv(format!(
-                "没有解析到有效云端报文；跳过 {skipped_records} 行。{detail}"
+                "No valid cloud records parsed; skipped {skipped_records} row(s). {detail}"
             )));
         }
 
@@ -224,7 +232,7 @@ impl CloudCsvDataSource {
 
         Ok(Self {
             path: path.to_owned(),
-            header_offset: header_bytes as u64,
+            content_column,
             sample_rate_hz,
             meta: DatasetMeta {
                 source_name,
@@ -238,9 +246,9 @@ impl CloudCsvDataSource {
         })
     }
 
-    fn new_block(offset: u64, start_sample: u64, sample_rate_hz: f64) -> BlockIndex {
+    fn new_block(position: Position, start_sample: u64, sample_rate_hz: f64) -> BlockIndex {
         BlockIndex {
-            offset,
+            position,
             start_sample,
             records: 0,
             start_time: start_sample as f64 / sample_rate_hz,
@@ -258,9 +266,9 @@ impl CloudCsvDataSource {
         block.records += 1;
         block.end_time = (block.start_sample + block.records * 2 - 1) as f64 / sample_rate_hz;
         for frame in frames {
-            for channel in 0..CHANNEL_COUNT {
-                block.min[channel] = block.min[channel].min(frame[channel]);
-                block.max[channel] = block.max[channel].max(frame[channel]);
+            for (channel, value) in frame.iter().enumerate() {
+                block.min[channel] = block.min[channel].min(*value);
+                block.max[channel] = block.max[channel].max(*value);
             }
         }
     }
@@ -312,13 +320,16 @@ impl DataSource for CloudCsvDataSource {
         }
 
         let first_block = self.find_block_for_time(start_time);
-        let mut file = File::open(&self.path)?;
-        file.seek(SeekFrom::Start(
-            self.blocks[first_block].offset.max(self.header_offset),
-        ))?;
-        let mut reader = BufReader::new(file);
-        let estimated_points =
-            ((end_time - start_time) * self.sample_rate_hz + 1.0).max(1.0) as usize;
+        let mut reader = Self::reader_from_path(&self.path)?;
+        reader.seek(self.blocks[first_block].position.clone())?;
+        let remaining_samples = self
+            .meta
+            .sample_count
+            .saturating_sub(self.blocks[first_block].start_sample)
+            .max(1) as usize;
+        let estimated_points = (((end_time - start_time) * self.sample_rate_hz + 1.0).max(1.0)
+            as usize)
+            .min(remaining_samples);
         let stride = (estimated_points / max_points.max(1)).max(1);
         let mut sample_index = self.blocks[first_block].start_sample;
         let mut seen = 0_usize;
@@ -327,14 +338,10 @@ impl DataSource for CloudCsvDataSource {
         let mut channel_values = (0..channels.len())
             .map(|_| Vec::with_capacity(capacity))
             .collect::<Vec<_>>();
+        let mut record = StringRecord::new();
 
-        loop {
-            let mut line = String::new();
-            let bytes = reader.read_line(&mut line)?;
-            if bytes == 0 {
-                break;
-            }
-            let Ok(frames) = Self::parse_record(&line) else {
+        while reader.read_record(&mut record)? {
+            let Ok(frames) = Self::parse_record_from_csv(&record, self.content_column) else {
                 continue;
             };
 
@@ -350,7 +357,7 @@ impl DataSource for CloudCsvDataSource {
                         channels: channel_values,
                     });
                 }
-                if seen % stride == 0 {
+                if seen.is_multiple_of(stride) {
                     times.push(time);
                     for (out_index, &channel) in channels.iter().enumerate() {
                         channel_values[out_index].push(frame[channel]);
@@ -433,13 +440,34 @@ impl DataSource for CloudCsvDataSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs::File, io::Write};
+
+    const RECORD: &str = "01148c450610020000a9203d109b1f590b10f09d033ffe55011c00bb0b9df04202aa0b6cf01b03c4fa6d0d37f7b8147002590c9eff590c79ffdcfffbff26fe30fe0000000073fc4d804506100220007b2037109b1fb50edff2e8fdebf64b060601c70dc9f30bfdc00edff219fe26ef39128ffc81147102590caaff560c9dffc5ffefffc5f6c9f70000000073fc4d8057c5";
 
     #[test]
     fn parses_one_cloud_record_into_two_samples() {
-        let line = "01148c450610020000a9203d109b1f590b10f09d033ffe55011c00bb0b9df04202aa0b6cf01b03c4fa6d0d37f7b8147002590c9eff590c79ffdcfffbff26fe30fe0000000073fc4d804506100220007b2037109b1fb50edff2e8fdebf64b060601c70dc9f30bfdc00edff219fe26ef39128ffc81147102590caaff560c9dffc5ffefffc5f6c9f70000000073fc4d8057c5";
-        let frames = CloudCsvDataSource::parse_record(line).unwrap();
+        let frames = CloudCsvDataSource::parse_record(RECORD).unwrap();
         assert_eq!(frames[0].len(), CHANNEL_COUNT);
         assert_eq!(frames[0][0], 8361.0);
         assert_eq!(frames[0][30], 3.0);
+    }
+
+    #[test]
+    fn opens_content_csv_with_standard_reader() {
+        let path = std::env::temp_dir().join("scope_analyzer_cloud_test.csv");
+        let mut file = File::create(&path).unwrap();
+        writeln!(file, "Content,Ignored").unwrap();
+        writeln!(file, "{RECORD},metadata").unwrap();
+        drop(file);
+
+        let source = CloudCsvDataSource::open(&path).unwrap();
+        assert_eq!(source.metadata().channels.len(), CHANNEL_COUNT);
+        assert_eq!(source.metadata().sample_count, 2);
+
+        let block = source.read_range(0.0, 1.0, &[0, 30], 100).unwrap();
+        assert_eq!(block.channels.len(), 2);
+        assert_eq!(block.times.len(), 2);
+
+        let _ = std::fs::remove_file(path);
     }
 }

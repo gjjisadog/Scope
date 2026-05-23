@@ -10,6 +10,10 @@ pub enum DataError {
     Io(#[from] std::io::Error),
     #[error("CSV 格式错误：{0}")]
     Csv(String),
+    #[error("CSV read error: {0}")]
+    CsvRead(#[from] csv::Error),
+    #[error("DAT format error: {0}")]
+    Dat(String),
     #[error("字段不足：没有找到数值通道。请确认第一行包含时间列和至少 1 个通道列。")]
     NoChannels,
     #[error("空文件或没有有效采样点。请确认文件不是空文件，且数据行格式正确。")]
@@ -17,6 +21,7 @@ pub enum DataError {
     #[error("通道索引超出范围。当前文件的通道数量少于请求的通道。")]
     BadChannel,
     #[error("暂不支持该文件格式：{0}")]
+    #[allow(dead_code)]
     UnsupportedFormat(String),
 }
 
@@ -25,7 +30,9 @@ pub struct ChannelMeta {
     pub index: usize,
     pub name: String,
     pub unit: String,
+    #[allow(dead_code)]
     pub sample_rate_hz: f64,
+    #[allow(dead_code)]
     pub scale: f32,
     pub default_visible: bool,
 }
@@ -60,7 +67,7 @@ pub struct RangeSummary {
     pub max: Vec<Vec<f32>>,
 }
 
-pub trait DataSource {
+pub trait DataSource: Send + Sync {
     fn open(path: &Path) -> DataResult<Self>
     where
         Self: Sized;

@@ -6,7 +6,8 @@ description = "Windows offline oscilloscope-style waveform analyzer"
 license = "Proprietary"
 
 [dependencies]
-eframe = "0.27"
+csv = "1.4"
+eframe = { version = "0.27", default-features = false, features = ["default_fonts", "glow", "wgpu"] }
 egui_plot = "0.27"
 rfd = "0.14"
 rustfft = "6.2"
@@ -16,8 +17,13 @@ thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
+[patch.crates-io]
+eframe = { path = "vendor/eframe-0.27.2-angle" }
+egui-wgpu = { path = "vendor/egui-wgpu-0.27.2-fallback" }
+egui_plot = { path = "vendor/egui_plot-0.27.2-shared" }
+
 [profile.release]
 lto = true
 codegen-units = 1
 strip = true
-panic = "abort"
+panic = "unwind"

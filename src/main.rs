@@ -1,18 +1,207 @@
 mod app;
 mod data;
 mod fft;
+mod transforms;
+
+use std::{
+    fs::OpenOptions,
+    io::Write as _,
+    process::{Command, ExitStatus},
+    time::{Duration, SystemTime},
+};
+
+const RENDERER_CHILD_ENV: &str = "SCOPE_RENDERER_CHILD";
+const RENDERER_ENV: &str = "SCOPE_RENDERER";
+const FALLBACK_WAIT: Duration = Duration::from_secs(6);
+const DEFAULT_RENDERER_ORDER: [RendererMode; 4] = [
+    RendererMode::GlowHardware,
+    RendererMode::GlowSoftware,
+    RendererMode::WgpuDx12,
+    RendererMode::WgpuDx12Software,
+];
+
+#[derive(Clone, Copy, Debug)]
+enum RendererMode {
+    GlowHardware,
+    GlowSoftware,
+    WgpuDx12,
+    WgpuDx12Software,
+}
+
+impl RendererMode {
+    fn from_env_value(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "glow" | "opengl" => Some(Self::GlowHardware),
+            "glow-software" | "opengl-software" | "software" => Some(Self::GlowSoftware),
+            "wgpu" | "dx12" => Some(Self::WgpuDx12),
+            "wgpu-software" | "dx12-software" | "warp" => Some(Self::WgpuDx12Software),
+            _ => None,
+        }
+    }
+
+    fn env_value(self) -> &'static str {
+        match self {
+            Self::GlowHardware => "glow",
+            Self::GlowSoftware => "glow-software",
+            Self::WgpuDx12 => "wgpu",
+            Self::WgpuDx12Software => "wgpu-software",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::GlowHardware => "glow/OpenGL hardware",
+            Self::GlowSoftware => "glow/OpenGL software",
+            Self::WgpuDx12 => "wgpu/DX12",
+            Self::WgpuDx12Software => "wgpu/DX12 software/WARP",
+        }
+    }
+
+    fn renderer(self) -> eframe::Renderer {
+        match self {
+            Self::GlowHardware | Self::GlowSoftware => eframe::Renderer::Glow,
+            Self::WgpuDx12 | Self::WgpuDx12Software => eframe::Renderer::Wgpu,
+        }
+    }
+
+    fn hardware_acceleration(self) -> eframe::HardwareAcceleration {
+        match self {
+            Self::GlowSoftware | Self::WgpuDx12Software => eframe::HardwareAcceleration::Off,
+            Self::GlowHardware | Self::WgpuDx12 => eframe::HardwareAcceleration::Preferred,
+        }
+    }
+
+    fn force_wgpu_fallback_adapter(self) -> bool {
+        matches!(self, Self::WgpuDx12Software)
+    }
+}
 
 fn main() -> eframe::Result<()> {
+    configure_graphics_runtime();
+
     tracing_subscriber::fmt()
         .with_env_filter("scope_analyzer=info,warn")
         .with_target(false)
         .init();
+
+    if let Ok(renderer) = std::env::var(RENDERER_ENV) {
+        if let Some(mode) = RendererMode::from_env_value(&renderer) {
+            write_startup_log(&format!("starting renderer: {}", mode.label()));
+            return run_app(mode);
+        }
+        write_startup_log(&format!(
+            "unknown {RENDERER_ENV}={renderer}; using automatic fallback"
+        ));
+    }
+
+    if std::env::var_os(RENDERER_CHILD_ENV).is_none() {
+        return launch_with_process_fallback();
+    }
+
+    match try_run_app(RendererMode::GlowHardware) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            tracing::warn!("Glow/OpenGL renderer failed, retrying with software fallback: {error}");
+            write_startup_log(&format!("in-process glow/OpenGL failed: {error}"));
+            run_app(RendererMode::GlowSoftware)
+        }
+        Err(_) => {
+            tracing::warn!(
+                "Glow/OpenGL renderer panicked during startup, retrying software fallback"
+            );
+            write_startup_log("in-process glow/OpenGL panicked");
+            run_app(RendererMode::GlowSoftware)
+        }
+    }
+}
+
+fn launch_with_process_fallback() -> eframe::Result<()> {
+    for mode in DEFAULT_RENDERER_ORDER {
+        write_startup_log(&format!("launcher: starting {} child", mode.label()));
+        match spawn_renderer_child(mode) {
+            Ok(mut child) => {
+                let started = SystemTime::now();
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            write_startup_log(&format!(
+                                "launcher: {} child exited early: {}",
+                                mode.label(),
+                                status_text(status)
+                            ));
+                            if status.success() {
+                                return Ok(());
+                            }
+                            break;
+                        }
+                        Ok(None) => {
+                            if started.elapsed().unwrap_or_default() >= FALLBACK_WAIT {
+                                write_startup_log(&format!(
+                                    "launcher: {} child is still running; startup accepted",
+                                    mode.label()
+                                ));
+                                return Ok(());
+                            }
+                            std::thread::sleep(Duration::from_millis(150));
+                        }
+                        Err(error) => {
+                            write_startup_log(&format!(
+                                "launcher: failed to monitor {} child: {error}",
+                                mode.label()
+                            ));
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                write_startup_log(&format!(
+                    "launcher: failed to start {} child: {error}",
+                    mode.label()
+                ));
+            }
+        }
+    }
+    write_startup_log("launcher: all child renderers failed; running WARP fallback in-process");
+    run_app(RendererMode::WgpuDx12Software)
+}
+
+fn spawn_renderer_child(mode: RendererMode) -> std::io::Result<std::process::Child> {
+    let exe = std::env::current_exe()?;
+    Command::new(exe)
+        .env(RENDERER_CHILD_ENV, "1")
+        .env(RENDERER_ENV, mode.env_value())
+        .spawn()
+}
+
+fn status_text(status: ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exit code {code}"),
+        None => "terminated by system".to_owned(),
+    }
+}
+
+fn try_run_app(mode: RendererMode) -> std::thread::Result<eframe::Result<()>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_app(mode)))
+}
+
+fn run_app(mode: RendererMode) -> eframe::Result<()> {
+    let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
+    wgpu_options.supported_backends = eframe::wgpu::Backends::DX12;
+    wgpu_options.power_preference = eframe::wgpu::PowerPreference::LowPower;
+    wgpu_options.force_fallback_adapter = mode.force_wgpu_fallback_adapter();
 
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Scope Analyzer")
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([980.0, 640.0]),
+        renderer: mode.renderer(),
+        hardware_acceleration: mode.hardware_acceleration(),
+        wgpu_options,
+        multisampling: 0,
+        depth_buffer: 0,
+        stencil_buffer: 0,
         ..Default::default()
     };
 
@@ -21,4 +210,74 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(|cc| Box::new(app::ScopeApp::new(cc))),
     )
+}
+
+fn configure_graphics_runtime() {
+    let mut angle_dirs = Vec::new();
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        let system_root = std::path::PathBuf::from(system_root);
+        angle_dirs.push(system_root.join("System32").join("Microsoft-Edge-WebView"));
+    }
+    angle_dirs.push(std::path::PathBuf::from(
+        r"C:\Program Files (x86)\Microsoft\EdgeWebView\Application",
+    ));
+    angle_dirs.push(std::path::PathBuf::from(
+        r"C:\Program Files (x86)\Microsoft\Edge\Application",
+    ));
+    angle_dirs.push(std::path::PathBuf::from(
+        r"C:\Program Files\Microsoft\Edge\Application",
+    ));
+
+    let mut dll_dirs = Vec::new();
+    for base in angle_dirs {
+        if base.join("libEGL.dll").is_file() && base.join("libGLESv2.dll").is_file() {
+            dll_dirs.push(base);
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&base) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir()
+                && path.join("libEGL.dll").is_file()
+                && path.join("libGLESv2.dll").is_file()
+            {
+                dll_dirs.push(path);
+            }
+        }
+    }
+
+    if dll_dirs.is_empty() {
+        return;
+    }
+
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = dll_dirs;
+    paths.extend(std::env::split_paths(&old_path));
+    if let Ok(joined) = std::env::join_paths(paths) {
+        std::env::set_var("PATH", joined);
+    }
+}
+
+fn write_startup_log(message: &str) {
+    let mut paths = startup_log_paths();
+    for path in paths.drain(..) {
+        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+            continue;
+        };
+        let _ = writeln!(file, "{:?} {message}", SystemTime::now());
+        break;
+    }
+}
+
+fn startup_log_paths() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            paths.push(parent.join("ScopeAnalyzer-startup.log"));
+        }
+    }
+    paths.push(std::env::temp_dir().join("ScopeAnalyzer-startup.log"));
+    paths
 }

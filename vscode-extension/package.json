@@ -1,0 +1,49 @@
+{
+  "name": "scope-analyzer-vscode",
+  "displayName": "Scope Analyzer",
+  "description": "Open oscilloscope waveform CSV and DAT files in a VS Code webview.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "license": "Proprietary",
+  "engines": {
+    "vscode": "^1.88.0"
+  },
+  "categories": [
+    "Visualization",
+    "Data Science",
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:scopeAnalyzer.openFile",
+    "onCommand:scopeAnalyzer.openActiveFile"
+  ],
+  "main": "./src/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "scopeAnalyzer.openFile",
+        "title": "Scope Analyzer: Open Waveform Data"
+      },
+      {
+        "command": "scopeAnalyzer.openActiveFile",
+        "title": "Scope Analyzer: Open Active Waveform"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "scopeAnalyzer.openFile",
+          "when": "resourceExtname == .csv || resourceExtname == .dat",
+          "group": "navigation"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "scopeAnalyzer.openActiveFile",
+          "when": "resourceExtname == .csv || resourceExtname == .dat",
+          "group": "navigation"
+        }
+      ]
+    }
+  }
+}

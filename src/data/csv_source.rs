@@ -1,9 +1,9 @@
 use std::{
     cmp::Ordering,
-    fs::File,
-    io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
+
+use csv::{Position, ReaderBuilder, StringRecord, Trim};
 
 use super::{
     ChannelMeta, DataError, DataResult, DataSource, DatasetMeta, RangeSummary, SampleBlock,
@@ -14,8 +14,8 @@ const INDEX_BLOCK_ROWS: u64 = 4096;
 
 #[derive(Clone, Debug)]
 struct BlockIndex {
-    offset: u64,
-    first_row: u64,
+    position: Position,
+    start_sample: u64,
     rows: u64,
     start_time: f64,
     end_time: f64,
@@ -23,103 +23,209 @@ struct BlockIndex {
     max: Vec<f32>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum CsvLayout {
+    TimeColumn,
+    SyntheticTime { sample_interval_s: f64 },
+}
+
 pub struct CsvDataSource {
     path: PathBuf,
-    header_offset: u64,
+    layout: CsvLayout,
     meta: DatasetMeta,
     blocks: Vec<BlockIndex>,
 }
 
 impl CsvDataSource {
-    fn parse_header(line: &str) -> Vec<String> {
-        line.trim_end()
-            .split(',')
-            .map(|s| s.trim().trim_matches('"').to_owned())
-            .collect()
+    fn reader_from_path(path: &Path) -> DataResult<csv::Reader<std::fs::File>> {
+        Ok(ReaderBuilder::new()
+            .flexible(true)
+            .has_headers(false)
+            .trim(Trim::All)
+            .from_path(path)?)
     }
 
-    fn parse_sample(line: &str, channel_count: usize) -> Result<(f64, Vec<f32>), String> {
-        let mut parts = line.trim_end().split(',');
-        let Some(raw_time) = parts.next() else {
-            return Err("字段不足：缺少时间列".to_owned());
-        };
-        let time = raw_time
-            .trim()
-            .parse::<f64>()
-            .map_err(|_| format!("时间列不是有效数字：{}", raw_time.trim()))?;
-        if !time.is_finite() {
-            return Err(format!("时间列不是有限数字：{}", raw_time.trim()));
+    fn is_end_marker(record: &StringRecord) -> bool {
+        record.iter().any(|field| {
+            let field = field.trim();
+            !field.is_empty() && field.to_ascii_lowercase().contains("end")
+        })
+    }
+
+    fn first_non_empty(record: &StringRecord) -> Option<&str> {
+        record.iter().find_map(|field| {
+            let field = field.trim().trim_start_matches('\u{feff}');
+            (!field.is_empty()).then_some(field)
+        })
+    }
+
+    fn parse_positive_f64(raw: &str) -> Option<f64> {
+        let value = raw.trim().parse::<f64>().ok()?;
+        (value.is_finite() && value > 0.0).then_some(value)
+    }
+
+    fn discover_layout(
+        reader: &mut csv::Reader<std::fs::File>,
+    ) -> DataResult<(CsvLayout, Vec<String>)> {
+        let mut record = StringRecord::new();
+        if !reader.read_record(&mut record)? {
+            return Err(DataError::Empty);
         }
-        let mut values = Vec::with_capacity(channel_count);
-        for (index, raw) in parts.take(channel_count).enumerate() {
-            let raw = raw.trim();
-            if raw.is_empty() {
-                values.push(f32::NAN);
-            } else {
-                let value = raw
-                    .parse::<f32>()
-                    .map_err(|_| format!("第 {} 个通道值不是有效数字：{raw}", index + 1))?;
-                values.push(if value.is_finite() { value } else { f32::NAN });
+
+        let first_key = Self::first_non_empty(&record)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if first_key != "file_path" {
+            let names = record
+                .iter()
+                .map(|name| name.trim_start_matches('\u{feff}').to_owned())
+                .collect::<Vec<_>>();
+            return Ok((CsvLayout::TimeColumn, names));
+        }
+
+        let mut sample_interval_s = None;
+        loop {
+            let mut metadata = StringRecord::new();
+            if !reader.read_record(&mut metadata)? {
+                return Err(DataError::Csv(
+                    "Metadata CSV is missing an END marker and channel header row.".to_owned(),
+                ));
+            }
+
+            let key = Self::first_non_empty(&metadata)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if key == "dt" {
+                sample_interval_s = metadata.iter().skip(1).find_map(Self::parse_positive_f64);
+            }
+
+            if Self::is_end_marker(&metadata) {
+                break;
             }
         }
-        if values.len() == channel_count {
-            Ok((time, values))
-        } else {
-            Err(format!(
-                "字段不足：需要 {channel_count} 个通道值，实际只有 {} 个",
-                values.len()
-            ))
+
+        loop {
+            let mut names = StringRecord::new();
+            if !reader.read_record(&mut names)? {
+                return Err(DataError::Csv(
+                    "Metadata CSV is missing a channel header row after END.".to_owned(),
+                ));
+            }
+            if names.iter().any(|field| !field.trim().is_empty()) {
+                let names = names
+                    .iter()
+                    .map(|name| name.trim_start_matches('\u{feff}').to_owned())
+                    .collect::<Vec<_>>();
+                let sample_interval_s = sample_interval_s.ok_or_else(|| {
+                    DataError::Csv("Metadata CSV is missing a positive dt value.".to_owned())
+                })?;
+                return Ok((CsvLayout::SyntheticTime { sample_interval_s }, names));
+            }
         }
     }
 
-    fn parse_time(line: &str) -> Result<f64, String> {
-        let Some(raw_time) = line.trim_end().split(',').next() else {
-            return Err("字段不足：缺少时间列".to_owned());
-        };
+    fn parse_time_field(raw_time: &str) -> Result<f64, String> {
         let time = raw_time
-            .trim()
             .parse::<f64>()
-            .map_err(|_| format!("时间列不是有效数字：{}", raw_time.trim()))?;
+            .map_err(|_| format!("Invalid time value: {raw_time}"))?;
         if time.is_finite() {
             Ok(time)
         } else {
-            Err(format!("时间列不是有限数字：{}", raw_time.trim()))
+            Err(format!("Time value is not finite: {raw_time}"))
         }
     }
 
+    fn parse_channel_value(raw: &str, channel_index: usize) -> Result<f32, String> {
+        if raw.is_empty() {
+            return Ok(f32::NAN);
+        }
+        let value = raw
+            .parse::<f32>()
+            .map_err(|_| format!("Invalid value in channel {}: {raw}", channel_index + 1))?;
+        Ok(if value.is_finite() { value } else { f32::NAN })
+    }
+
+    fn parse_sample(
+        record: &StringRecord,
+        channel_count: usize,
+    ) -> Result<(f64, Vec<f32>), String> {
+        let raw_time = record
+            .get(0)
+            .ok_or_else(|| "Missing time column".to_owned())?;
+        let time = Self::parse_time_field(raw_time)?;
+        let mut values = Vec::with_capacity(channel_count);
+        for index in 0..channel_count {
+            let raw = record.get(index + 1).ok_or_else(|| {
+                format!(
+                    "Missing channel fields: expected {channel_count}, got {}",
+                    record.len().saturating_sub(1)
+                )
+            })?;
+            values.push(Self::parse_channel_value(raw, index)?);
+        }
+        Ok((time, values))
+    }
+
+    fn parse_time(record: &StringRecord) -> Result<f64, String> {
+        let raw_time = record
+            .get(0)
+            .ok_or_else(|| "Missing time column".to_owned())?;
+        Self::parse_time_field(raw_time)
+    }
+
     fn parse_selected_values(
-        line: &str,
+        record: &StringRecord,
         channel_count: usize,
         channels: &[usize],
     ) -> Result<Vec<f32>, String> {
-        let mut selected = vec![f32::NAN; channels.len()];
-        let mut found = vec![false; channels.len()];
-        let mut parts = line.trim_end().split(',');
-        parts.next();
-        for (index, raw) in parts.take(channel_count).enumerate() {
-            let Some(out_index) = channels.iter().position(|channel| *channel == index) else {
-                continue;
-            };
-            let raw = raw.trim();
-            selected[out_index] = if raw.is_empty() {
-                f32::NAN
-            } else {
-                let value = raw
-                    .parse::<f32>()
-                    .map_err(|_| format!("第 {} 个通道值不是有效数字：{raw}", index + 1))?;
-                if value.is_finite() {
-                    value
-                } else {
-                    f32::NAN
-                }
-            };
-            found[out_index] = true;
+        let mut selected = Vec::with_capacity(channels.len());
+        for &channel in channels {
+            if channel >= channel_count {
+                return Err("Requested channel is out of range".to_owned());
+            }
+            let raw = record
+                .get(channel + 1)
+                .ok_or_else(|| "Requested channel column is missing".to_owned())?;
+            selected.push(Self::parse_channel_value(raw, channel)?);
         }
-        if found.iter().all(|present| *present) {
-            Ok(selected)
-        } else {
-            Err("字段不足：请求的通道列不存在或数据列不足".to_owned())
+        Ok(selected)
+    }
+
+    fn parse_synthetic_sample(
+        record: &StringRecord,
+        channel_count: usize,
+        sample_index: u64,
+        sample_interval_s: f64,
+    ) -> Result<(f64, Vec<f32>), String> {
+        let mut values = Vec::with_capacity(channel_count);
+        for index in 0..channel_count {
+            let raw = record.get(index).ok_or_else(|| {
+                format!(
+                    "Missing channel fields: expected {channel_count}, got {}",
+                    record.len()
+                )
+            })?;
+            values.push(Self::parse_channel_value(raw, index)?);
         }
+        Ok((sample_index as f64 * sample_interval_s, values))
+    }
+
+    fn parse_synthetic_selected_values(
+        record: &StringRecord,
+        channel_count: usize,
+        channels: &[usize],
+    ) -> Result<Vec<f32>, String> {
+        let mut selected = Vec::with_capacity(channels.len());
+        for &channel in channels {
+            if channel >= channel_count {
+                return Err("Requested channel is out of range".to_owned());
+            }
+            let raw = record
+                .get(channel)
+                .ok_or_else(|| "Requested channel column is missing".to_owned())?;
+            selected.push(Self::parse_channel_value(raw, channel)?);
+        }
+        Ok(selected)
     }
 
     fn find_block_for_time(&self, time: f64) -> usize {
@@ -150,46 +256,48 @@ impl CsvDataSource {
 
 impl DataSource for CsvDataSource {
     fn open(path: &Path) -> DataResult<Self> {
-        let mut file = File::open(path)?;
-        let mut reader = BufReader::new(&mut file);
-        let mut header = String::new();
-        let header_bytes = reader.read_line(&mut header)?;
-        if header_bytes == 0 {
-            return Err(DataError::Empty);
-        }
-
-        let names = Self::parse_header(&header);
-        if names.len() < 2 {
+        let mut reader = Self::reader_from_path(path)?;
+        let (layout, names) = Self::discover_layout(&mut reader)?;
+        let channel_count = match layout {
+            CsvLayout::TimeColumn => names.len().saturating_sub(1).min(MAX_CHANNELS),
+            CsvLayout::SyntheticTime { .. } => names.len().min(MAX_CHANNELS),
+        };
+        if channel_count == 0 {
             return Err(DataError::NoChannels);
         }
 
-        let channel_count = (names.len() - 1).min(MAX_CHANNELS);
         let mut blocks = Vec::new();
         let mut current: Option<BlockIndex> = None;
         let mut row_count = 0_u64;
         let mut skipped_rows = 0_u64;
         let mut first_parse_error: Option<String> = None;
-        let mut line_number = 1_u64;
         let mut first_time: Option<f64> = None;
         let mut last_time: Option<f64> = None;
         let mut previous_time: Option<f64> = None;
         let mut dt_sum = 0.0_f64;
         let mut dt_count = 0_u64;
+        let mut record = StringRecord::new();
 
         loop {
-            let offset = reader.stream_position()?;
-            let mut line = String::new();
-            let bytes = reader.read_line(&mut line)?;
-            if bytes == 0 {
+            let position = reader.position().clone();
+            if !reader.read_record(&mut record)? {
                 break;
             }
-            line_number += 1;
-            let (time, values) = match Self::parse_sample(&line, channel_count) {
+            let line_number = record.position().map(|pos| pos.line()).unwrap_or(0);
+            let sample_result = match &layout {
+                CsvLayout::TimeColumn => Self::parse_sample(&record, channel_count),
+                CsvLayout::SyntheticTime { sample_interval_s } => Self::parse_synthetic_sample(
+                    &record,
+                    channel_count,
+                    row_count,
+                    *sample_interval_s,
+                ),
+            };
+            let (time, values) = match sample_result {
                 Ok(sample) => sample,
                 Err(error) => {
                     skipped_rows += 1;
-                    first_parse_error
-                        .get_or_insert_with(|| format!("第 {line_number} 行：{error}"));
+                    first_parse_error.get_or_insert_with(|| format!("line {line_number}: {error}"));
                     continue;
                 }
             };
@@ -207,14 +315,14 @@ impl DataSource for CsvDataSource {
 
             let needs_new = current
                 .as_ref()
-                .map_or(true, |block| block.rows >= INDEX_BLOCK_ROWS);
+                .is_none_or(|block| block.rows >= INDEX_BLOCK_ROWS);
             if needs_new {
                 if let Some(block) = current.take() {
                     blocks.push(block);
                 }
                 current = Some(BlockIndex {
-                    offset,
-                    first_row: row_count,
+                    position,
+                    start_sample: row_count,
                     rows: 0,
                     start_time: time,
                     end_time: time,
@@ -243,7 +351,7 @@ impl DataSource for CsvDataSource {
         if row_count == 0 {
             if let Some(error) = first_parse_error {
                 return Err(DataError::Csv(format!(
-                    "没有解析到有效数据行；跳过 {skipped_rows} 行。第一条错误：{error}"
+                    "No valid data rows parsed; skipped {skipped_rows} row(s). First error: {error}"
                 )));
             }
             return Err(DataError::Empty);
@@ -253,14 +361,17 @@ impl DataSource for CsvDataSource {
         let end_time = last_time.unwrap_or(start_time);
         let nominal_sample_rate_hz = if dt_count > 0 {
             1.0 / (dt_sum / dt_count as f64)
+        } else if let CsvLayout::SyntheticTime { sample_interval_s } = layout {
+            1.0 / sample_interval_s
         } else {
             1.0
         };
 
-        let channels = names
-            .iter()
-            .skip(1)
-            .take(channel_count)
+        let name_iter: Box<dyn Iterator<Item = &String>> = match layout {
+            CsvLayout::TimeColumn => Box::new(names.iter().skip(1).take(channel_count)),
+            CsvLayout::SyntheticTime { .. } => Box::new(names.iter().take(channel_count)),
+        };
+        let channels = name_iter
             .enumerate()
             .map(|(index, name)| ChannelMeta {
                 index,
@@ -284,7 +395,7 @@ impl DataSource for CsvDataSource {
 
         Ok(Self {
             path: path.to_owned(),
-            header_offset: header_bytes as u64,
+            layout,
             meta: DatasetMeta {
                 source_name,
                 channels,
@@ -314,11 +425,9 @@ impl DataSource for CsvDataSource {
         }
 
         let first_block = self.find_block_for_time(start_time);
-        let mut file = File::open(&self.path)?;
-        file.seek(SeekFrom::Start(
-            self.blocks[first_block].offset.max(self.header_offset),
-        ))?;
-        let mut reader = BufReader::new(file);
+        let mut reader = Self::reader_from_path(&self.path)?;
+        reader.seek(self.blocks[first_block].position.clone())?;
+        let mut sample_index = self.blocks[first_block].start_sample;
         let estimated_points =
             ((end_time - start_time) * self.meta.nominal_sample_rate_hz).max(1.0) as usize;
         let stride = (estimated_points / max_points.max(1)).max(1);
@@ -328,15 +437,21 @@ impl DataSource for CsvDataSource {
         let mut channel_values = (0..channels.len())
             .map(|_| Vec::with_capacity(capacity))
             .collect::<Vec<_>>();
+        let mut record = StringRecord::new();
 
-        loop {
-            let mut line = String::new();
-            let bytes = reader.read_line(&mut line)?;
-            if bytes == 0 {
-                break;
-            }
-            let Ok(time) = Self::parse_time(&line) else {
-                continue;
+        while reader.read_record(&mut record)? {
+            let time = match self.layout {
+                CsvLayout::TimeColumn => {
+                    let Ok(time) = Self::parse_time(&record) else {
+                        continue;
+                    };
+                    time
+                }
+                CsvLayout::SyntheticTime { sample_interval_s } => {
+                    let time = sample_index as f64 * sample_interval_s;
+                    sample_index += 1;
+                    time
+                }
             };
             if time < start_time {
                 continue;
@@ -344,10 +459,18 @@ impl DataSource for CsvDataSource {
             if time > end_time {
                 break;
             }
-            if seen % stride == 0 {
-                let Ok(values) =
-                    Self::parse_selected_values(&line, self.meta.channels.len(), channels)
-                else {
+            if seen.is_multiple_of(stride) {
+                let values = match self.layout {
+                    CsvLayout::TimeColumn => {
+                        Self::parse_selected_values(&record, self.meta.channels.len(), channels)
+                    }
+                    CsvLayout::SyntheticTime { .. } => Self::parse_synthetic_selected_values(
+                        &record,
+                        self.meta.channels.len(),
+                        channels,
+                    ),
+                };
+                let Ok(values) = values else {
                     continue;
                 };
                 times.push(time);
@@ -435,7 +558,7 @@ impl DataSource for CsvDataSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::{fs::File, io::Write};
 
     #[test]
     fn opens_csv_and_reads_a_range() {
@@ -454,6 +577,34 @@ mod tests {
         let block = source.read_range(0.002, 0.006, &[0, 1], 100).unwrap();
         assert_eq!(block.channels.len(), 2);
         assert_eq!(block.times.len(), 5);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn opens_metadata_csv_with_generated_time_axis() {
+        let path = std::env::temp_dir().join("scope_analyzer_metadata_test.csv");
+        let mut file = File::create(&path).unwrap();
+        writeln!(file, "file_path,C:\\\\wave.csv").unwrap();
+        writeln!(file, "dt,0.0001").unwrap();
+        writeln!(file, "Number_of,3").unwrap();
+        writeln!(file, "t0,49:35.4").unwrap();
+        writeln!(file, "--------END--------").unwrap();
+        writeln!(file, "A,B,C").unwrap();
+        writeln!(file, "1,10,100").unwrap();
+        writeln!(file, "2,20,200").unwrap();
+        writeln!(file, "3,30,300").unwrap();
+        drop(file);
+
+        let source = CsvDataSource::open(&path).unwrap();
+        assert_eq!(source.metadata().channels.len(), 3);
+        assert_eq!(source.metadata().sample_count, 3);
+        assert_eq!(source.metadata().nominal_sample_rate_hz, 10_000.0);
+
+        let block = source.read_range(0.0, 0.0002, &[0, 2], 100).unwrap();
+        assert_eq!(block.times, vec![0.0, 0.0001, 0.0002]);
+        assert_eq!(block.channels[0], vec![1.0, 2.0, 3.0]);
+        assert_eq!(block.channels[1], vec![100.0, 200.0, 300.0]);
 
         let _ = std::fs::remove_file(path);
     }

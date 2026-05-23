@@ -46,7 +46,15 @@
       </Component>
       <Component Id="StartScript" Directory="INSTALLFOLDER" Guid="{43437FD8-35E2-4B95-A555-B0FD2471E5C0}" Win64="yes">
         <File Id="StartScopeAnalyzerBat" Source="$(var.StageDir)\Start-ScopeAnalyzer.bat" KeyPath="yes" />
+        <File Id="StartScopeAnalyzerDx12Bat" Source="$(var.StageDir)\Start-ScopeAnalyzer-DX12.bat" />
+        <File Id="StartScopeAnalyzerSoftwareBat" Source="$(var.StageDir)\Start-ScopeAnalyzer-Software.bat" />
+        <File Id="StartScopeAnalyzerOpenGlBat" Source="$(var.StageDir)\Start-ScopeAnalyzer-OpenGL.bat" />
       </Component>
+      <?if $(var.IncludeLibUnwind) = "true" ?>
+      <Component Id="LibUnwindDll" Directory="INSTALLFOLDER" Guid="{ACEE3B3E-514B-4BE0-A21D-3AC33B84D181}" Win64="yes">
+        <File Id="LibUnwindDllFile" Source="$(var.StageDir)\libunwind.dll" KeyPath="yes" />
+      </Component>
+      <?endif?>
       <Component Id="ProgramMenuCleanup" Directory="ApplicationProgramsFolder" Guid="{4DB70962-7727-4CB3-AF1A-A5801ED467F1}" Win64="yes">
         <RemoveFolder Id="RemoveProgramMenuFolder" On="uninstall" />
         <RegistryValue Root="HKCU" Key="Software\ScopeAnalyzer" Name="Installed" Type="integer" Value="1" KeyPath="yes" />
