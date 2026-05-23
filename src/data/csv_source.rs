@@ -5,7 +5,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::{ChannelMeta, DataError, DataResult, DataSource, DatasetMeta, RangeSummary, SampleBlock};
+use super::{
+    ChannelMeta, DataError, DataResult, DataSource, DatasetMeta, RangeSummary, SampleBlock,
+};
 
 const MAX_CHANNELS: usize = 128;
 const INDEX_BLOCK_ROWS: u64 = 4096;
@@ -45,16 +47,19 @@ impl CsvDataSource {
             .trim()
             .parse::<f64>()
             .map_err(|_| format!("时间列不是有效数字：{}", raw_time.trim()))?;
+        if !time.is_finite() {
+            return Err(format!("时间列不是有限数字：{}", raw_time.trim()));
+        }
         let mut values = Vec::with_capacity(channel_count);
         for (index, raw) in parts.take(channel_count).enumerate() {
             let raw = raw.trim();
             if raw.is_empty() {
                 values.push(f32::NAN);
             } else {
-                values.push(
-                    raw.parse::<f32>()
-                        .map_err(|_| format!("第 {} 个通道值不是有效数字：{raw}", index + 1))?,
-                );
+                let value = raw
+                    .parse::<f32>()
+                    .map_err(|_| format!("第 {} 个通道值不是有效数字：{raw}", index + 1))?;
+                values.push(if value.is_finite() { value } else { f32::NAN });
             }
         }
         if values.len() == channel_count {
@@ -71,10 +76,15 @@ impl CsvDataSource {
         let Some(raw_time) = line.trim_end().split(',').next() else {
             return Err("字段不足：缺少时间列".to_owned());
         };
-        raw_time
+        let time = raw_time
             .trim()
             .parse::<f64>()
-            .map_err(|_| format!("时间列不是有效数字：{}", raw_time.trim()))
+            .map_err(|_| format!("时间列不是有效数字：{}", raw_time.trim()))?;
+        if time.is_finite() {
+            Ok(time)
+        } else {
+            Err(format!("时间列不是有限数字：{}", raw_time.trim()))
+        }
     }
 
     fn parse_selected_values(
@@ -94,8 +104,14 @@ impl CsvDataSource {
             selected[out_index] = if raw.is_empty() {
                 f32::NAN
             } else {
-                raw.parse::<f32>()
-                    .map_err(|_| format!("第 {} 个通道值不是有效数字：{raw}", index + 1))?
+                let value = raw
+                    .parse::<f32>()
+                    .map_err(|_| format!("第 {} 个通道值不是有效数字：{raw}", index + 1))?;
+                if value.is_finite() {
+                    value
+                } else {
+                    f32::NAN
+                }
             };
             found[out_index] = true;
         }
@@ -117,7 +133,9 @@ impl CsvDataSource {
             }
         }) {
             Ok(index) => index,
-            Err(index) => index.saturating_sub(1).min(self.blocks.len().saturating_sub(1)),
+            Err(index) => index
+                .saturating_sub(1)
+                .min(self.blocks.len().saturating_sub(1)),
         }
     }
 
@@ -297,7 +315,9 @@ impl DataSource for CsvDataSource {
 
         let first_block = self.find_block_for_time(start_time);
         let mut file = File::open(&self.path)?;
-        file.seek(SeekFrom::Start(self.blocks[first_block].offset.max(self.header_offset)))?;
+        file.seek(SeekFrom::Start(
+            self.blocks[first_block].offset.max(self.header_offset),
+        ))?;
         let mut reader = BufReader::new(file);
         let estimated_points =
             ((end_time - start_time) * self.meta.nominal_sample_rate_hz).max(1.0) as usize;

@@ -2873,6 +2873,8 @@ dependencies = [
  "egui_plot",
  "rfd",
  "rustfft",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",

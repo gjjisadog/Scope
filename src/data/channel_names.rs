@@ -60,4 +60,3 @@ pub const VARIABLE_NAMES: [&str; 60] = [
     "unFaultFlag.DeviceFault",
     "unFaultFlag.GenFault",
 ];
-

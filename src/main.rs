@@ -22,4 +22,3 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| Box::new(app::ScopeApp::new(cc))),
     )
 }
-

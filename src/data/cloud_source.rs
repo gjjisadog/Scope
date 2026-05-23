@@ -111,13 +111,11 @@ impl CloudCsvDataSource {
         }
 
         let frame_len = Self::hex_byte_at(raw, 6)? as usize;
-        let sublength = frame_len
-            .checked_sub(5)
-            .ok_or_else(|| {
-                DataError::Csv(format!(
-                    "报文长度异常：长度字段为 {frame_len}，小于最小头部长度 5"
-                ))
-            })?;
+        let sublength = frame_len.checked_sub(5).ok_or_else(|| {
+            DataError::Csv(format!(
+                "报文长度异常：长度字段为 {frame_len}，小于最小头部长度 5"
+            ))
+        })?;
         if sublength % 2 != 0 {
             return Err(DataError::Csv(format!(
                 "报文长度异常：数据区字节数 {sublength} 不是 16-bit word 的整数倍"
@@ -278,7 +276,9 @@ impl CloudCsvDataSource {
             }
         }) {
             Ok(index) => index,
-            Err(index) => index.saturating_sub(1).min(self.blocks.len().saturating_sub(1)),
+            Err(index) => index
+                .saturating_sub(1)
+                .min(self.blocks.len().saturating_sub(1)),
         }
     }
 
@@ -313,7 +313,9 @@ impl DataSource for CloudCsvDataSource {
 
         let first_block = self.find_block_for_time(start_time);
         let mut file = File::open(&self.path)?;
-        file.seek(SeekFrom::Start(self.blocks[first_block].offset.max(self.header_offset)))?;
+        file.seek(SeekFrom::Start(
+            self.blocks[first_block].offset.max(self.header_offset),
+        ))?;
         let mut reader = BufReader::new(file);
         let estimated_points =
             ((end_time - start_time) * self.sample_rate_hz + 1.0).max(1.0) as usize;
