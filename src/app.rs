@@ -5,28 +5,41 @@ use std::{
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{Arc, Once},
-    thread::{self, JoinHandle},
+    thread::JoinHandle,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use eframe::egui::{self, Color32, PointerButton, RichText, Stroke};
-use egui_plot::{
-    Legend, Line, LineStyle, Plot, PlotBounds, PlotPoint, PlotPoints, PlotUi, Text, VLine,
-};
-use serde::{Deserialize, Serialize};
+use egui_plot::{Legend, Line, LineStyle, Plot, PlotBounds, PlotPoint, PlotUi, Text, VLine};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
     data::{
-        CloudCsvDataSource, CsvDataSource, DatDataSource, DataResult, DataSource, DatasetMeta,
-        RangeSummary, SampleBlock,
+        csv_reader_from_path_with_headers, BitfieldDigitalDataSource, ChannelMeta,
+        CloudCsvDataSource, CombinedDataSource, CsvDataSource, DatDataSource, DataResult,
+        DataSource, DatasetMeta, RangeSummary, SampleBlock, CHANNEL_UNIT_ANALOG,
+        CHANNEL_UNIT_DIGITAL,
     },
     fft::{self, FftResult, SequenceResult},
+    png_export::{Canvas, ClipRect, Rgba, StrokeStyle, TextStyle, WaveformCanvas},
+    svg_export::SvgCanvas,
     transforms,
+};
+
+mod jobs;
+mod plot;
+
+use plot::{
+    CompareDatasetJobResult, ComparePlotJobInput, ComparePlotJobResult, PanePlotSelections,
+    PlotCacheKey, PlotJobData, PlotJobResult, PlotSelections, PreparedPlotSeries,
 };
 
 const MAX_DRAW_POINTS_PER_CHANNEL: usize = 8_000;
 const MAX_TOTAL_DRAW_POINTS: usize = 60_000;
 const MIN_DRAW_POINTS_PER_CHANNEL: usize = 192;
+const LAYOUT_RESIZE_DRAW_POINTS_PER_CHANNEL: usize = 384;
+const LAYOUT_RESIZE_ACTIVE_GRACE: Duration = Duration::from_millis(180);
+const DEFAULT_PLOT_PIXEL_WIDTH: f32 = 1024.0;
 const MAX_FFT_POINTS: usize = 262_144;
 const MAX_AUTO_MEASURE_POINTS: usize = 131_072;
 const EXPORT_CHUNK_SAMPLES: usize = 100_000;
@@ -42,9 +55,19 @@ const MIN_CHANNEL_SCALE: f32 = -1_000_000.0;
 const MAX_CHANNEL_SCALE: f32 = 1_000_000.0;
 const MAX_RECENT_FILES: usize = 12;
 const MAX_RECENT_CONFIGS: usize = 12;
-const CHANNEL_PANEL_DEFAULT_WIDTH: f32 = 230.0;
-const CHANNEL_PANEL_MAX_WIDTH: f32 = 360.0;
-const MEASUREMENT_CHANNEL_COLUMN_WIDTH: f32 = 120.0;
+const CHANNEL_PANEL_DEFAULT_WIDTH: f32 = 170.0;
+const CHANNEL_PANEL_MIN_WIDTH: f32 = 120.0;
+const CHANNEL_PANEL_MAX_WIDTH: f32 = 320.0;
+const ANALYSIS_PANEL_DEFAULT_WIDTH: f32 = 310.0;
+const ANALYSIS_PANEL_MIN_WIDTH: f32 = 260.0;
+const ANALYSIS_PANEL_MAX_WIDTH: f32 = 380.0;
+const CHANNEL_NAME_COLUMN_WIDTH: f32 = 112.0;
+const MEASUREMENT_CHANNEL_COLUMN_WIDTH: f32 = 132.0;
+const MEASUREMENT_VALUE_COLUMN_WIDTH: f32 = 78.0;
+const ANALYSIS_LABEL_COLUMN_WIDTH: f32 = 56.0;
+const ANALYSIS_VALUE_COLUMN_WIDTH: f32 = 86.0;
+const ANALYSIS_CHANNEL_COMBO_WIDTH: f32 = 176.0;
+const ANALYSIS_CHANNEL_LABEL_CHARS: usize = 14;
 const MAX_SCOPE_LAYOUT_ROWS: usize = 4;
 const MAX_SCOPE_LAYOUT_COLS: usize = 4;
 const MAX_TIME_SYNC_POINTS: usize = 20_000;
@@ -52,6 +75,13 @@ const PLOT_RELOAD_DEBOUNCE: Duration = Duration::from_millis(90);
 const DERIVED_CHANNEL_COUNT: usize = 4;
 const DERIVED_CHANNEL_NAMES: [&str; DERIVED_CHANNEL_COUNT] =
     ["PLL theta (deg)", "dq0.d", "dq0.q", "dq0.0"];
+const DEFAULT_EXPORT_RESOLUTION: ExportResolution = ExportResolution::Ultra;
+const DEFAULT_EXPORT_ARROW_SIZE: f32 = 11.0;
+const MIN_EXPORT_ARROW_SIZE: f32 = 4.0;
+const MAX_EXPORT_ARROW_SIZE: f32 = 28.0;
+const DEFAULT_EXPORT_LABEL_SCALE: i32 = 3;
+const MIN_EXPORT_LABEL_SCALE: i32 = 1;
+const MAX_EXPORT_LABEL_SCALE: i32 = 4;
 
 fn default_sample_rate_hz() -> f64 {
     1000.0
@@ -81,6 +111,381 @@ fn default_theme_mode() -> ThemeMode {
 enum Language {
     Zh,
     En,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UiText {
+    Error,
+    Dismiss,
+    ScopeLayout,
+    Rows,
+    Columns,
+    ActivePane,
+    PaneSelectHint,
+    QuickSelect,
+    Single,
+    DeleteDataset,
+    DeleteSelectedDatasets,
+    DatasetSettings,
+    DatasetName,
+    MarkForDeletion,
+    SelectAllChannels,
+    LineStyle,
+    Source,
+    Analog,
+    Digital,
+    NoMatchingChannels,
+    ImportData,
+    WaveformCsv,
+    ExportData,
+    ExportAllRange,
+    ExportCursorRangeData,
+    ExportWaveformPng,
+    RecentFiles,
+    NoRecentFiles,
+    MissingFile,
+    ClearRecentFiles,
+    Layout,
+    View,
+    ResetView,
+    FitCursors,
+    AutoY,
+    ImportNames,
+    ExportNames,
+    RecentNames,
+    NoRecentNames,
+    ClearRecentNames,
+    Options,
+    Help,
+    Diagnostics,
+    CopyDiagnostics,
+    OpenLogDirectory,
+    Interaction,
+    UiLanguage,
+    Theme,
+    ImageExportLabels,
+    ArrowSize,
+    ArrowLabelColor,
+    CustomColor,
+    VariableNameSize,
+    VariableNameFont,
+    ResetExportLabelStyle,
+    HarmonicBasePrefix,
+    PllSyncSource,
+    TimeAxisSync,
+    AlignDatasetTimeAxes,
+    SyncByPhase,
+    ClearSync,
+    TimeSyncSource,
+    WheelZoomSensitivity,
+    ResetSensitivity,
+    Shortcuts,
+    ToggleCursors,
+    DeselectAllChannels,
+    ResetShortcuts,
+    DoubleClickRename,
+    ColorSettings,
+    Color,
+    LineWidth,
+    ScaleRatio,
+    Scale,
+    Zoom2x,
+    ShrinkHalf,
+    Reset,
+    Derived,
+    Channels,
+    Datasets,
+    Clear,
+    FilterChannelsHint,
+    NoDataLoaded,
+    AnalysisDataset,
+    AnalysisChannel,
+    AnalysisInput,
+    Hidden,
+    Measurements,
+    NoChannelsSelected,
+    CalculatingMeasurements,
+    Channel,
+    Min,
+    Max,
+    Sequence,
+    CalculatingSequence,
+    Component,
+    Amplitude,
+    Phase,
+    PositiveRatio,
+    ZeroSequence,
+    PositiveSequence,
+    NegativeSequence,
+    Dq0Input,
+    PllDistinctChannels,
+    SelectDerivedCurves,
+    PllDq0Enabled,
+    CalculatingPllDq0,
+    CalculatingFft,
+    NoAnalogFftChannels,
+    FftNeedsCursorSamples,
+    Order,
+    FundamentalRatio,
+    PlaceCursorX1,
+    PlaceCursorX2,
+    CancelPlacement,
+    HideCursorX1,
+    ShowCursorX1,
+    HideCursorX2,
+    ShowCursorX2,
+}
+
+impl UiText {
+    fn get(self, language: Language) -> &'static str {
+        use UiText::*;
+        match (self, language) {
+            (Error, Language::Zh) => "错误",
+            (Error, Language::En) => "Error",
+            (Dismiss, Language::Zh) => "关闭",
+            (Dismiss, Language::En) => "Dismiss",
+            (ScopeLayout, Language::Zh) => "示波器布局",
+            (ScopeLayout, Language::En) => "Scope Layout",
+            (Rows, Language::Zh) => "纵向",
+            (Rows, Language::En) => "Rows",
+            (Columns, Language::Zh) => "横向",
+            (Columns, Language::En) => "Columns",
+            (ActivePane, Language::Zh) => "当前示波器",
+            (ActivePane, Language::En) => "Active Pane",
+            (PaneSelectHint, Language::Zh) => {
+                "请先点击一个示波器子窗口，再勾选变量，变量会放入该子窗口。"
+            }
+            (PaneSelectHint, Language::En) => {
+                "Click a scope pane first, then check variables to place them there."
+            }
+            (QuickSelect, Language::Zh) => "快速选择",
+            (QuickSelect, Language::En) => "Quick Select",
+            (Single, Language::Zh) => "单栏",
+            (Single, Language::En) => "Single",
+            (DeleteDataset, Language::Zh) => "删除数据组",
+            (DeleteDataset, Language::En) => "Delete Dataset",
+            (DeleteSelectedDatasets, Language::Zh) => "删除已选数据组",
+            (DeleteSelectedDatasets, Language::En) => "Delete Selected Datasets",
+            (DatasetSettings, Language::Zh) => "数据组设置",
+            (DatasetSettings, Language::En) => "Dataset Settings",
+            (DatasetName, Language::Zh) => "数据组名",
+            (DatasetName, Language::En) => "Dataset Name",
+            (MarkForDeletion, Language::Zh) => "选中待删",
+            (MarkForDeletion, Language::En) => "Mark for deletion",
+            (SelectAllChannels, Language::Zh) => "全选通道",
+            (SelectAllChannels, Language::En) => "Select All Channels",
+            (LineStyle, Language::Zh) => "线型",
+            (LineStyle, Language::En) => "Line style",
+            (Source, Language::Zh) => "原始",
+            (Source, Language::En) => "src",
+            (Analog, Language::Zh) => "模拟量",
+            (Analog, Language::En) => "Analog",
+            (Digital, Language::Zh) => "数字量",
+            (Digital, Language::En) => "Digital",
+            (NoMatchingChannels, Language::Zh) => "没有匹配的通道。",
+            (NoMatchingChannels, Language::En) => "No matching channels.",
+            (ImportData, Language::Zh) => "添加数据",
+            (ImportData, Language::En) => "Add Data",
+            (WaveformCsv, Language::Zh) => "波形 CSV",
+            (WaveformCsv, Language::En) => "Waveform CSV",
+            (ExportData, Language::Zh) => "导出数据",
+            (ExportData, Language::En) => "Export Data",
+            (ExportAllRange, Language::Zh) => "全部导出",
+            (ExportAllRange, Language::En) => "Export All",
+            (ExportCursorRangeData, Language::Zh) => "导出光标内数据",
+            (ExportCursorRangeData, Language::En) => "Export Cursor Range",
+            (ExportWaveformPng, Language::Zh) => "导出波形图片 PNG",
+            (ExportWaveformPng, Language::En) => "Export Waveform PNG",
+            (RecentFiles, Language::Zh) => "最近文件",
+            (RecentFiles, Language::En) => "Recent Files",
+            (NoRecentFiles, Language::Zh) => "暂无最近文件",
+            (NoRecentFiles, Language::En) => "No recent files",
+            (MissingFile, Language::Zh) => "(文件不存在)",
+            (MissingFile, Language::En) => "(missing)",
+            (ClearRecentFiles, Language::Zh) => "清空最近文件",
+            (ClearRecentFiles, Language::En) => "Clear Recent Files",
+            (Layout, Language::Zh) => "布局",
+            (Layout, Language::En) => "Layout",
+            (View, Language::Zh) => "视图",
+            (View, Language::En) => "View",
+            (ResetView, Language::Zh) => "重置视图",
+            (ResetView, Language::En) => "Reset View",
+            (FitCursors, Language::Zh) => "适配光标",
+            (FitCursors, Language::En) => "Fit Cursors",
+            (AutoY, Language::Zh) => "Y轴自适应",
+            (AutoY, Language::En) => "Auto Y",
+            (ImportNames, Language::Zh) => "导入变量名",
+            (ImportNames, Language::En) => "Import Names",
+            (ExportNames, Language::Zh) => "导出变量名",
+            (ExportNames, Language::En) => "Export Names",
+            (RecentNames, Language::Zh) => "最近变量名",
+            (RecentNames, Language::En) => "Recent Names",
+            (NoRecentNames, Language::Zh) => "暂无最近变量名",
+            (NoRecentNames, Language::En) => "No recent names",
+            (ClearRecentNames, Language::Zh) => "清空最近变量名",
+            (ClearRecentNames, Language::En) => "Clear Recent Names",
+            (Options, Language::Zh) => "选项",
+            (Options, Language::En) => "Options",
+            (Help, Language::Zh) => "帮助",
+            (Help, Language::En) => "Help",
+            (Diagnostics, Language::Zh) => "诊断",
+            (Diagnostics, Language::En) => "Diagnostics",
+            (CopyDiagnostics, Language::Zh) => "复制诊断信息",
+            (CopyDiagnostics, Language::En) => "Copy Diagnostics",
+            (OpenLogDirectory, Language::Zh) => "打开日志目录",
+            (OpenLogDirectory, Language::En) => "Open Log Directory",
+            (Interaction, Language::Zh) => "交互",
+            (Interaction, Language::En) => "Interaction",
+            (UiLanguage, Language::Zh) => "界面语言",
+            (UiLanguage, Language::En) => "Language",
+            (Theme, Language::Zh) => "主题",
+            (Theme, Language::En) => "Theme",
+            (ImageExportLabels, Language::Zh) => "导出图片标注",
+            (ImageExportLabels, Language::En) => "Image Export Labels",
+            (ArrowSize, Language::Zh) => "箭头大小",
+            (ArrowSize, Language::En) => "Arrow size",
+            (ArrowLabelColor, Language::Zh) => "箭头/标注颜色",
+            (ArrowLabelColor, Language::En) => "Arrow/label color",
+            (CustomColor, Language::Zh) => "自定义颜色",
+            (CustomColor, Language::En) => "Custom color",
+            (VariableNameSize, Language::Zh) => "变量名字号",
+            (VariableNameSize, Language::En) => "Variable name size",
+            (VariableNameFont, Language::Zh) => "变量名字体",
+            (VariableNameFont, Language::En) => "Variable name font",
+            (ResetExportLabelStyle, Language::Zh) => "重置导出标注样式",
+            (ResetExportLabelStyle, Language::En) => "Reset Export Label Style",
+            (HarmonicBasePrefix, Language::Zh) => "谐波基准: ",
+            (HarmonicBasePrefix, Language::En) => "Harmonic base: ",
+            (PllSyncSource, Language::Zh) => "锁相环源",
+            (PllSyncSource, Language::En) => "PLL source",
+            (TimeAxisSync, Language::Zh) => "时间轴同步",
+            (TimeAxisSync, Language::En) => "Time Axis Sync",
+            (AlignDatasetTimeAxes, Language::Zh) => "统一数据组时间轴",
+            (AlignDatasetTimeAxes, Language::En) => "Align dataset time axes",
+            (SyncByPhase, Language::Zh) => "按所选变量相位同步",
+            (SyncByPhase, Language::En) => "Sync by selected variable phase",
+            (ClearSync, Language::Zh) => "清除同步",
+            (ClearSync, Language::En) => "Clear Sync",
+            (TimeSyncSource, Language::Zh) => "同步源",
+            (TimeSyncSource, Language::En) => "Sync Source",
+            (WheelZoomSensitivity, Language::Zh) => "滚轮缩放灵敏度",
+            (WheelZoomSensitivity, Language::En) => "Wheel zoom sensitivity",
+            (ResetSensitivity, Language::Zh) => "重置灵敏度",
+            (ResetSensitivity, Language::En) => "Reset Sensitivity",
+            (Shortcuts, Language::Zh) => "快捷键",
+            (Shortcuts, Language::En) => "Shortcuts",
+            (ToggleCursors, Language::Zh) => "隐藏/显示光标",
+            (ToggleCursors, Language::En) => "Hide/Show Cursors",
+            (DeselectAllChannels, Language::Zh) => "取消全选通道",
+            (DeselectAllChannels, Language::En) => "Deselect All Channels",
+            (ResetShortcuts, Language::Zh) => "重置快捷键",
+            (ResetShortcuts, Language::En) => "Reset Shortcuts",
+            (DoubleClickRename, Language::Zh) => "双击修改变量名",
+            (DoubleClickRename, Language::En) => "Double-click to rename",
+            (ColorSettings, Language::Zh) => "颜色设置",
+            (ColorSettings, Language::En) => "Color Settings",
+            (Color, Language::Zh) => "颜色",
+            (Color, Language::En) => "Color",
+            (LineWidth, Language::Zh) => "线宽",
+            (LineWidth, Language::En) => "Line width",
+            (ScaleRatio, Language::Zh) => "变比",
+            (ScaleRatio, Language::En) => "Scale Ratio",
+            (Scale, Language::Zh) => "倍率",
+            (Scale, Language::En) => "Scale",
+            (Zoom2x, Language::Zh) => "放大 2x",
+            (Zoom2x, Language::En) => "Zoom 2x",
+            (ShrinkHalf, Language::Zh) => "缩小 1/2",
+            (ShrinkHalf, Language::En) => "Shrink 1/2",
+            (Reset, Language::Zh) => "重置",
+            (Reset, Language::En) => "Reset",
+            (Derived, Language::Zh) => "派生量",
+            (Derived, Language::En) => "Derived",
+            (Channels, Language::Zh) => "变量",
+            (Channels, Language::En) => "Channels",
+            (Datasets, Language::Zh) => "数据组",
+            (Datasets, Language::En) => "Datasets",
+            (Clear, Language::Zh) => "清除",
+            (Clear, Language::En) => "Clear",
+            (FilterChannelsHint, Language::Zh) => "筛选变量，支持多关键词",
+            (FilterChannelsHint, Language::En) => "Filter channels, multiple keywords",
+            (NoDataLoaded, Language::Zh) => "未加载数据。",
+            (NoDataLoaded, Language::En) => "No data loaded.",
+            (AnalysisDataset, Language::Zh) => "分析数据组",
+            (AnalysisDataset, Language::En) => "Analysis Dataset",
+            (AnalysisChannel, Language::Zh) => "分析通道",
+            (AnalysisChannel, Language::En) => "Analysis Channel",
+            (AnalysisInput, Language::Zh) => "分析入口",
+            (AnalysisInput, Language::En) => "Analysis",
+            (Hidden, Language::Zh) => "（隐藏）",
+            (Hidden, Language::En) => " (hidden)",
+            (Measurements, Language::Zh) => "测量",
+            (Measurements, Language::En) => "Measurements",
+            (NoChannelsSelected, Language::Zh) => "当前数据组没有选中通道。",
+            (NoChannelsSelected, Language::En) => "No channels selected in this dataset.",
+            (CalculatingMeasurements, Language::Zh) => "计算测量中...",
+            (CalculatingMeasurements, Language::En) => "Calculating measurements...",
+            (Channel, Language::Zh) => "通道",
+            (Channel, Language::En) => "Channel",
+            (Min, Language::Zh) => "最小",
+            (Min, Language::En) => "Min",
+            (Max, Language::Zh) => "最大",
+            (Max, Language::En) => "Max",
+            (Sequence, Language::Zh) => "正负序",
+            (Sequence, Language::En) => "Sequence",
+            (CalculatingSequence, Language::Zh) => "计算正负序中...",
+            (CalculatingSequence, Language::En) => "Calculating sequence...",
+            (Component, Language::Zh) => "分量",
+            (Component, Language::En) => "Component",
+            (Amplitude, Language::Zh) => "幅值",
+            (Amplitude, Language::En) => "Amplitude",
+            (Phase, Language::Zh) => "相位",
+            (Phase, Language::En) => "Phase",
+            (PositiveRatio, Language::Zh) => "相对正序比例",
+            (PositiveRatio, Language::En) => "% Positive",
+            (ZeroSequence, Language::Zh) => "零序",
+            (ZeroSequence, Language::En) => "Zero",
+            (PositiveSequence, Language::Zh) => "正序",
+            (PositiveSequence, Language::En) => "Positive",
+            (NegativeSequence, Language::Zh) => "负序",
+            (NegativeSequence, Language::En) => "Negative",
+            (Dq0Input, Language::Zh) => "dq0 输入",
+            (Dq0Input, Language::En) => "dq0 input",
+            (PllDistinctChannels, Language::Zh) => "A/B/C 通道不能重复。",
+            (PllDistinctChannels, Language::En) => "A/B/C channels must be distinct.",
+            (SelectDerivedCurves, Language::Zh) => "在左侧派生量分组勾选派生曲线。",
+            (SelectDerivedCurves, Language::En) => "Select derived curves below.",
+            (PllDq0Enabled, Language::Zh) => "PLL/dq0 派生曲线已启用。",
+            (PllDq0Enabled, Language::En) => "PLL/dq0 uses the Analysis Dataset selected above.",
+            (CalculatingPllDq0, Language::Zh) => "PLL/dq0 计算中...",
+            (CalculatingPllDq0, Language::En) => "Calculating PLL/dq0...",
+            (CalculatingFft, Language::Zh) => "FFT 计算中...",
+            (CalculatingFft, Language::En) => "Calculating FFT...",
+            (NoAnalogFftChannels, Language::Zh) => "没有可用于 FFT 的模拟量通道。",
+            (NoAnalogFftChannels, Language::En) => "No analog channels are available for FFT.",
+            (FftNeedsCursorSamples, Language::Zh) => "FFT 需要光标区间内至少 16 个采样点。",
+            (FftNeedsCursorSamples, Language::En) => {
+                "FFT needs at least 16 samples in the cursor range."
+            }
+            (Order, Language::Zh) => "次数",
+            (Order, Language::En) => "Order",
+            (FundamentalRatio, Language::Zh) => "相对基波比例",
+            (FundamentalRatio, Language::En) => "% Fundamental",
+            (PlaceCursorX1, Language::Zh) => "放置光标 X1",
+            (PlaceCursorX1, Language::En) => "Place Cursor X1",
+            (PlaceCursorX2, Language::Zh) => "放置光标 X2",
+            (PlaceCursorX2, Language::En) => "Place Cursor X2",
+            (CancelPlacement, Language::Zh) => "取消放置",
+            (CancelPlacement, Language::En) => "Cancel Placement",
+            (HideCursorX1, Language::Zh) => "隐藏光标 X1",
+            (HideCursorX1, Language::En) => "Hide Cursor X1",
+            (ShowCursorX1, Language::Zh) => "显示光标 X1",
+            (ShowCursorX1, Language::En) => "Show Cursor X1",
+            (HideCursorX2, Language::Zh) => "隐藏光标 X2",
+            (HideCursorX2, Language::En) => "Hide Cursor X2",
+            (ShowCursorX2, Language::Zh) => "显示光标 X2",
+            (ShowCursorX2, Language::En) => "Show Cursor X2",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -341,10 +746,186 @@ fn default_shortcuts() -> ShortcutConfig {
     ShortcutConfig::default()
 }
 
+fn default_wheel_zoom_sensitivity() -> f64 {
+    DEFAULT_WHEEL_ZOOM_SENSITIVITY
+}
+
+fn default_pll_sync_source() -> PllSyncSource {
+    PllSyncSource::Voltage
+}
+
+fn default_three_phase_channels() -> [usize; 3] {
+    [0, 1, 2]
+}
+
+fn default_export_arrow_size() -> f32 {
+    DEFAULT_EXPORT_ARROW_SIZE
+}
+
+fn default_export_arrow_color_style() -> ExportArrowColorStyle {
+    ExportArrowColorStyle::Curve
+}
+
+fn default_export_style_preset() -> ExportStylePreset {
+    ExportStylePreset::Screenshot
+}
+
+fn default_export_pane_scope() -> ExportPaneScope {
+    ExportPaneScope::All
+}
+
+fn default_export_time_range_mode() -> ExportTimeRangeMode {
+    ExportTimeRangeMode::View
+}
+
+fn default_export_arrow_line_style() -> ExportArrowLineStyle {
+    ExportArrowLineStyle::Solid
+}
+
+fn default_export_arrow_custom_color() -> [u8; 4] {
+    Color32::BLACK.to_array()
+}
+
+fn default_export_label_scale() -> i32 {
+    DEFAULT_EXPORT_LABEL_SCALE
+}
+
+fn default_export_label_font_style() -> ExportLabelFontStyle {
+    ExportLabelFontStyle::Regular
+}
+
+fn default_export_resolution() -> ExportResolution {
+    DEFAULT_EXPORT_RESOLUTION
+}
+
+fn default_export_dpi() -> ExportDpi {
+    ExportDpi::Dpi300
+}
+
+fn default_export_dpi_value() -> u32 {
+    300
+}
+
+fn default_export_cursor_table_enabled() -> bool {
+    true
+}
+
+fn default_primary_line_pattern() -> ChannelLinePattern {
+    ChannelLinePattern::Solid
+}
+
+fn default_imported_line_pattern() -> ChannelLinePattern {
+    ChannelLinePattern::Dashed
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct NamesConfig {
     #[serde(default)]
     display_names: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DisplayConfig {
+    #[serde(default)]
+    channel_colors: Vec<[u8; 4]>,
+    #[serde(default)]
+    line_widths: Vec<f32>,
+    #[serde(default)]
+    line_patterns: Vec<ChannelLinePattern>,
+    #[serde(default)]
+    channel_scales: Vec<f32>,
+    #[serde(default)]
+    channel_panes: Vec<usize>,
+    #[serde(default)]
+    derived_visible: Vec<bool>,
+    #[serde(default)]
+    derived_colors: Vec<[u8; 4]>,
+    #[serde(default)]
+    derived_line_patterns: Vec<ChannelLinePattern>,
+    #[serde(default)]
+    derived_panes: Vec<usize>,
+    #[serde(default = "default_pll_sync_source")]
+    pll_sync_source: PllSyncSource,
+    #[serde(default = "default_three_phase_channels")]
+    pll_source_channels: [usize; 3],
+    #[serde(default = "default_three_phase_channels")]
+    dq_source_channels: [usize; 3],
+    #[serde(default = "default_three_phase_channels")]
+    time_sync_source_channels: [usize; 3],
+    #[serde(default)]
+    fft_channel: usize,
+    #[serde(default = "default_wheel_zoom_sensitivity")]
+    wheel_zoom_sensitivity: f64,
+    #[serde(default = "default_sample_rate_hz")]
+    sample_rate_hz: f64,
+    #[serde(default = "default_harmonic_base_hz")]
+    harmonic_base_hz: f64,
+    #[serde(default = "default_scope_layout_rows")]
+    scope_layout_rows: usize,
+    #[serde(default = "default_scope_layout_cols")]
+    scope_layout_cols: usize,
+    #[serde(default = "default_language")]
+    language: Language,
+    #[serde(default = "default_theme_mode")]
+    theme_mode: ThemeMode,
+    #[serde(default = "default_export_arrow_size")]
+    export_arrow_size: f32,
+    #[serde(default = "default_export_arrow_color_style")]
+    export_arrow_color_style: ExportArrowColorStyle,
+    #[serde(default = "default_export_style_preset")]
+    export_style_preset: ExportStylePreset,
+    #[serde(default = "default_export_pane_scope")]
+    export_pane_scope: ExportPaneScope,
+    #[serde(default = "default_export_time_range_mode")]
+    export_time_range_mode: ExportTimeRangeMode,
+    #[serde(default)]
+    export_manual_start: f64,
+    #[serde(default)]
+    export_manual_end: f64,
+    #[serde(default = "default_export_arrow_line_style")]
+    export_arrow_line_style: ExportArrowLineStyle,
+    #[serde(default = "default_export_arrow_custom_color")]
+    export_arrow_custom_color: [u8; 4],
+    #[serde(default = "default_export_label_scale")]
+    export_label_scale: i32,
+    #[serde(default = "default_export_label_font_style")]
+    export_label_font_style: ExportLabelFontStyle,
+    #[serde(default = "default_export_resolution")]
+    export_resolution: ExportResolution,
+    #[serde(default = "default_export_dpi")]
+    export_dpi: ExportDpi,
+    #[serde(default = "default_export_dpi_value")]
+    export_dpi_value: u32,
+    #[serde(default = "default_export_cursor_table_enabled")]
+    export_cursor_table_enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DatasetConfig {
+    #[serde(default)]
+    primary_dataset_name: String,
+    #[serde(default)]
+    primary_visible: Vec<bool>,
+    #[serde(default = "default_primary_line_pattern")]
+    primary_line_pattern: ChannelLinePattern,
+    #[serde(default)]
+    sync_time_axes: bool,
+    #[serde(default = "default_three_phase_channels")]
+    time_sync_source_channels: [usize; 3],
+    #[serde(default)]
+    imported: Vec<DatasetGroupConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DatasetGroupConfig {
+    #[serde(default)]
+    display_name: String,
+    #[serde(default)]
+    visible: Vec<bool>,
+    #[serde(default = "default_imported_line_pattern")]
+    line_pattern: ChannelLinePattern,
+    #[serde(default)]
+    time_offset: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -361,7 +942,9 @@ struct RuntimeConfig {
     derived_line_patterns: Vec<ChannelLinePattern>,
     derived_panes: Vec<usize>,
     pll_sync_source: PllSyncSource,
+    pll_source_channels: [usize; 3],
     dq_source_channels: [usize; 3],
+    time_sync_source_channels: [usize; 3],
     fft_channel: usize,
     wheel_zoom_sensitivity: f64,
     sample_rate_hz: f64,
@@ -371,6 +954,21 @@ struct RuntimeConfig {
     language: Language,
     theme_mode: ThemeMode,
     shortcuts: ShortcutConfig,
+    export_arrow_size: f32,
+    export_arrow_color_style: ExportArrowColorStyle,
+    export_style_preset: ExportStylePreset,
+    export_pane_scope: ExportPaneScope,
+    export_time_range_mode: ExportTimeRangeMode,
+    export_manual_start: f64,
+    export_manual_end: f64,
+    export_arrow_line_style: ExportArrowLineStyle,
+    export_arrow_custom_color: [u8; 4],
+    export_label_scale: i32,
+    export_label_font_style: ExportLabelFontStyle,
+    export_resolution: ExportResolution,
+    export_dpi: ExportDpi,
+    export_dpi_value: u32,
+    export_cursor_table_enabled: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -452,30 +1050,152 @@ struct DerivedJobKey {
     dq_channels: [usize; 3],
 }
 
-enum PlotJobData {
-    Samples(SampleBlock),
-    Summary(RangeSummary),
+struct ExportCurve<'a> {
+    label_index: usize,
+    label: String,
+    color: Color32,
+    width: i32,
+    points: &'a [PlotPoint],
 }
 
-#[derive(Clone, Default)]
-struct PreparedPlotSeries {
-    points: Vec<Arc<[PlotPoint]>>,
-    bounds: Vec<Option<(f64, f64)>>,
+#[derive(Clone)]
+struct ExportCurveLabel {
+    name: String,
+    color: Color32,
 }
 
-struct PlotJobResult {
-    generation: u64,
-    result: Result<Option<PlotJobData>, String>,
+#[derive(Clone, Debug)]
+struct ExportLabelPlacement {
+    label_index: usize,
+    label_rect: [i32; 4],
+    anchor_rect: [i32; 4],
+    anchor_point: [i32; 2],
+    plot_rect: ClipRect,
 }
 
-struct CompareDatasetJobResult {
-    index: usize,
-    result: Result<Option<PlotJobData>, String>,
+#[derive(Clone, Debug)]
+struct ExportPreviewDrag {
+    label_index: usize,
+    start_pos: [i32; 2],
+    before_state: ExportPreviewEditState,
+    undo_recorded: bool,
 }
 
-struct ComparePlotJobResult {
-    generation: u64,
-    datasets: Vec<CompareDatasetJobResult>,
+#[derive(Clone, Debug)]
+struct ExportPreviewAnchorDrag {
+    label_index: usize,
+    before_state: ExportPreviewEditState,
+    undo_recorded: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ExportPreviewTextDrag {
+    text_index: usize,
+    start_pos: [i32; 2],
+    before_state: ExportPreviewEditState,
+    undo_recorded: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ExportTextAnnotation {
+    text: String,
+    pos: [i32; 2],
+    color: Color32,
+    scale: i32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ExportInkStroke {
+    points: Vec<[i32; 2]>,
+    color: Color32,
+    width: i32,
+}
+
+#[derive(Clone, Debug)]
+struct ExportInkDrag {
+    stroke_index: Option<usize>,
+    before_state: ExportPreviewEditState,
+    undo_recorded: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExportPreviewTool {
+    Select,
+    Text,
+    Brush,
+    Eraser,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ExportPreviewEditState {
+    label_overrides: Vec<String>,
+    label_positions: Vec<Option<[i32; 2]>>,
+    label_anchor_x: Vec<Option<f64>>,
+    text_annotations: Vec<ExportTextAnnotation>,
+    ink_strokes: Vec<ExportInkStroke>,
+    arrow_size: f32,
+    arrow_color_style: ExportArrowColorStyle,
+    style_preset: ExportStylePreset,
+    pane_scope: ExportPaneScope,
+    time_range_mode: ExportTimeRangeMode,
+    manual_start: f64,
+    manual_end: f64,
+    arrow_line_style: ExportArrowLineStyle,
+    arrow_custom_color: Color32,
+    label_scale: i32,
+    label_font_style: ExportLabelFontStyle,
+    resolution: ExportResolution,
+    dpi: ExportDpi,
+    dpi_value: u32,
+    cursor_table_enabled: bool,
+}
+
+#[derive(Clone)]
+struct BatchExportTimeWindow {
+    enabled: bool,
+    start: f64,
+    end: f64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BatchExportDatasetMode {
+    Combined,
+    EachDataset,
+}
+
+impl BatchExportDatasetMode {
+    const ALL: [Self; 2] = [Self::Combined, Self::EachDataset];
+
+    fn label(self, language: Language) -> &'static str {
+        match (self, language) {
+            (Self::Combined, Language::Zh) => "合并当前选择",
+            (Self::Combined, Language::En) => "Current selection together",
+            (Self::EachDataset, Language::Zh) => "按数据组拆分",
+            (Self::EachDataset, Language::En) => "One image per dataset",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BatchExportPaneMode {
+    Current,
+    AllPanes,
+    EachPane,
+}
+
+impl BatchExportPaneMode {
+    const ALL: [Self; 3] = [Self::Current, Self::AllPanes, Self::EachPane];
+
+    fn label(self, language: Language) -> &'static str {
+        match (self, language) {
+            (Self::Current, Language::Zh) => "使用当前导出子窗口设置",
+            (Self::Current, Language::En) => "Use current pane setting",
+            (Self::AllPanes, Language::Zh) => "所有子窗口合成一张",
+            (Self::AllPanes, Language::En) => "All panes in one image",
+            (Self::EachPane, Language::Zh) => "每个子窗口单独导出",
+            (Self::EachPane, Language::En) => "One image per pane",
+        }
+    }
 }
 
 struct FftJobResult {
@@ -522,13 +1242,6 @@ struct DerivedMeasurementJobResult {
     result: Result<Vec<(usize, AutoMeasurement)>, String>,
 }
 
-struct ComparePlotJobInput {
-    index: usize,
-    source: Arc<dyn DataSource>,
-    visible: Vec<bool>,
-    offset: f64,
-}
-
 struct OpenedDataset {
     source: Arc<dyn DataSource>,
     path: PathBuf,
@@ -550,6 +1263,7 @@ struct ImportedDataset {
     visible: Vec<bool>,
     line_pattern: ChannelLinePattern,
     time_offset: f64,
+    plot_cache_key: Option<PlotCacheKey>,
     plot_cache: SampleBlock,
     plot_summary: Option<RangeSummary>,
     prepared_plot_cache: PreparedPlotSeries,
@@ -592,20 +1306,66 @@ pub struct ScopeApp {
     channel_filter: String,
     show_help: bool,
     show_options: bool,
+    show_export_preview: bool,
+    show_batch_export: bool,
+    export_preview_dirty: bool,
+    export_preview_texture: Option<egui::TextureHandle>,
+    export_preview_size: [usize; 2],
+    export_preview_error: Option<String>,
+    export_label_overrides: Vec<String>,
+    export_label_positions: Vec<Option<[i32; 2]>>,
+    export_label_anchor_x: Vec<Option<f64>>,
+    export_preview_label_layout: Vec<ExportLabelPlacement>,
+    export_preview_drag: Option<ExportPreviewDrag>,
+    export_preview_anchor_drag: Option<ExportPreviewAnchorDrag>,
+    export_preview_text_drag: Option<ExportPreviewTextDrag>,
+    export_preview_edit_label_index: Option<usize>,
+    export_preview_edit_label_focus_pending: bool,
+    export_preview_edit_text_index: Option<usize>,
+    export_preview_undo_stack: Vec<ExportPreviewEditState>,
+    export_preview_redo_stack: Vec<ExportPreviewEditState>,
+    export_text_annotations: Vec<ExportTextAnnotation>,
+    batch_export_windows: Vec<BatchExportTimeWindow>,
+    batch_export_dataset_mode: BatchExportDatasetMode,
+    batch_export_pane_mode: BatchExportPaneMode,
+    batch_export_last_summary: Option<String>,
+    export_preview_tool: ExportPreviewTool,
+    export_ink_strokes: Vec<ExportInkStroke>,
+    export_ink_drag: Option<ExportInkDrag>,
+    export_brush_color: Color32,
+    export_brush_width: i32,
     wheel_zoom_sensitivity: f64,
     sample_rate_hz: f64,
     harmonic_base_hz: f64,
     sync_time_axes: bool,
     time_sync_status: String,
+    time_sync_source_channels: [usize; 3],
+    time_sync_source_channels_user_selected: bool,
     scope_layout_rows: usize,
     scope_layout_cols: usize,
     language: Language,
     theme_mode: ThemeMode,
     shortcuts: ShortcutConfig,
+    export_arrow_size: f32,
+    export_arrow_color_style: ExportArrowColorStyle,
+    export_style_preset: ExportStylePreset,
+    export_pane_scope: ExportPaneScope,
+    export_time_range_mode: ExportTimeRangeMode,
+    export_manual_start: f64,
+    export_manual_end: f64,
+    export_arrow_line_style: ExportArrowLineStyle,
+    export_arrow_custom_color: Color32,
+    export_label_scale: i32,
+    export_label_font_style: ExportLabelFontStyle,
+    export_resolution: ExportResolution,
+    export_dpi: ExportDpi,
+    export_dpi_value: u32,
+    export_cursor_table_enabled: bool,
     last_error: Option<String>,
     loaded_path: Option<PathBuf>,
     recent_files: Vec<PathBuf>,
     recent_configs: Vec<PathBuf>,
+    plot_cache_key: Option<PlotCacheKey>,
     plot_cache: SampleBlock,
     plot_summary: Option<RangeSummary>,
     prepared_plot_cache: PreparedPlotSeries,
@@ -641,6 +1401,9 @@ pub struct ScopeApp {
     needs_plot_reload: bool,
     needs_compare_plot_reload: bool,
     plot_reload_deferred_until: Option<Instant>,
+    last_channel_panel_width: Option<f32>,
+    last_analysis_panel_width: Option<f32>,
+    layout_resize_active_until: Option<Instant>,
     needs_derived_reload: bool,
     cursor_place_mode: Option<CursorId>,
     zoom_box_start: Option<egui::Pos2>,
@@ -653,7 +1416,7 @@ enum CursorId {
     B,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SourceKind {
     Cloud,
     Dat,
@@ -661,20 +1424,319 @@ enum SourceKind {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LocalCsvRole {
+    Analog,
+    Digital,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 enum PllSyncSource {
     Voltage,
     Current,
 }
 
-impl PllSyncSource {
-    const ALL: [Self; 2] = [Self::Voltage, Self::Current];
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+enum ExportArrowColorStyle {
+    Curve,
+    Dark,
+    Red,
+    Blue,
+    Custom,
+}
+
+impl ExportArrowColorStyle {
+    const ALL: [Self; 5] = [Self::Curve, Self::Dark, Self::Red, Self::Blue, Self::Custom];
 
     fn label(self, language: Language) -> &'static str {
         match (self, language) {
-            (Self::Voltage, Language::Zh) => "电压",
-            (Self::Current, Language::Zh) => "电流",
-            (Self::Voltage, Language::En) => "Voltage",
-            (Self::Current, Language::En) => "Current",
+            (Self::Curve, Language::Zh) => "跟随曲线",
+            (Self::Dark, Language::Zh) => "深色统一",
+            (Self::Red, Language::Zh) => "红色统一",
+            (Self::Blue, Language::Zh) => "蓝色统一",
+            (Self::Custom, Language::Zh) => "自定义",
+            (Self::Curve, Language::En) => "Match curve",
+            (Self::Dark, Language::En) => "Dark",
+            (Self::Red, Language::En) => "Red",
+            (Self::Blue, Language::En) => "Blue",
+            (Self::Custom, Language::En) => "Custom",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+enum ExportStylePreset {
+    ReportWhite,
+    PaperMono,
+    Screenshot,
+    HighContrastPrint,
+}
+
+#[derive(Clone, Copy)]
+struct ExportStylePalette {
+    canvas_bg: Rgba,
+    plot_bg: Rgba,
+    grid: Rgba,
+    border: Rgba,
+    axis_text: Rgba,
+    label_bg: Rgba,
+    cursor_label_bg: Rgba,
+    line_width_scale: f32,
+}
+
+impl ExportStylePreset {
+    fn palette(self) -> ExportStylePalette {
+        match self {
+            Self::ReportWhite => ExportStylePalette {
+                canvas_bg: Rgba::rgb(255, 255, 255),
+                plot_bg: Rgba::rgb(255, 255, 255),
+                grid: Rgba::rgb(211, 224, 240),
+                border: Rgba::rgb(28, 43, 64),
+                axis_text: Rgba::rgb(18, 31, 50),
+                label_bg: Rgba::rgba(255, 255, 255, 230),
+                cursor_label_bg: Rgba::rgba(255, 255, 255, 238),
+                line_width_scale: 1.0,
+            },
+            Self::PaperMono => ExportStylePalette {
+                canvas_bg: Rgba::rgb(255, 255, 255),
+                plot_bg: Rgba::rgb(255, 255, 255),
+                grid: Rgba::rgb(222, 222, 222),
+                border: Rgba::rgb(0, 0, 0),
+                axis_text: Rgba::rgb(0, 0, 0),
+                label_bg: Rgba::rgba(255, 255, 255, 245),
+                cursor_label_bg: Rgba::rgba(255, 255, 255, 245),
+                line_width_scale: 0.9,
+            },
+            Self::Screenshot => ExportStylePalette {
+                canvas_bg: Rgba::rgb(248, 251, 255),
+                plot_bg: Rgba::rgb(252, 254, 255),
+                grid: Rgba::rgb(206, 220, 238),
+                border: Rgba::rgb(42, 58, 80),
+                axis_text: Rgba::rgb(24, 36, 56),
+                label_bg: Rgba::rgba(255, 255, 255, 224),
+                cursor_label_bg: Rgba::rgba(255, 255, 255, 232),
+                line_width_scale: 1.0,
+            },
+            Self::HighContrastPrint => ExportStylePalette {
+                canvas_bg: Rgba::rgb(255, 255, 255),
+                plot_bg: Rgba::rgb(255, 255, 255),
+                grid: Rgba::rgb(180, 180, 180),
+                border: Rgba::rgb(0, 0, 0),
+                axis_text: Rgba::rgb(0, 0, 0),
+                label_bg: Rgba::rgba(255, 255, 255, 248),
+                cursor_label_bg: Rgba::rgba(255, 255, 255, 248),
+                line_width_scale: 1.25,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+enum ExportPaneScope {
+    All,
+    Active,
+}
+
+impl ExportPaneScope {
+    const ALL: [Self; 2] = [Self::All, Self::Active];
+
+    fn label(self, language: Language) -> &'static str {
+        match (self, language) {
+            (Self::All, Language::Zh) => "全部子窗口",
+            (Self::Active, Language::Zh) => "当前子窗口",
+            (Self::All, Language::En) => "All panes",
+            (Self::Active, Language::En) => "Active pane",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+enum ExportTimeRangeMode {
+    View,
+    Cursor,
+    Manual,
+}
+
+impl ExportTimeRangeMode {
+    const ALL: [Self; 3] = [Self::View, Self::Cursor, Self::Manual];
+
+    fn label(self, language: Language) -> &'static str {
+        match (self, language) {
+            (Self::View, Language::Zh) => "当前视图",
+            (Self::Cursor, Language::Zh) => "光标 X1-X2",
+            (Self::Manual, Language::Zh) => "手动范围",
+            (Self::View, Language::En) => "Current view",
+            (Self::Cursor, Language::En) => "Cursor X1-X2",
+            (Self::Manual, Language::En) => "Manual range",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+enum ExportArrowLineStyle {
+    Solid,
+    Dashed,
+    Dotted,
+    Thick,
+    Double,
+}
+
+impl ExportArrowLineStyle {
+    const BASE: [Self; 3] = [Self::Solid, Self::Dashed, Self::Dotted];
+
+    fn label(self, language: Language) -> &'static str {
+        match (self, language) {
+            (Self::Solid, Language::Zh) => "箭头实线",
+            (Self::Dashed, Language::Zh) => "箭头虚线",
+            (Self::Dotted, Language::Zh) => "箭头点线",
+            (Self::Thick, Language::Zh) => "➜ 粗箭头",
+            (Self::Double, Language::Zh) => "⇒ 双线箭头",
+            (Self::Solid, Language::En) => "→ Solid arrow",
+            (Self::Dashed, Language::En) => "⇢ Dashed arrow",
+            (Self::Dotted, Language::En) => "⋯→ Dotted arrow",
+            (Self::Thick, Language::En) => "➜ Thick arrow",
+            (Self::Double, Language::En) => "⇒ Double arrow",
+        }
+    }
+
+    fn base_style(self) -> Self {
+        match self {
+            Self::Dashed => Self::Dashed,
+            Self::Dotted => Self::Dotted,
+            Self::Solid | Self::Thick | Self::Double => Self::Solid,
+        }
+    }
+
+    fn base_label(self, language: Language) -> &'static str {
+        match (self.base_style(), language) {
+            (Self::Solid, Language::Zh) => "箭头实线",
+            (Self::Dashed, Language::Zh) => "箭头虚线",
+            (Self::Dotted, Language::Zh) => "箭头点线",
+            (Self::Solid, Language::En) => "Solid arrow",
+            (Self::Dashed, Language::En) => "Dashed arrow",
+            (Self::Dotted, Language::En) => "Dotted arrow",
+            _ => self.label(language),
+        }
+    }
+
+    fn stroke_style(self) -> StrokeStyle {
+        match self {
+            Self::Solid | Self::Thick | Self::Double => StrokeStyle::Solid,
+            Self::Dashed => StrokeStyle::Dashed,
+            Self::Dotted => StrokeStyle::Dotted,
+        }
+    }
+
+    fn width_extra(self) -> i32 {
+        match self {
+            Self::Thick => 2,
+            Self::Double => 1,
+            Self::Solid | Self::Dashed | Self::Dotted => 0,
+        }
+    }
+
+    fn head_scale(self) -> f32 {
+        match self {
+            Self::Thick => 1.18,
+            Self::Double => 1.06,
+            Self::Solid | Self::Dashed | Self::Dotted => 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+enum ExportLabelFontStyle {
+    Regular,
+    Bold,
+    Outline,
+}
+
+impl ExportLabelFontStyle {
+    const ALL: [Self; 3] = [Self::Regular, Self::Bold, Self::Outline];
+
+    fn label(self, language: Language) -> &'static str {
+        match (self, language) {
+            (Self::Regular, Language::Zh) => "常规",
+            (Self::Bold, Language::Zh) => "加粗",
+            (Self::Outline, Language::Zh) => "描边",
+            (Self::Regular, Language::En) => "Regular",
+            (Self::Bold, Language::En) => "Bold",
+            (Self::Outline, Language::En) => "Outline",
+        }
+    }
+
+    fn text_style(self) -> TextStyle {
+        match self {
+            Self::Regular => TextStyle::Regular,
+            Self::Bold => TextStyle::Bold,
+            Self::Outline => TextStyle::Outline,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+enum ExportResolution {
+    Standard,
+    High,
+    Ultra,
+}
+
+impl ExportResolution {
+    const ALL: [Self; 3] = [Self::Ultra, Self::High, Self::Standard];
+
+    fn label(self, language: Language) -> &'static str {
+        match (self, language) {
+            (Self::Standard, Language::Zh) => "标准 1600px",
+            (Self::High, Language::Zh) => "高清 2400px",
+            (Self::Ultra, Language::Zh) => "最高 3200px",
+            (Self::Standard, Language::En) => "Standard 1600px",
+            (Self::High, Language::En) => "High 2400px",
+            (Self::Ultra, Language::En) => "Ultra 3200px",
+        }
+    }
+
+    fn width(self) -> usize {
+        match self {
+            Self::Standard => 1600,
+            Self::High => 2400,
+            Self::Ultra => 3200,
+        }
+    }
+
+    fn scale(self) -> i32 {
+        match self {
+            Self::Standard => 1,
+            Self::High => 2,
+            Self::Ultra => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+enum ExportDpi {
+    Dpi150,
+    Dpi300,
+    Dpi600,
+}
+
+impl ExportDpi {
+    const ALL: [Self; 3] = [Self::Dpi300, Self::Dpi600, Self::Dpi150];
+
+    fn label(self, language: Language) -> &'static str {
+        match (self, language) {
+            (Self::Dpi150, Language::Zh) => "150 DPI 屏幕",
+            (Self::Dpi300, Language::Zh) => "300 DPI Word/报告",
+            (Self::Dpi600, Language::Zh) => "600 DPI 论文/打印",
+            (Self::Dpi150, Language::En) => "150 DPI screen",
+            (Self::Dpi300, Language::En) => "300 DPI Word/report",
+            (Self::Dpi600, Language::En) => "600 DPI paper/print",
+        }
+    }
+
+    fn value(self) -> u32 {
+        match self {
+            Self::Dpi150 => 150,
+            Self::Dpi300 => 300,
+            Self::Dpi600 => 600,
         }
     }
 }
@@ -804,20 +1866,66 @@ impl ScopeApp {
             channel_filter: String::new(),
             show_help: false,
             show_options: false,
+            show_export_preview: false,
+            show_batch_export: false,
+            export_preview_dirty: false,
+            export_preview_texture: None,
+            export_preview_size: [0, 0],
+            export_preview_error: None,
+            export_label_overrides: Vec::new(),
+            export_label_positions: Vec::new(),
+            export_label_anchor_x: Vec::new(),
+            export_preview_label_layout: Vec::new(),
+            export_preview_drag: None,
+            export_preview_anchor_drag: None,
+            export_preview_text_drag: None,
+            export_preview_edit_label_index: None,
+            export_preview_edit_label_focus_pending: false,
+            export_preview_edit_text_index: None,
+            export_preview_undo_stack: Vec::new(),
+            export_preview_redo_stack: Vec::new(),
+            export_text_annotations: Vec::new(),
+            batch_export_windows: Vec::new(),
+            batch_export_dataset_mode: BatchExportDatasetMode::Combined,
+            batch_export_pane_mode: BatchExportPaneMode::Current,
+            batch_export_last_summary: None,
+            export_preview_tool: ExportPreviewTool::Select,
+            export_ink_strokes: Vec::new(),
+            export_ink_drag: None,
+            export_brush_color: Color32::from_rgb(220, 20, 38),
+            export_brush_width: 4,
             wheel_zoom_sensitivity: DEFAULT_WHEEL_ZOOM_SENSITIVITY,
             sample_rate_hz: default_sample_rate_hz(),
             harmonic_base_hz: default_harmonic_base_hz(),
             sync_time_axes: false,
             time_sync_status: String::new(),
+            time_sync_source_channels: [0, 1, 2],
+            time_sync_source_channels_user_selected: false,
             scope_layout_rows: default_scope_layout_rows(),
             scope_layout_cols: default_scope_layout_cols(),
             language: default_language(),
             theme_mode: default_theme_mode(),
             shortcuts: default_shortcuts(),
+            export_arrow_size: DEFAULT_EXPORT_ARROW_SIZE,
+            export_arrow_color_style: ExportArrowColorStyle::Curve,
+            export_style_preset: ExportStylePreset::Screenshot,
+            export_pane_scope: ExportPaneScope::All,
+            export_time_range_mode: ExportTimeRangeMode::View,
+            export_manual_start: 0.0,
+            export_manual_end: 1.0,
+            export_arrow_line_style: ExportArrowLineStyle::Solid,
+            export_arrow_custom_color: Color32::from_rgb(20, 96, 180),
+            export_label_scale: DEFAULT_EXPORT_LABEL_SCALE,
+            export_label_font_style: ExportLabelFontStyle::Regular,
+            export_resolution: DEFAULT_EXPORT_RESOLUTION,
+            export_dpi: ExportDpi::Dpi300,
+            export_dpi_value: 300,
+            export_cursor_table_enabled: true,
             last_error: None,
             loaded_path: None,
             recent_files,
             recent_configs,
+            plot_cache_key: None,
             plot_cache: SampleBlock::default(),
             plot_summary: None,
             prepared_plot_cache: PreparedPlotSeries::default(),
@@ -853,6 +1961,9 @@ impl ScopeApp {
             needs_plot_reload: false,
             needs_compare_plot_reload: false,
             plot_reload_deferred_until: None,
+            last_channel_panel_width: None,
+            last_analysis_panel_width: None,
+            layout_resize_active_until: None,
             needs_derived_reload: false,
             cursor_place_mode: None,
             zoom_box_start: None,
@@ -910,6 +2021,158 @@ impl ScopeApp {
             .unwrap_or_else(|| PathBuf::from("scope-crash.log"))
     }
 
+    fn startup_log_paths() -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        if let Ok(exe) = env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                paths.push(parent.join("ScopeAnalyzer-startup.log"));
+            }
+        }
+        paths.push(env::temp_dir().join("ScopeAnalyzer-startup.log"));
+        paths
+    }
+
+    fn log_directory() -> PathBuf {
+        env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .unwrap_or_else(env::temp_dir)
+    }
+
+    fn open_log_directory(&mut self) {
+        let path = Self::log_directory();
+        let result = if cfg!(target_os = "windows") {
+            std::process::Command::new("explorer").arg(&path).spawn()
+        } else if cfg!(target_os = "macos") {
+            std::process::Command::new("open").arg(&path).spawn()
+        } else {
+            std::process::Command::new("xdg-open").arg(&path).spawn()
+        };
+        if let Err(error) = result {
+            self.last_error = Some(match self.language {
+                Language::Zh => format!("打开日志目录失败: {error}"),
+                Language::En => format!("Failed to open log directory: {error}"),
+            });
+        }
+    }
+
+    fn copy_diagnostics_to_clipboard(&mut self, ctx: &egui::Context) {
+        let diagnostics = self.diagnostic_info();
+        ctx.output_mut(|output| {
+            output.copied_text = diagnostics;
+        });
+        self.last_error = Some(match self.language {
+            Language::Zh => "诊断信息已复制到剪贴板。".to_owned(),
+            Language::En => "Diagnostics copied to clipboard.".to_owned(),
+        });
+    }
+
+    fn log_file_description(path: &Path) -> String {
+        match std::fs::metadata(path) {
+            Ok(metadata) => format!("{} (exists, {} bytes)", path.display(), metadata.len()),
+            Err(_) => format!("{} (missing)", path.display()),
+        }
+    }
+
+    fn diagnostic_info(&self) -> String {
+        let mut text = String::new();
+        text.push_str("Scope Analyzer Diagnostics\n");
+        text.push_str(&format!("version: {}\n", env!("CARGO_PKG_VERSION")));
+        text.push_str(&format!(
+            "exe: {}\n",
+            env::current_exe()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|error| format!("unknown ({error})"))
+        ));
+        text.push_str(&format!("log_dir: {}\n", Self::log_directory().display()));
+        text.push_str(&format!(
+            "renderer_env: {}\n",
+            env::var("SCOPE_RENDERER").unwrap_or_else(|_| "(unset)".to_owned())
+        ));
+        text.push_str(&format!(
+            "renderer_child: {}\n",
+            env::var("SCOPE_RENDERER_CHILD").unwrap_or_else(|_| "(unset)".to_owned())
+        ));
+        text.push_str(&format!("language: {:?}\n", self.language));
+        text.push_str(&format!("theme: {:?}\n", self.theme_mode));
+        text.push_str(&format!(
+            "sample_rate_hz: {:.3}, harmonic_base_hz: {:.3}\n",
+            self.sample_rate_hz, self.harmonic_base_hz
+        ));
+        text.push_str(&format!(
+            "view: {:.9}..{:.9}, cursors: X1={:.9}, X2={:.9}, visible=({}, {})\n",
+            self.view_start,
+            self.view_end,
+            self.cursor_a,
+            self.cursor_b,
+            self.show_cursor_a,
+            self.show_cursor_b
+        ));
+        text.push_str(&format!(
+            "layout: {}x{}, active_pane: {}\n",
+            self.scope_layout_rows,
+            self.scope_layout_cols,
+            self.current_scope_pane() + 1
+        ));
+        text.push_str(&format!(
+            "workers: plot={}, compare={}, fft={}, measurement={}, sequence={}, derived={}, import={}\n",
+            self.plot_worker.is_some(),
+            self.compare_plot_worker.is_some(),
+            self.fft_worker.is_some(),
+            self.measurement_worker.is_some(),
+            self.sequence_worker.is_some(),
+            self.derived_curve_worker.is_some() || self.derived_measurement_worker.is_some(),
+            self.import_worker.is_some()
+        ));
+        if let Some(error) = &self.last_error {
+            text.push_str(&format!("last_error: {}\n", error));
+        }
+        if let Some(meta) = self.meta() {
+            text.push_str(&format!(
+                "primary: name={}, samples={}, duration={:.6}, data_hz={:.3}, channels={}, selected={}\n",
+                meta.source_name,
+                meta.sample_count,
+                meta.duration(),
+                meta.nominal_sample_rate_hz,
+                meta.channels.len(),
+                self.selected_channels().len()
+            ));
+        } else {
+            text.push_str("primary: none\n");
+        }
+        text.push_str(&format!(
+            "imported_dataset_count: {}\n",
+            self.imported_datasets.len()
+        ));
+        for (index, dataset) in self.imported_datasets.iter().enumerate() {
+            let meta = dataset.source.metadata();
+            text.push_str(&format!(
+                "  data{}: name={}, samples={}, duration={:.6}, data_hz={:.3}, channels={}, selected={}, offset={:.9}, kind={:?}\n",
+                Self::dataset_letter(index + 1),
+                dataset.display_name,
+                meta.sample_count,
+                meta.duration(),
+                meta.nominal_sample_rate_hz,
+                meta.channels.len(),
+                self.selected_imported_channels(index).len(),
+                dataset.time_offset,
+                dataset.kind
+            ));
+        }
+        text.push_str("logs:\n");
+        text.push_str(&format!(
+            "  crash: {}\n",
+            Self::log_file_description(&Self::crash_log_path())
+        ));
+        for path in Self::startup_log_paths() {
+            text.push_str(&format!(
+                "  startup: {}\n",
+                Self::log_file_description(&path)
+            ));
+        }
+        text
+    }
+
     fn append_crash_log(message: &str) {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -932,6 +2195,15 @@ impl ScopeApp {
         } else {
             "non-string panic payload".to_owned()
         }
+    }
+
+    fn recover_worker_panic(
+        worker_message: &'static str,
+        payload: Box<dyn std::any::Any + Send>,
+    ) -> String {
+        let detail = Self::panic_payload_message(payload.as_ref());
+        Self::append_crash_log(&format!("{worker_message}: {detail}"));
+        worker_message.to_owned()
     }
 
     fn install_cjk_fonts(ctx: &egui::Context) {
@@ -1003,6 +2275,14 @@ impl ScopeApp {
         }
     }
 
+    fn dataset_short_label(&self, index: usize) -> String {
+        if self.language == Language::Zh {
+            format!("数据{}", Self::dataset_letter(index))
+        } else {
+            format!("Data {}", Self::dataset_letter(index))
+        }
+    }
+
     fn dataset_label(&self, index: usize) -> String {
         let prefix = if self.language == Language::Zh {
             "数据"
@@ -1021,7 +2301,14 @@ impl ScopeApp {
             self.imported_datasets
                 .get(index - 1)
                 .map(|dataset| dataset.display_name.clone())
-                .unwrap_or_else(|| format!("Dataset {}", index + 1))
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| {
+                    if self.language == Language::Zh {
+                        format!("数据组 {}", index + 1)
+                    } else {
+                        format!("Dataset {}", index + 1)
+                    }
+                })
         };
         format!("{prefix}{}  {name}", Self::dataset_letter(index))
     }
@@ -1141,11 +2428,11 @@ impl ScopeApp {
                 && channels[0] != channels[2]
                 && channels[1] != channels[2]
         };
-        let next_pll_source = self
-            .preferred_pll_source_channels(&channel_options)
-            .unwrap_or([0, 1, 2]);
-        if self.pll_source_channels != next_pll_source {
-            self.pll_source_channels = next_pll_source;
+        if !valid_triplet(&self.pll_source_channels) {
+            self.pll_source_channels = self
+                .preferred_pll_source_channels(&channel_options)
+                .or_else(|| Self::default_sequence_channels_from_options(&channel_options))
+                .unwrap_or([0, 1, 2]);
             self.needs_derived_reload = true;
         }
         if !valid_triplet(&self.dq_source_channels) {
@@ -1154,6 +2441,23 @@ impl ScopeApp {
                 .unwrap_or(self.pll_source_channels);
             self.dq_source_channels_user_selected = false;
             self.needs_derived_reload = true;
+        }
+        let time_sync_options = self.primary_time_sync_channel_options();
+        let valid_time_sync_triplet = |channels: &[usize; 3]| {
+            channels
+                .iter()
+                .all(|channel| time_sync_options.contains(channel))
+                && channels[0] != channels[1]
+                && channels[0] != channels[2]
+                && channels[1] != channels[2]
+        };
+        if !valid_time_sync_triplet(&self.time_sync_source_channels) {
+            self.time_sync_source_channels = self
+                .preferred_time_sync_source_channels(&time_sync_options)
+                .or_else(|| Self::default_sequence_channels_from_options(&time_sync_options))
+                .unwrap_or([0, 1, 2]);
+            self.time_sync_source_channels_user_selected = false;
+            self.time_sync_status.clear();
         }
 
         for dataset in &mut self.imported_datasets {
@@ -1240,6 +2544,13 @@ impl ScopeApp {
             .unwrap_or([0, 1, 2]);
         self.dq_source_channels = self.pll_source_channels;
         self.dq_source_channels_user_selected = false;
+        let time_sync_options = self.primary_time_sync_channel_options();
+        self.time_sync_source_channels = self
+            .preferred_time_sync_source_channels(&time_sync_options)
+            .or_else(|| Self::default_sequence_channels_from_options(&time_sync_options))
+            .unwrap_or([0, 1, 2]);
+        self.time_sync_source_channels_user_selected = false;
+        self.time_sync_status.clear();
         self.derived_curve_cache = None;
         self.prepared_derived_curve_cache = PreparedPlotSeries::default();
         self.derived_measurement_cache = None;
@@ -1274,6 +2585,7 @@ impl ScopeApp {
             visible: vec![false; visible_len],
             line_pattern: ChannelLinePattern::Dashed,
             time_offset: 0.0,
+            plot_cache_key: None,
             plot_cache: SampleBlock::default(),
             plot_summary: None,
             prepared_plot_cache: PreparedPlotSeries::default(),
@@ -1404,6 +2716,33 @@ impl ScopeApp {
         self.delete_selected_datasets();
     }
 
+    fn dataset_selected_for_delete(&self, dataset_index: usize) -> bool {
+        if dataset_index == 0 {
+            self.primary_selected_for_delete
+        } else {
+            self.imported_datasets
+                .get(dataset_index - 1)
+                .map(|dataset| dataset.selected_for_delete)
+                .unwrap_or(false)
+        }
+    }
+
+    fn set_dataset_selected_for_delete(&mut self, dataset_index: usize, selected: bool) {
+        if dataset_index == 0 {
+            self.primary_selected_for_delete = selected;
+        } else if let Some(dataset) = self.imported_datasets.get_mut(dataset_index - 1) {
+            dataset.selected_for_delete = selected;
+        }
+    }
+
+    fn any_dataset_selected_for_delete(&self) -> bool {
+        self.primary_selected_for_delete
+            || self
+                .imported_datasets
+                .iter()
+                .any(|dataset| dataset.selected_for_delete)
+    }
+
     fn recent_files_path() -> PathBuf {
         env::current_exe()
             .ok()
@@ -1518,7 +2857,7 @@ impl ScopeApp {
 
     #[allow(dead_code)]
     fn open_standard_csv(&mut self, path: PathBuf) -> bool {
-        match CsvDataSource::open(&path) {
+        match CsvDataSource::open_with_sample_rate(&path, self.sample_rate_hz) {
             Ok(source) => {
                 self.set_source(Arc::new(source), path, SourceKind::Local);
                 true
@@ -1564,7 +2903,7 @@ impl ScopeApp {
 
     #[allow(dead_code)]
     fn open_standard_compare_csv(&mut self, path: PathBuf) -> bool {
-        match CsvDataSource::open(&path) {
+        match CsvDataSource::open_with_sample_rate(&path, self.sample_rate_hz) {
             Ok(source) => {
                 self.add_imported_dataset(Arc::new(source), path, SourceKind::Local);
                 true
@@ -1642,31 +2981,40 @@ impl ScopeApp {
         let generation = self.data_generation;
         let replace_primary = self.source.is_none();
         let sample_rate_hz = self.sample_rate_hz;
-        self.import_worker = Some(thread::spawn(move || {
-            let mut opened = Vec::new();
-            let mut errors = Vec::new();
-            for path in paths {
-                let result = Self::open_waveform_file(&path, sample_rate_hz);
-                match result {
-                    Ok(dataset) => opened.push(dataset),
-                    Err(error) => errors.push(format!("{}: {error}", path.display())),
+        Self::spawn_job(&mut self.import_worker, move || {
+            let generation_for_panic = generation;
+            let replace_primary_for_panic = replace_primary;
+            match panic::catch_unwind(AssertUnwindSafe(|| {
+                let (opened, errors) = Self::open_waveform_files(paths, sample_rate_hz);
+                ImportJobResult {
+                    generation,
+                    replace_primary,
+                    opened,
+                    errors,
                 }
+            })) {
+                Ok(result) => result,
+                Err(payload) => ImportJobResult {
+                    generation: generation_for_panic,
+                    replace_primary: replace_primary_for_panic,
+                    opened: Vec::new(),
+                    errors: vec![Self::recover_worker_panic(
+                        "Import worker panicked.",
+                        payload,
+                    )],
+                },
             }
-            ImportJobResult {
-                generation,
-                replace_primary,
-                opened,
-                errors,
-            }
-        }));
+        });
         true
     }
 
     fn poll_import_worker(&mut self) {
-        let Some(worker) = self.import_worker.take_if(|worker| worker.is_finished()) else {
+        let Some(joined) =
+            Self::take_finished_job(&mut self.import_worker, "Import worker panicked.")
+        else {
             return;
         };
-        let Ok(result) = worker.join() else {
+        let Ok(result) = joined else {
             self.last_error = Some("Import worker panicked.".to_owned());
             return;
         };
@@ -1714,7 +3062,7 @@ impl ScopeApp {
                         kind: SourceKind::Cloud,
                     })
                     .map_err(|error| error.to_string()),
-                Ok(false) => CsvDataSource::open(path)
+                Ok(false) => CsvDataSource::open_with_sample_rate(path, sample_rate_hz)
                     .map(|source| OpenedDataset {
                         source: Arc::new(source),
                         path: path.to_owned(),
@@ -1730,12 +3078,348 @@ impl ScopeApp {
         }
     }
 
-    fn looks_like_cloud_csv(path: &Path) -> Result<bool, String> {
-        let mut reader = csv::ReaderBuilder::new()
-            .flexible(true)
-            .trim(csv::Trim::All)
-            .from_path(path)
+    fn open_waveform_files(
+        paths: Vec<PathBuf>,
+        sample_rate_hz: f64,
+    ) -> (Vec<OpenedDataset>, Vec<String>) {
+        let mut opened = Vec::new();
+        let mut errors = Vec::new();
+        let mut used = vec![false; paths.len()];
+
+        let local_csv_roles = paths
+            .iter()
+            .map(|path| Self::local_csv_merge_role(path))
+            .collect::<Vec<_>>();
+
+        for index in 0..paths.len() {
+            if used[index] {
+                continue;
+            }
+            let Some((role, key)) = &local_csv_roles[index] else {
+                continue;
+            };
+            let wanted = match role {
+                LocalCsvRole::Analog => LocalCsvRole::Digital,
+                LocalCsvRole::Digital => LocalCsvRole::Analog,
+            };
+            let pair_index = paths.iter().enumerate().find_map(|(other_index, _)| {
+                if other_index == index || used[other_index] {
+                    return None;
+                }
+                let Some((other_role, other_key)) = &local_csv_roles[other_index] else {
+                    return None;
+                };
+                (*other_role == wanted && (other_key == key || paths.len() == 2))
+                    .then_some(other_index)
+            });
+            let Some(pair_index) = pair_index else {
+                continue;
+            };
+
+            let analog_index = if *role == LocalCsvRole::Analog {
+                index
+            } else {
+                pair_index
+            };
+            let digital_index = if *role == LocalCsvRole::Digital {
+                index
+            } else {
+                pair_index
+            };
+            let display_path = format!(
+                "{} + {}",
+                paths[analog_index].display(),
+                paths[digital_index].display()
+            );
+            let result = Self::worker_result("Import worker panicked.", || {
+                Self::open_local_csv_pair(
+                    &paths[analog_index],
+                    &paths[digital_index],
+                    sample_rate_hz,
+                )
+            });
+            match result {
+                Ok(dataset) => {
+                    used[index] = true;
+                    used[pair_index] = true;
+                    opened.push(dataset);
+                }
+                Err(error) => errors.push(format!("{display_path}: {error}")),
+            }
+        }
+
+        let remaining_local_csv = paths
+            .iter()
+            .enumerate()
+            .filter_map(|(index, path)| {
+                (!used[index] && Self::is_local_csv_file(path)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if remaining_local_csv.len() == 2 {
+            let first = remaining_local_csv[0];
+            let second = remaining_local_csv[1];
+            let display_path = format!("{} + {}", paths[first].display(), paths[second].display());
+            let result = Self::worker_result("Import worker panicked.", || {
+                Self::open_local_csv_pair_by_content(&paths[first], &paths[second], sample_rate_hz)
+            });
+            match result {
+                Ok(dataset) => {
+                    used[first] = true;
+                    used[second] = true;
+                    opened.push(dataset);
+                }
+                Err(error) => errors.push(format!("{display_path}: {error}")),
+            }
+        }
+
+        for (index, path) in paths.into_iter().enumerate() {
+            if used[index] {
+                continue;
+            }
+            let display_path = path.display().to_string();
+            let result = Self::worker_result("Import worker panicked.", || {
+                Self::open_waveform_file(&path, sample_rate_hz)
+            });
+            match result {
+                Ok(dataset) => opened.push(dataset),
+                Err(error) => errors.push(format!("{display_path}: {error}")),
+            }
+        }
+
+        (opened, errors)
+    }
+
+    fn open_local_csv_pair(
+        analog_path: &Path,
+        digital_path: &Path,
+        sample_rate_hz: f64,
+    ) -> Result<OpenedDataset, String> {
+        let analog = CsvDataSource::open_with_sample_rate(analog_path, sample_rate_hz)
             .map_err(|error| error.to_string())?;
+        let digital = CsvDataSource::open_with_sample_rate(digital_path, sample_rate_hz)
+            .map_err(|error| error.to_string())?;
+        Self::open_local_csv_pair_sources(analog_path, analog, digital_path, digital)
+    }
+
+    fn open_local_csv_pair_by_content(
+        first_path: &Path,
+        second_path: &Path,
+        sample_rate_hz: f64,
+    ) -> Result<OpenedDataset, String> {
+        let first = CsvDataSource::open_with_sample_rate(first_path, sample_rate_hz)
+            .map_err(|error| error.to_string())?;
+        let second = CsvDataSource::open_with_sample_rate(second_path, sample_rate_hz)
+            .map_err(|error| error.to_string())?;
+        let first_digital = Self::csv_source_looks_digital(&first);
+        let second_digital = Self::csv_source_looks_digital(&second);
+        match (first_digital, second_digital) {
+            (false, true) => {
+                Self::open_local_csv_pair_sources(first_path, first, second_path, second)
+            }
+            (true, false) => {
+                Self::open_local_csv_pair_sources(second_path, second, first_path, first)
+            }
+            _ => Err("Could not distinguish analog and digital local CSV files.".to_owned()),
+        }
+    }
+
+    fn open_local_csv_pair_sources(
+        analog_path: &Path,
+        analog: CsvDataSource,
+        digital_path: &Path,
+        digital: CsvDataSource,
+    ) -> Result<OpenedDataset, String> {
+        let source_name = Self::merged_local_csv_name(analog_path, digital_path);
+        let digital_source = Self::local_digital_source(digital_path, digital);
+        let source = CombinedDataSource::new(
+            source_name,
+            vec![
+                (Arc::new(analog) as Arc<dyn DataSource>, false),
+                (digital_source, true),
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+
+        Ok(OpenedDataset {
+            source: Arc::new(source),
+            path: analog_path.to_owned(),
+            kind: SourceKind::Local,
+        })
+    }
+
+    fn local_digital_source(path: &Path, source: CsvDataSource) -> Arc<dyn DataSource> {
+        if Self::should_expand_ddata_bitfields(path, &source) {
+            let bitfield_channels = source
+                .metadata()
+                .channels
+                .iter()
+                .take(3)
+                .map(|channel| channel.index)
+                .collect::<Vec<_>>();
+            let source_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("DDATA.csv")
+                .to_owned();
+            Arc::new(BitfieldDigitalDataSource::new(
+                Arc::new(source),
+                source_name,
+                bitfield_channels,
+            ))
+        } else {
+            Arc::new(source)
+        }
+    }
+
+    fn should_expand_ddata_bitfields(path: &Path, source: &CsvDataSource) -> bool {
+        if source.metadata().channels.len() < 3 {
+            return false;
+        }
+        let path_has_ddata = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stem.to_ascii_lowercase().contains("ddata"));
+        let channels_have_ddata = source
+            .metadata()
+            .channels
+            .iter()
+            .take(3)
+            .any(|channel| channel.name.to_ascii_lowercase().contains("ddata"));
+        path_has_ddata || channels_have_ddata
+    }
+
+    fn is_local_csv_file(path: &Path) -> bool {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("csv"))
+            && Self::looks_like_cloud_csv(path).is_ok_and(|is_cloud| !is_cloud)
+    }
+
+    fn csv_source_looks_digital(source: &dyn DataSource) -> bool {
+        let meta = source.metadata();
+        let channels = meta
+            .channels
+            .iter()
+            .take(12)
+            .map(|channel| channel.index)
+            .collect::<Vec<_>>();
+        if channels.is_empty() {
+            return false;
+        }
+        let Ok(block) = source.read_range(meta.start_time, meta.end_time, &channels, 512) else {
+            return false;
+        };
+        let checked = block
+            .channels
+            .iter()
+            .filter(|values| !values.is_empty())
+            .count();
+        if checked == 0 {
+            return false;
+        }
+        let digital = block
+            .channels
+            .iter()
+            .filter(|values| Self::samples_look_digital(values))
+            .count();
+        digital * 2 >= checked
+    }
+
+    fn local_csv_merge_role(path: &Path) -> Option<(LocalCsvRole, String)> {
+        if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_none_or(|extension| !extension.eq_ignore_ascii_case("csv"))
+        {
+            return None;
+        }
+        if Self::looks_like_cloud_csv(path).ok()? {
+            return None;
+        }
+
+        let stem = path.file_stem()?.to_string_lossy();
+        let lowered = stem.to_ascii_lowercase();
+        let role = if stem.contains("模拟量")
+            || stem.contains("模拟")
+            || lowered.contains("analog")
+            || lowered.contains("adata")
+            || lowered.contains("_ai")
+            || lowered.contains("-ai")
+        {
+            LocalCsvRole::Analog
+        } else if stem.contains("数字量")
+            || stem.contains("数字")
+            || lowered.contains("digital")
+            || lowered.contains("ddata")
+            || lowered.contains("_di")
+            || lowered.contains("-di")
+            || lowered.contains("status")
+            || lowered.contains("logic")
+        {
+            LocalCsvRole::Digital
+        } else {
+            return None;
+        };
+        Some((role, Self::local_csv_merge_key(&stem)))
+    }
+
+    fn local_csv_merge_key(stem: &str) -> String {
+        let mut key = stem.to_owned();
+        for token in [
+            "模拟量",
+            "数字量",
+            "模拟",
+            "数字",
+            "ADATA",
+            "DDATA",
+            "adata",
+            "ddata",
+            "analog",
+            "digital",
+            "status",
+            "logic",
+            "_ai",
+            "-ai",
+            "_di",
+            "-di",
+            "ai",
+            "di",
+        ] {
+            key = key.replace(token, "");
+            key = key.replace(&token.to_ascii_uppercase(), "");
+        }
+        let key = key
+            .chars()
+            .filter(|ch| ch.is_alphanumeric())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if key.is_empty() {
+            "local_csv_pair".to_owned()
+        } else {
+            key
+        }
+    }
+
+    fn merged_local_csv_name(analog_path: &Path, digital_path: &Path) -> String {
+        let analog = analog_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("analog");
+        let digital = digital_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("digital");
+        let key = Self::local_csv_merge_key(analog);
+        if key != "local_csv_pair" {
+            key
+        } else {
+            format!("{analog}+{digital}")
+        }
+    }
+
+    fn looks_like_cloud_csv(path: &Path) -> Result<bool, String> {
+        let mut reader =
+            csv_reader_from_path_with_headers(path, true).map_err(|error| error.to_string())?;
         let headers = reader.headers().map_err(|error| error.to_string())?;
         if headers.is_empty() {
             return Err("Empty CSV: missing header or data.".to_owned());
@@ -1750,6 +3434,75 @@ impl ScopeApp {
     fn current_names_config(&self) -> NamesConfig {
         NamesConfig {
             display_names: self.display_names.clone(),
+        }
+    }
+
+    fn current_display_config(&self) -> DisplayConfig {
+        DisplayConfig {
+            channel_colors: self
+                .channel_colors
+                .iter()
+                .map(|color| color.to_array())
+                .collect(),
+            line_widths: self.line_widths.clone(),
+            line_patterns: self.line_patterns.clone(),
+            channel_scales: self.channel_scales.clone(),
+            channel_panes: self.channel_panes.clone(),
+            derived_visible: self.derived_visible.clone(),
+            derived_colors: self
+                .derived_colors
+                .iter()
+                .map(|color| color.to_array())
+                .collect(),
+            derived_line_patterns: self.derived_line_patterns.clone(),
+            derived_panes: self.derived_panes.clone(),
+            pll_sync_source: self.pll_sync_source,
+            pll_source_channels: self.pll_source_channels,
+            dq_source_channels: self.dq_source_channels,
+            time_sync_source_channels: self.time_sync_source_channels,
+            fft_channel: self.fft_channel,
+            wheel_zoom_sensitivity: self.wheel_zoom_sensitivity,
+            sample_rate_hz: self.sample_rate_hz,
+            harmonic_base_hz: self.harmonic_base_hz,
+            scope_layout_rows: self.scope_layout_rows,
+            scope_layout_cols: self.scope_layout_cols,
+            language: self.language,
+            theme_mode: self.theme_mode,
+            export_arrow_size: self.export_arrow_size,
+            export_arrow_color_style: self.export_arrow_color_style,
+            export_style_preset: ExportStylePreset::Screenshot,
+            export_pane_scope: self.export_pane_scope,
+            export_time_range_mode: self.export_time_range_mode,
+            export_manual_start: self.export_manual_start,
+            export_manual_end: self.export_manual_end,
+            export_arrow_line_style: self.export_arrow_line_style,
+            export_arrow_custom_color: self.export_arrow_custom_color.to_array(),
+            export_label_scale: self.export_label_scale,
+            export_label_font_style: self.export_label_font_style,
+            export_resolution: self.export_resolution,
+            export_dpi: self.export_dpi,
+            export_dpi_value: self.export_dpi_value(),
+            export_cursor_table_enabled: self.export_cursor_table_enabled,
+        }
+    }
+
+    fn current_dataset_config(&self) -> DatasetConfig {
+        DatasetConfig {
+            primary_dataset_name: self.primary_dataset_name.clone(),
+            primary_visible: self.visible.clone(),
+            primary_line_pattern: self.dataset_line_pattern(0),
+            sync_time_axes: self.sync_time_axes,
+            time_sync_source_channels: self.time_sync_source_channels,
+            imported: self
+                .imported_datasets
+                .iter()
+                .map(|dataset| DatasetGroupConfig {
+                    display_name: dataset.display_name.clone(),
+                    visible: dataset.visible.clone(),
+                    line_pattern: dataset.line_pattern,
+                    time_offset: dataset.time_offset,
+                })
+                .collect(),
         }
     }
 
@@ -1775,7 +3528,9 @@ impl ScopeApp {
             derived_line_patterns: self.derived_line_patterns.clone(),
             derived_panes: self.derived_panes.clone(),
             pll_sync_source: self.pll_sync_source,
+            pll_source_channels: self.pll_source_channels,
             dq_source_channels: self.dq_source_channels,
+            time_sync_source_channels: self.time_sync_source_channels,
             fft_channel: self.fft_channel,
             wheel_zoom_sensitivity: self.wheel_zoom_sensitivity,
             sample_rate_hz: self.sample_rate_hz,
@@ -1785,11 +3540,260 @@ impl ScopeApp {
             language: self.language,
             theme_mode: self.theme_mode,
             shortcuts: self.shortcuts,
+            export_arrow_size: self.export_arrow_size,
+            export_arrow_color_style: self.export_arrow_color_style,
+            export_style_preset: ExportStylePreset::Screenshot,
+            export_pane_scope: self.export_pane_scope,
+            export_time_range_mode: self.export_time_range_mode,
+            export_manual_start: self.export_manual_start,
+            export_manual_end: self.export_manual_end,
+            export_arrow_line_style: self.export_arrow_line_style,
+            export_arrow_custom_color: self.export_arrow_custom_color.to_array(),
+            export_label_scale: self.export_label_scale,
+            export_label_font_style: self.export_label_font_style,
+            export_resolution: self.export_resolution,
+            export_dpi: self.export_dpi,
+            export_dpi_value: self.export_dpi_value(),
+            export_cursor_table_enabled: self.export_cursor_table_enabled,
         }
     }
 
     fn apply_names_config(&mut self, config: NamesConfig) {
         self.apply_display_names(config.display_names);
+    }
+
+    fn apply_display_config(&mut self, config: DisplayConfig) {
+        let old_scales = self.channel_scales.clone();
+        let old_derived_visible = self.derived_visible.clone();
+        let old_pll_source_channels = self.pll_source_channels;
+        let old_dq_source_channels = self.dq_source_channels;
+        let old_time_sync_source_channels = self.time_sync_source_channels;
+        let old_sample_rate_hz = self.sample_rate_hz;
+        let old_harmonic_base_hz = self.harmonic_base_hz;
+        let old_fft_channel = self.fft_channel;
+        for (index, color) in config
+            .channel_colors
+            .into_iter()
+            .enumerate()
+            .take(self.channel_colors.len())
+        {
+            self.channel_colors[index] =
+                Color32::from_rgba_premultiplied(color[0], color[1], color[2], color[3]);
+        }
+        for (index, width) in config
+            .line_widths
+            .into_iter()
+            .enumerate()
+            .take(self.line_widths.len())
+        {
+            self.line_widths[index] = width.clamp(MIN_CHANNEL_LINE_WIDTH, MAX_CHANNEL_LINE_WIDTH);
+        }
+        for (index, pattern) in config
+            .line_patterns
+            .into_iter()
+            .enumerate()
+            .take(self.line_patterns.len())
+        {
+            self.line_patterns[index] = pattern;
+        }
+        for (index, scale) in config
+            .channel_scales
+            .into_iter()
+            .enumerate()
+            .take(self.channel_scales.len())
+        {
+            self.channel_scales[index] = Self::sanitize_channel_scale(scale);
+        }
+
+        self.scope_layout_rows = config.scope_layout_rows.clamp(1, MAX_SCOPE_LAYOUT_ROWS);
+        self.scope_layout_cols = config.scope_layout_cols.clamp(1, MAX_SCOPE_LAYOUT_COLS);
+        let pane_count = self.scope_pane_count();
+        for (index, pane) in config
+            .channel_panes
+            .into_iter()
+            .enumerate()
+            .take(self.channel_panes.len())
+        {
+            self.channel_panes[index] = pane.min(pane_count.saturating_sub(1));
+        }
+        for (index, visible) in config
+            .derived_visible
+            .into_iter()
+            .enumerate()
+            .take(self.derived_visible.len())
+        {
+            self.derived_visible[index] = visible;
+        }
+        for (index, color) in config
+            .derived_colors
+            .into_iter()
+            .enumerate()
+            .take(self.derived_colors.len())
+        {
+            self.derived_colors[index] =
+                Color32::from_rgba_premultiplied(color[0], color[1], color[2], color[3]);
+        }
+        for (index, pattern) in config
+            .derived_line_patterns
+            .into_iter()
+            .enumerate()
+            .take(self.derived_line_patterns.len())
+        {
+            self.derived_line_patterns[index] = pattern;
+        }
+        for (index, pane) in config
+            .derived_panes
+            .into_iter()
+            .enumerate()
+            .take(self.derived_panes.len())
+        {
+            self.derived_panes[index] = pane.min(pane_count.saturating_sub(1));
+        }
+
+        self.pll_sync_source = config.pll_sync_source;
+        let channel_options = self.fft_channel_options();
+        self.pll_source_channels =
+            if Self::valid_three_phase_selection(config.pll_source_channels, &channel_options) {
+                config.pll_source_channels
+            } else {
+                self.preferred_pll_source_channels(&channel_options)
+                    .or_else(|| Self::default_sequence_channels_from_options(&channel_options))
+                    .unwrap_or(self.pll_source_channels)
+            };
+        self.dq_source_channels = config.dq_source_channels;
+        let time_sync_options = self.primary_time_sync_channel_options();
+        self.time_sync_source_channels = if Self::valid_three_phase_selection(
+            config.time_sync_source_channels,
+            &time_sync_options,
+        ) {
+            config.time_sync_source_channels
+        } else {
+            self.preferred_time_sync_source_channels(&time_sync_options)
+                .or_else(|| Self::default_sequence_channels_from_options(&time_sync_options))
+                .unwrap_or(self.time_sync_source_channels)
+        };
+        let channel_count = self.display_names.len();
+        if channel_count > 0 {
+            self.fft_channel = config.fft_channel.min(channel_count - 1);
+        }
+        self.wheel_zoom_sensitivity = config
+            .wheel_zoom_sensitivity
+            .clamp(MIN_WHEEL_ZOOM_SENSITIVITY, MAX_WHEEL_ZOOM_SENSITIVITY);
+        self.sample_rate_hz = config.sample_rate_hz.clamp(1.0, 10_000_000.0);
+        self.harmonic_base_hz = config.harmonic_base_hz.clamp(0.001, 10_000_000.0);
+        self.language = config.language;
+        self.theme_mode = config.theme_mode;
+        self.export_arrow_size = config
+            .export_arrow_size
+            .clamp(MIN_EXPORT_ARROW_SIZE, MAX_EXPORT_ARROW_SIZE);
+        self.export_arrow_color_style = config.export_arrow_color_style;
+        let _ = config.export_style_preset;
+        self.export_style_preset = ExportStylePreset::Screenshot;
+        self.export_pane_scope = config.export_pane_scope;
+        self.export_time_range_mode = config.export_time_range_mode;
+        self.export_manual_start = config.export_manual_start;
+        self.export_manual_end = config.export_manual_end;
+        self.export_arrow_line_style = config.export_arrow_line_style;
+        self.export_arrow_custom_color = Color32::from_rgba_premultiplied(
+            config.export_arrow_custom_color[0],
+            config.export_arrow_custom_color[1],
+            config.export_arrow_custom_color[2],
+            config.export_arrow_custom_color[3],
+        );
+        self.export_label_scale = config
+            .export_label_scale
+            .clamp(MIN_EXPORT_LABEL_SCALE, MAX_EXPORT_LABEL_SCALE);
+        self.export_label_font_style = config.export_label_font_style;
+        self.export_resolution = config.export_resolution;
+        self.export_dpi = config.export_dpi;
+        self.export_dpi_value = config.export_dpi_value.clamp(50, 2400);
+        self.export_cursor_table_enabled = config.export_cursor_table_enabled;
+
+        self.hovered_channel = None;
+        let scale_changed = old_scales != self.channel_scales;
+        let derived_input_changed = old_derived_visible != self.derived_visible
+            || old_pll_source_channels != self.pll_source_channels
+            || old_dq_source_channels != self.dq_source_channels
+            || (old_sample_rate_hz - self.sample_rate_hz).abs() > f64::EPSILON
+            || (old_harmonic_base_hz - self.harmonic_base_hz).abs() > f64::EPSILON;
+        let fft_input_changed = scale_changed
+            || old_fft_channel != self.fft_channel
+            || (old_sample_rate_hz - self.sample_rate_hz).abs() > f64::EPSILON
+            || (old_harmonic_base_hz - self.harmonic_base_hz).abs() > f64::EPSILON;
+        if scale_changed {
+            self.clear_y_overrides();
+            self.needs_plot_reload = true;
+            self.needs_compare_plot_reload = true;
+            self.measurement_cache = None;
+            self.derived_measurement_cache = None;
+        }
+        if derived_input_changed {
+            self.needs_derived_reload = true;
+            self.derived_measurement_cache = None;
+        }
+        if fft_input_changed {
+            self.needs_fft_reload = true;
+        }
+        if old_time_sync_source_channels != self.time_sync_source_channels {
+            self.time_sync_status.clear();
+        }
+        self.fft_channel_user_selected = false;
+    }
+
+    fn apply_dataset_config(&mut self, config: DatasetConfig) {
+        self.primary_dataset_name = config.primary_dataset_name;
+        for (index, visible) in config
+            .primary_visible
+            .into_iter()
+            .enumerate()
+            .take(self.visible.len())
+        {
+            self.visible[index] = visible;
+        }
+        self.set_dataset_line_pattern(0, config.primary_line_pattern);
+        self.sync_time_axes = config.sync_time_axes;
+        let time_sync_options = self.primary_time_sync_channel_options();
+        self.time_sync_source_channels = if Self::valid_three_phase_selection(
+            config.time_sync_source_channels,
+            &time_sync_options,
+        ) {
+            config.time_sync_source_channels
+        } else {
+            self.preferred_time_sync_source_channels(&time_sync_options)
+                .or_else(|| Self::default_sequence_channels_from_options(&time_sync_options))
+                .unwrap_or(self.time_sync_source_channels)
+        };
+        self.time_sync_source_channels_user_selected = true;
+
+        for (index, group) in config.imported.into_iter().enumerate() {
+            if let Some(dataset) = self.imported_datasets.get_mut(index) {
+                dataset.display_name = group.display_name;
+                for (channel_index, visible) in group
+                    .visible
+                    .into_iter()
+                    .enumerate()
+                    .take(dataset.visible.len())
+                {
+                    dataset.visible[channel_index] = visible;
+                }
+                dataset.line_pattern = group.line_pattern;
+                dataset.time_offset = group.time_offset;
+                dataset.plot_cache = SampleBlock::default();
+                dataset.plot_summary = None;
+                dataset.prepared_plot_cache = PreparedPlotSeries::default();
+                dataset.prepared_plot_summary = None;
+            }
+        }
+
+        self.time_sync_status.clear();
+        self.clear_y_overrides();
+        self.needs_plot_reload = true;
+        self.needs_compare_plot_reload = true;
+        self.needs_fft_reload = true;
+        self.measurement_cache = None;
+        self.derived_measurement_cache = None;
+        self.fft_results.clear();
+        self.fft_channel_user_selected = false;
     }
 
     fn apply_display_names(&mut self, display_names: Vec<String>) {
@@ -1801,6 +3805,15 @@ impl ScopeApp {
     }
 
     fn apply_runtime_config(&mut self, config: RuntimeConfig) {
+        let old_visible = self.visible.clone();
+        let old_scales = self.channel_scales.clone();
+        let old_derived_visible = self.derived_visible.clone();
+        let old_pll_source_channels = self.pll_source_channels;
+        let old_dq_source_channels = self.dq_source_channels;
+        let old_time_sync_source_channels = self.time_sync_source_channels;
+        let old_sample_rate_hz = self.sample_rate_hz;
+        let old_harmonic_base_hz = self.harmonic_base_hz;
+        let old_fft_channel = self.fft_channel;
         self.apply_display_names(config.display_names.clone());
         self.language = config.language;
         self.theme_mode = config.theme_mode;
@@ -1890,11 +3903,29 @@ impl ScopeApp {
             self.derived_panes[index] = pane.min(pane_count.saturating_sub(1));
         }
         self.pll_sync_source = config.pll_sync_source;
-        self.pll_source_channels = self
-            .preferred_pll_source_channels(&self.fft_channel_options())
-            .unwrap_or(self.pll_source_channels);
+        let channel_options = self.fft_channel_options();
+        self.pll_source_channels =
+            if Self::valid_three_phase_selection(config.pll_source_channels, &channel_options) {
+                config.pll_source_channels
+            } else {
+                self.preferred_pll_source_channels(&channel_options)
+                    .or_else(|| Self::default_sequence_channels_from_options(&channel_options))
+                    .unwrap_or(self.pll_source_channels)
+            };
         self.dq_source_channels = config.dq_source_channels;
         self.dq_source_channels_user_selected = true;
+        let time_sync_options = self.primary_time_sync_channel_options();
+        self.time_sync_source_channels = if Self::valid_three_phase_selection(
+            config.time_sync_source_channels,
+            &time_sync_options,
+        ) {
+            config.time_sync_source_channels
+        } else {
+            self.preferred_time_sync_source_channels(&time_sync_options)
+                .or_else(|| Self::default_sequence_channels_from_options(&time_sync_options))
+                .unwrap_or(self.time_sync_source_channels)
+        };
+        self.time_sync_source_channels_user_selected = true;
         if channel_count > 0 {
             self.fft_channel = config.fft_channel.min(channel_count - 1);
         }
@@ -1906,13 +3937,60 @@ impl ScopeApp {
         self.harmonic_base_hz = config.harmonic_base_hz.clamp(0.001, 10_000_000.0);
         self.scope_layout_rows = config.scope_layout_rows.clamp(1, MAX_SCOPE_LAYOUT_ROWS);
         self.scope_layout_cols = config.scope_layout_cols.clamp(1, MAX_SCOPE_LAYOUT_COLS);
+        self.export_arrow_size = config
+            .export_arrow_size
+            .clamp(MIN_EXPORT_ARROW_SIZE, MAX_EXPORT_ARROW_SIZE);
+        self.export_arrow_color_style = config.export_arrow_color_style;
+        let _ = config.export_style_preset;
+        self.export_style_preset = ExportStylePreset::Screenshot;
+        self.export_pane_scope = config.export_pane_scope;
+        self.export_time_range_mode = config.export_time_range_mode;
+        self.export_manual_start = config.export_manual_start;
+        self.export_manual_end = config.export_manual_end;
+        self.export_arrow_line_style = config.export_arrow_line_style;
+        self.export_arrow_custom_color = Color32::from_rgba_premultiplied(
+            config.export_arrow_custom_color[0],
+            config.export_arrow_custom_color[1],
+            config.export_arrow_custom_color[2],
+            config.export_arrow_custom_color[3],
+        );
+        self.export_label_scale = config
+            .export_label_scale
+            .clamp(MIN_EXPORT_LABEL_SCALE, MAX_EXPORT_LABEL_SCALE);
+        self.export_label_font_style = config.export_label_font_style;
+        self.export_resolution = config.export_resolution;
+        self.export_dpi = config.export_dpi;
+        self.export_dpi_value = config.export_dpi_value.clamp(50, 2400);
+        self.export_cursor_table_enabled = config.export_cursor_table_enabled;
         self.hovered_channel = None;
-        self.needs_plot_reload = true;
-        self.needs_compare_plot_reload = true;
-        self.needs_derived_reload = true;
-        self.needs_fft_reload = true;
-        self.measurement_cache = None;
-        self.derived_measurement_cache = None;
+        let visibility_changed = old_visible != self.visible;
+        let scale_changed = old_scales != self.channel_scales;
+        let derived_input_changed = old_derived_visible != self.derived_visible
+            || old_pll_source_channels != self.pll_source_channels
+            || old_dq_source_channels != self.dq_source_channels
+            || (old_sample_rate_hz - self.sample_rate_hz).abs() > f64::EPSILON
+            || (old_harmonic_base_hz - self.harmonic_base_hz).abs() > f64::EPSILON;
+        let fft_input_changed = scale_changed
+            || old_fft_channel != self.fft_channel
+            || (old_sample_rate_hz - self.sample_rate_hz).abs() > f64::EPSILON
+            || (old_harmonic_base_hz - self.harmonic_base_hz).abs() > f64::EPSILON;
+        if visibility_changed || scale_changed {
+            self.clear_y_overrides();
+            self.needs_plot_reload = true;
+            self.needs_compare_plot_reload = true;
+            self.measurement_cache = None;
+            self.derived_measurement_cache = None;
+        }
+        if derived_input_changed || visibility_changed || scale_changed {
+            self.needs_derived_reload = true;
+            self.derived_measurement_cache = None;
+        }
+        if fft_input_changed {
+            self.needs_fft_reload = true;
+        }
+        if old_time_sync_source_channels != self.time_sync_source_channels {
+            self.time_sync_status.clear();
+        }
     }
 
     fn reload_cloud_with_current_sample_rate(&mut self) {
@@ -1988,11 +4066,13 @@ impl ScopeApp {
         if path.extension().is_none() {
             path.set_extension(format.extension());
         }
+        let channels = self.export_channels_for_dataset(dataset_index, false);
 
         match self.write_dataset_export(
             source,
             &meta,
             dataset_index,
+            &channels,
             &path,
             format,
             meta.start_time,
@@ -2025,7 +4105,12 @@ impl ScopeApp {
         format!("{stem}{}.{}", format.suffix(), format.extension())
     }
 
-    fn export_cursor_range_dataset(&mut self, dataset_index: usize, format: DatasetExportFormat) {
+    fn export_cursor_range_dataset_channels(
+        &mut self,
+        dataset_index: usize,
+        format: DatasetExportFormat,
+        visible_only: bool,
+    ) {
         let Some((start_time, end_time)) = self.cursor_export_range_for_dataset(dataset_index)
         else {
             self.last_error = Some(
@@ -2052,6 +4137,17 @@ impl ScopeApp {
             );
             return;
         }
+        let channels = self.export_channels_for_dataset(dataset_index, visible_only);
+        if channels.is_empty() {
+            self.last_error = Some(
+                self.tr(
+                    "没有可导出的通道。",
+                    "No channels are available for export.",
+                )
+                .to_owned(),
+            );
+            return;
+        }
 
         let default_name =
             self.default_range_export_file_name(dataset_index, &meta, format, start_time, end_time);
@@ -2070,6 +4166,7 @@ impl ScopeApp {
             source,
             &meta,
             dataset_index,
+            &channels,
             &path,
             format,
             start_time,
@@ -2087,6 +4184,97 @@ impl ScopeApp {
                     Language::En => format!("Failed to export cursor range: {error}"),
                 });
             }
+        }
+    }
+
+    fn export_cursor_range_batch(
+        &mut self,
+        dataset_indices: Vec<usize>,
+        formats: Vec<DatasetExportFormat>,
+        visible_only: bool,
+    ) {
+        let targets = dataset_indices
+            .into_iter()
+            .filter_map(|dataset_index| {
+                let range = self.cursor_export_range_for_dataset(dataset_index)?;
+                let source = self.dataset_source_by_index(dataset_index)?;
+                let meta = self.dataset_meta_by_index(dataset_index)?.clone();
+                let channels = self.export_channels_for_dataset(dataset_index, visible_only);
+                (!channels.is_empty()).then_some((dataset_index, source, meta, range, channels))
+            })
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            self.last_error = Some(
+                self.tr(
+                    "没有可导出的数据组或通道。",
+                    "No datasets or channels are available for export.",
+                )
+                .to_owned(),
+            );
+            return;
+        }
+        let Some(folder) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+
+        let mut exported_files = 0usize;
+        let mut exported_rows = 0u64;
+        let mut errors = Vec::new();
+        for (dataset_index, source, meta, (start_time, end_time), channels) in targets {
+            for format in &formats {
+                let file_name = self.default_batch_range_export_file_name(
+                    dataset_index,
+                    &meta,
+                    *format,
+                    start_time,
+                    end_time,
+                );
+                let path = folder.join(file_name);
+                match self.write_dataset_export(
+                    source.clone(),
+                    &meta,
+                    dataset_index,
+                    &channels,
+                    &path,
+                    *format,
+                    start_time,
+                    end_time,
+                ) {
+                    Ok(rows) => {
+                        exported_files += 1;
+                        exported_rows += rows;
+                        tracing::info!(
+                            "exported {rows} split rows ({start_time:.6}..{end_time:.6}) to {}",
+                            path.display()
+                        );
+                    }
+                    Err(error) => errors.push(format!("{}: {error}", path.display())),
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            self.last_error = Some(match self.language {
+                Language::Zh => {
+                    format!("已批量导出 {exported_files} 个文件，共 {exported_rows} 行。")
+                }
+                Language::En => {
+                    format!("Exported {exported_files} files, {exported_rows} rows total.")
+                }
+            });
+        } else {
+            self.last_error = Some(match self.language {
+                Language::Zh => format!(
+                    "批量导出完成，但有 {} 个文件失败：\n{}",
+                    errors.len(),
+                    errors.join("\n")
+                ),
+                Language::En => format!(
+                    "Batch export finished with {} failed files:\n{}",
+                    errors.len(),
+                    errors.join("\n")
+                ),
+            });
         }
     }
 
@@ -2111,11 +4299,3554 @@ impl ScopeApp {
         )
     }
 
+    fn default_batch_range_export_file_name(
+        &self,
+        dataset_index: usize,
+        meta: &DatasetMeta,
+        format: DatasetExportFormat,
+        start_time: f64,
+        end_time: f64,
+    ) -> String {
+        let dataset = Self::sanitize_file_component(&self.dataset_short_label(dataset_index));
+        let base = Self::sanitize_file_component(&self.default_range_export_file_name(
+            dataset_index,
+            meta,
+            format,
+            start_time,
+            end_time,
+        ));
+        format!("{dataset}_{base}")
+    }
+
+    fn sanitize_file_component(value: &str) -> String {
+        let sanitized = value
+            .chars()
+            .map(|ch| match ch {
+                '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+                ch if ch.is_control() => '_',
+                ch => ch,
+            })
+            .collect::<String>();
+        let sanitized = sanitized.trim_matches([' ', '.']).trim();
+        if sanitized.is_empty() {
+            "export".to_owned()
+        } else {
+            sanitized.to_owned()
+        }
+    }
+
+    fn export_channels_for_dataset(&self, dataset_index: usize, visible_only: bool) -> Vec<usize> {
+        if visible_only {
+            if dataset_index == 0 {
+                self.selected_channels()
+            } else {
+                self.selected_imported_channels(dataset_index - 1)
+            }
+        } else {
+            self.dataset_meta_by_index(dataset_index)
+                .map(|meta| {
+                    meta.channels
+                        .iter()
+                        .map(|channel| channel.index)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        }
+    }
+
+    fn cursor_export_scope_label(&self, visible_only: bool) -> &'static str {
+        if visible_only {
+            self.tr("已勾选通道", "Checked Channels")
+        } else {
+            self.tr("全部通道", "All Channels")
+        }
+    }
+
+    fn export_data_menu(&mut self, ui: &mut egui::Ui, dataset_indices: &[usize]) {
+        if dataset_indices.len() <= 1 {
+            self.export_dataset_range_menu(ui, 0);
+            return;
+        }
+
+        let labels = dataset_indices
+            .iter()
+            .map(|dataset_index| (*dataset_index, self.dataset_label(*dataset_index)))
+            .collect::<Vec<_>>();
+        for (dataset_index, label) in labels {
+            ui.menu_button(label, |ui| {
+                self.export_dataset_range_menu(ui, dataset_index);
+            });
+        }
+    }
+
+    fn export_dataset_range_menu(&mut self, ui: &mut egui::Ui, dataset_index: usize) {
+        ui.menu_button(self.t(UiText::ExportAllRange), |ui| {
+            for format in DatasetExportFormat::ALL {
+                if ui.button(format.label(self.language)).clicked() {
+                    self.export_dataset(dataset_index, format);
+                    ui.close_menu();
+                }
+            }
+        });
+
+        let cursor_range_available = self
+            .cursor_export_range_for_dataset(dataset_index)
+            .is_some();
+        ui.add_enabled_ui(cursor_range_available, |ui| {
+            ui.menu_button(self.t(UiText::ExportCursorRangeData), |ui| {
+                for format in DatasetExportFormat::ALL {
+                    if ui.button(format.label(self.language)).clicked() {
+                        self.export_cursor_range_dataset_channels(dataset_index, format, false);
+                        ui.close_menu();
+                    }
+                }
+            });
+        });
+    }
+
+    fn cursor_export_dataset_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        dataset_index: usize,
+        visible_only: bool,
+    ) {
+        let channels = self.export_channels_for_dataset(dataset_index, visible_only);
+        let label = format!(
+            "{} ({})",
+            self.cursor_export_scope_label(visible_only),
+            channels.len()
+        );
+        ui.add_enabled_ui(!channels.is_empty(), |ui| {
+            ui.menu_button(label, |ui| {
+                for format in DatasetExportFormat::ALL {
+                    if ui.button(format.label(self.language)).clicked() {
+                        self.export_cursor_range_dataset_channels(
+                            dataset_index,
+                            format,
+                            visible_only,
+                        );
+                        ui.close_menu();
+                    }
+                }
+                ui.separator();
+                if ui
+                    .button(self.tr("全部格式...", "All Formats..."))
+                    .clicked()
+                {
+                    self.export_cursor_range_batch(
+                        vec![dataset_index],
+                        DatasetExportFormat::ALL.to_vec(),
+                        visible_only,
+                    );
+                    ui.close_menu();
+                }
+            });
+        });
+    }
+
+    fn cursor_export_batch_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        dataset_indices: &[usize],
+        visible_only: bool,
+    ) {
+        let channel_count = dataset_indices
+            .iter()
+            .map(|dataset_index| {
+                self.export_channels_for_dataset(*dataset_index, visible_only)
+                    .len()
+            })
+            .sum::<usize>();
+        let label = format!(
+            "{} ({})",
+            self.cursor_export_scope_label(visible_only),
+            channel_count
+        );
+        ui.add_enabled_ui(channel_count > 0, |ui| {
+            ui.menu_button(label, |ui| {
+                for format in DatasetExportFormat::ALL {
+                    if ui.button(format.label(self.language)).clicked() {
+                        self.export_cursor_range_batch(
+                            dataset_indices.to_vec(),
+                            vec![format],
+                            visible_only,
+                        );
+                        ui.close_menu();
+                    }
+                }
+                ui.separator();
+                if ui
+                    .button(self.tr("全部格式...", "All Formats..."))
+                    .clicked()
+                {
+                    self.export_cursor_range_batch(
+                        dataset_indices.to_vec(),
+                        DatasetExportFormat::ALL.to_vec(),
+                        visible_only,
+                    );
+                    ui.close_menu();
+                }
+            });
+        });
+    }
+
+    fn export_waveform_png(&mut self) {
+        if self.source.is_none() {
+            self.last_error = Some(self.tr("请先导入数据。", "Import data first.").to_owned());
+            return;
+        }
+
+        self.poll_plot_worker();
+        self.poll_compare_plot_worker();
+        self.reload_derived_curve_cache();
+        if self.needs_plot_reload {
+            self.reload_plot_cache(DEFAULT_PLOT_PIXEL_WIDTH);
+        }
+        if self.needs_compare_plot_reload {
+            self.reload_compare_plot_cache(DEFAULT_PLOT_PIXEL_WIDTH);
+        }
+        if self.plot_worker.is_some()
+            || self.compare_plot_worker.is_some()
+            || self.derived_curve_worker.is_some()
+        {
+            self.last_error = Some(
+                self.tr(
+                    "波形数据正在刷新，请稍后再导出图片。",
+                    "Waveform data is refreshing. Please export again in a moment.",
+                )
+                .to_owned(),
+            );
+            return;
+        }
+
+        let selections = self.current_plot_selections();
+        let has_channels = !selections.primary.is_empty()
+            || !selections.derived.is_empty()
+            || selections
+                .imported
+                .iter()
+                .any(|channels| !channels.is_empty());
+        if !has_channels {
+            self.last_error = Some(
+                self.tr(
+                    "请至少勾选一条曲线后再导出。",
+                    "Select at least one curve to export.",
+                )
+                .to_owned(),
+            );
+            return;
+        }
+
+        let labels = self.current_export_curve_labels(&selections);
+        self.sync_export_label_overrides(&labels);
+        self.export_manual_start = self.view_start;
+        self.export_manual_end = self.view_end;
+        self.export_preview_undo_stack.clear();
+        self.export_preview_redo_stack.clear();
+        self.show_export_preview = true;
+        self.export_preview_dirty = true;
+        self.export_preview_error = None;
+    }
+
+    fn open_batch_waveform_export(&mut self) {
+        if self.source.is_none() {
+            self.last_error = Some(self.tr("请先导入数据。", "Import data first.").to_owned());
+            return;
+        }
+        self.poll_plot_worker();
+        self.poll_compare_plot_worker();
+        self.reload_derived_curve_cache();
+        if self.needs_plot_reload {
+            self.reload_plot_cache(DEFAULT_PLOT_PIXEL_WIDTH);
+        }
+        if self.needs_compare_plot_reload {
+            self.reload_compare_plot_cache(DEFAULT_PLOT_PIXEL_WIDTH);
+        }
+        if self.plot_worker.is_some()
+            || self.compare_plot_worker.is_some()
+            || self.derived_curve_worker.is_some()
+        {
+            self.last_error = Some(
+                self.tr(
+                    "波形数据正在刷新，请稍后再批量导出图片。",
+                    "Waveform data is refreshing; try batch export again shortly.",
+                )
+                .to_owned(),
+            );
+            return;
+        }
+        let selections = self.current_plot_selections();
+        if Self::plot_selection_curve_count(&selections) == 0 {
+            self.last_error = Some(
+                self.tr(
+                    "请至少勾选一条曲线后再批量导出。",
+                    "Select at least one curve before batch export.",
+                )
+                .to_owned(),
+            );
+            return;
+        }
+        if self.batch_export_windows.is_empty() {
+            self.batch_export_windows.push(BatchExportTimeWindow {
+                enabled: true,
+                start: self.view_start.min(self.view_end),
+                end: self.view_start.max(self.view_end),
+            });
+            if self.show_cursor_a && self.show_cursor_b {
+                let start = self.cursor_a.min(self.cursor_b);
+                let end = self.cursor_a.max(self.cursor_b);
+                if end > start {
+                    self.batch_export_windows.push(BatchExportTimeWindow {
+                        enabled: true,
+                        start,
+                        end,
+                    });
+                }
+            }
+        }
+        self.batch_export_last_summary = None;
+        self.show_batch_export = true;
+    }
+
+    fn default_waveform_png_name(&self) -> String {
+        let stem = self
+            .loaded_path
+            .as_ref()
+            .and_then(|path| path.file_stem())
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.trim().is_empty())
+            .or_else(|| self.meta().map(|meta| meta.source_name.as_str()))
+            .unwrap_or("waveform");
+        format!("{stem}_waveform.png")
+    }
+
+    fn default_waveform_svg_name(&self) -> String {
+        let stem = self
+            .loaded_path
+            .as_ref()
+            .and_then(|path| path.file_stem())
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.trim().is_empty())
+            .or_else(|| self.meta().map(|meta| meta.source_name.as_str()))
+            .unwrap_or("waveform");
+        format!("{stem}_waveform.svg")
+    }
+
+    fn write_current_waveform_png(
+        &self,
+        path: &Path,
+        selections: &PlotSelections,
+    ) -> Result<(), String> {
+        let canvas = self.render_current_waveform_canvas(selections)?;
+        canvas
+            .save_png_with_dpi(path, Some(self.export_dpi_value()))
+            .map_err(|error| error.to_string())
+    }
+
+    fn write_current_waveform_svg(
+        &self,
+        path: &Path,
+        selections: &PlotSelections,
+    ) -> Result<(), String> {
+        let canvas = self.render_current_waveform_svg(selections)?;
+        canvas.save_svg(path).map_err(|error| error.to_string())
+    }
+
+    fn render_current_waveform_canvas(
+        &self,
+        selections: &PlotSelections,
+    ) -> Result<Canvas, String> {
+        self.render_current_waveform_canvas_with_layout(selections)
+            .map(|(canvas, _)| canvas)
+    }
+
+    fn render_current_waveform_canvas_with_layout(
+        &self,
+        selections: &PlotSelections,
+    ) -> Result<(Canvas, Vec<ExportLabelPlacement>), String> {
+        let (x_min, x_max) = self.export_time_range()?;
+        if x_max <= x_min {
+            return Err(self
+                .tr("当前时间范围无效。", "The current time range is invalid.")
+                .to_owned());
+        }
+
+        let source_rows = self.scope_layout_rows.clamp(1, MAX_SCOPE_LAYOUT_ROWS);
+        let source_cols = self.scope_layout_cols.clamp(1, MAX_SCOPE_LAYOUT_COLS);
+        let source_pane_count = source_rows * source_cols;
+        let pane_indices = self.export_pane_indices(source_pane_count);
+        let export_pane_count = pane_indices.len().max(1);
+        let (rows, cols) = if self.export_pane_scope == ExportPaneScope::Active {
+            (1, 1)
+        } else {
+            (source_rows, source_cols)
+        };
+        let pane_selections = self.pane_plot_selections(selections, source_pane_count);
+        let y_bounds = self.current_y_bounds_for_panes(&pane_selections, source_pane_count);
+        let resolution_scale = self.export_resolution.scale();
+        let width = self.export_resolution.width();
+        let margin = 16_i32 * resolution_scale;
+        let gap = 16_i32 * resolution_scale;
+        let pane_w = ((width as i32 - margin * 2 - gap * (cols.saturating_sub(1) as i32))
+            / cols as i32)
+            .max(260);
+        let cursor_rows = self.max_export_cursor_table_rows(selections, source_pane_count);
+        let cursor_table_reserved =
+            self.export_cursor_table_reserved_height(cursor_rows, resolution_scale);
+        let default_bottom_reserved = 54_i32 * resolution_scale;
+        let bottom_reserved = default_bottom_reserved.max(cursor_table_reserved);
+        let pane_h = ((pane_w as f32 * 0.45).round() as i32)
+            .clamp(260 * resolution_scale, 480 * resolution_scale);
+        let pane_h = pane_h + (bottom_reserved - default_bottom_reserved).max(0);
+        let height =
+            (margin + rows as i32 * pane_h + (rows as i32 - 1) * gap + margin).max(480) as usize;
+        let palette = self.export_style_palette();
+        let mut canvas = Canvas::new(width, height, palette.canvas_bg);
+        let mut label_cursor = 0usize;
+        let mut label_layout = Vec::new();
+
+        for (export_index, pane_index) in pane_indices.into_iter().enumerate() {
+            let row = export_index / cols;
+            let col = export_index % cols;
+            let left = margin + col as i32 * (pane_w + gap);
+            let top = margin + row as i32 * (pane_h + gap);
+            let plot = ClipRect {
+                left: left + 64 * resolution_scale,
+                top: top + 12 * resolution_scale,
+                right: left + pane_w - 12 * resolution_scale,
+                bottom: top + pane_h - bottom_reserved,
+            };
+            let pane_title = if export_pane_count > 1 {
+                format!("Pane {}", pane_index + 1)
+            } else {
+                "Waveform".to_owned()
+            };
+            let bounds = y_bounds
+                .get(pane_index)
+                .copied()
+                .unwrap_or_else(|| Self::finalize_y_bounds(f64::INFINITY, f64::NEG_INFINITY));
+            self.draw_export_pane(
+                &mut canvas,
+                plot,
+                pane_index,
+                source_pane_count,
+                selections,
+                bounds,
+                x_min,
+                x_max,
+                &pane_title,
+                &mut label_cursor,
+                &mut label_layout,
+            );
+        }
+        self.draw_export_text_annotations(&mut canvas);
+        self.draw_export_ink_strokes(&mut canvas);
+
+        Ok((canvas, label_layout))
+    }
+
+    fn render_current_waveform_svg(
+        &self,
+        selections: &PlotSelections,
+    ) -> Result<SvgCanvas, String> {
+        let (x_min, x_max) = self.export_time_range()?;
+        if x_max <= x_min {
+            return Err(self
+                .tr("当前时间范围无效。", "The current time range is invalid.")
+                .to_owned());
+        }
+
+        let source_rows = self.scope_layout_rows.clamp(1, MAX_SCOPE_LAYOUT_ROWS);
+        let source_cols = self.scope_layout_cols.clamp(1, MAX_SCOPE_LAYOUT_COLS);
+        let source_pane_count = source_rows * source_cols;
+        let pane_indices = self.export_pane_indices(source_pane_count);
+        let export_pane_count = pane_indices.len().max(1);
+        let (rows, cols) = if self.export_pane_scope == ExportPaneScope::Active {
+            (1, 1)
+        } else {
+            (source_rows, source_cols)
+        };
+        let pane_selections = self.pane_plot_selections(selections, source_pane_count);
+        let y_bounds = self.current_y_bounds_for_panes(&pane_selections, source_pane_count);
+        let resolution_scale = self.export_resolution.scale();
+        let width = self.export_resolution.width();
+        let margin = 16_i32 * resolution_scale;
+        let gap = 16_i32 * resolution_scale;
+        let pane_w = ((width as i32 - margin * 2 - gap * (cols.saturating_sub(1) as i32))
+            / cols as i32)
+            .max(260);
+        let cursor_rows = self.max_export_cursor_table_rows(selections, source_pane_count);
+        let cursor_table_reserved =
+            self.export_cursor_table_reserved_height(cursor_rows, resolution_scale);
+        let default_bottom_reserved = 54_i32 * resolution_scale;
+        let bottom_reserved = default_bottom_reserved.max(cursor_table_reserved);
+        let pane_h = ((pane_w as f32 * 0.45).round() as i32)
+            .clamp(260 * resolution_scale, 480 * resolution_scale);
+        let pane_h = pane_h + (bottom_reserved - default_bottom_reserved).max(0);
+        let height =
+            (margin + rows as i32 * pane_h + (rows as i32 - 1) * gap + margin).max(480) as usize;
+        let palette = self.export_style_palette();
+        let mut canvas = SvgCanvas::new(width, height, palette.canvas_bg);
+        let mut label_cursor = 0usize;
+        let mut label_layout = Vec::new();
+
+        for (export_index, pane_index) in pane_indices.into_iter().enumerate() {
+            let row = export_index / cols;
+            let col = export_index % cols;
+            let left = margin + col as i32 * (pane_w + gap);
+            let top = margin + row as i32 * (pane_h + gap);
+            let plot = ClipRect {
+                left: left + 64 * resolution_scale,
+                top: top + 12 * resolution_scale,
+                right: left + pane_w - 12 * resolution_scale,
+                bottom: top + pane_h - bottom_reserved,
+            };
+            let pane_title = if export_pane_count > 1 {
+                format!("Pane {}", pane_index + 1)
+            } else {
+                "Waveform".to_owned()
+            };
+            let bounds = y_bounds
+                .get(pane_index)
+                .copied()
+                .unwrap_or_else(|| Self::finalize_y_bounds(f64::INFINITY, f64::NEG_INFINITY));
+            self.draw_export_pane(
+                &mut canvas,
+                plot,
+                pane_index,
+                source_pane_count,
+                selections,
+                bounds,
+                x_min,
+                x_max,
+                &pane_title,
+                &mut label_cursor,
+                &mut label_layout,
+            );
+        }
+        self.draw_export_text_annotations(&mut canvas);
+        self.draw_export_ink_strokes(&mut canvas);
+
+        Ok(canvas)
+    }
+
+    fn export_pane_indices(&self, pane_count: usize) -> Vec<usize> {
+        match self.export_pane_scope {
+            ExportPaneScope::All => (0..pane_count).collect(),
+            ExportPaneScope::Active => {
+                vec![self.active_scope_pane.min(pane_count.saturating_sub(1))]
+            }
+        }
+    }
+
+    fn max_export_cursor_table_rows(
+        &self,
+        selections: &PlotSelections,
+        pane_count: usize,
+    ) -> usize {
+        if !self.export_cursor_table_enabled || !(self.show_cursor_a || self.show_cursor_b) {
+            return 0;
+        }
+        self.export_pane_indices(pane_count)
+            .into_iter()
+            .map(|pane_index| self.export_curve_count_for_pane(selections, pane_index, pane_count))
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn export_curve_count_for_pane(
+        &self,
+        selections: &PlotSelections,
+        pane_index: usize,
+        pane_count: usize,
+    ) -> usize {
+        let primary = selections
+            .primary
+            .iter()
+            .filter(|channel_index| {
+                self.channel_in_scope_pane(**channel_index, pane_index, pane_count)
+            })
+            .count();
+        let imported = selections
+            .imported
+            .iter()
+            .flat_map(|channels| channels.iter())
+            .filter(|channel_index| {
+                self.channel_in_scope_pane(**channel_index, pane_index, pane_count)
+            })
+            .count();
+        let derived = selections
+            .derived
+            .iter()
+            .filter(|derived_index| {
+                self.derived_in_scope_pane(**derived_index, pane_index, pane_count)
+            })
+            .count();
+        primary + imported + derived
+    }
+
+    fn export_cursor_table_reserved_height(
+        &self,
+        curve_count: usize,
+        resolution_scale: i32,
+    ) -> i32 {
+        if !self.export_cursor_table_enabled || curve_count == 0 {
+            return 0;
+        }
+        let table_scale = self.export_cursor_table_text_scale();
+        let table_h = Self::export_cursor_table_height(curve_count, table_scale);
+        62 + table_h + 12 * resolution_scale.max(1)
+    }
+
+    fn export_cursor_table_text_scale(&self) -> i32 {
+        self.export_label_scale.clamp(1, 2)
+    }
+
+    fn export_cursor_table_height(curve_count: usize, scale: i32) -> i32 {
+        let text_h = Canvas::text_height(scale);
+        let row_h = text_h + 9;
+        let title_h = text_h + 10;
+        title_h + row_h * (curve_count as i32 + 1) + 8
+    }
+
+    fn format_export_cursor_value(value: Option<f64>) -> String {
+        value
+            .filter(|value| value.is_finite())
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_else(|| "--".to_owned())
+    }
+
+    fn export_time_range(&self) -> Result<(f64, f64), String> {
+        let (start, end) = match self.export_time_range_mode {
+            ExportTimeRangeMode::View => (self.view_start, self.view_end),
+            ExportTimeRangeMode::Cursor => {
+                if !(self.show_cursor_a && self.show_cursor_b) {
+                    return Err(self
+                        .tr(
+                            "请先显示 X1 和 X2 光标。",
+                            "Show both X1 and X2 cursors first.",
+                        )
+                        .to_owned());
+                }
+                (
+                    self.cursor_a.min(self.cursor_b),
+                    self.cursor_a.max(self.cursor_b),
+                )
+            }
+            ExportTimeRangeMode::Manual => (
+                self.export_manual_start.min(self.export_manual_end),
+                self.export_manual_start.max(self.export_manual_end),
+            ),
+        };
+        if !start.is_finite() || !end.is_finite() || end <= start {
+            return Err(self
+                .tr("导出时间范围无效。", "The export time range is invalid.")
+                .to_owned());
+        }
+        let view_start = self.view_start.min(self.view_end);
+        let view_end = self.view_start.max(self.view_end);
+        let start = start.max(view_start);
+        let end = end.min(view_end);
+        if end <= start {
+            return Err(self
+                .tr(
+                    "导出时间范围需要位于当前示波器视图内。",
+                    "The export time range must be inside the current scope view.",
+                )
+                .to_owned());
+        }
+        Ok((start, end))
+    }
+
+    fn current_export_curve_labels(&self, selections: &PlotSelections) -> Vec<ExportCurveLabel> {
+        let rows = self.scope_layout_rows.clamp(1, MAX_SCOPE_LAYOUT_ROWS);
+        let cols = self.scope_layout_cols.clamp(1, MAX_SCOPE_LAYOUT_COLS);
+        let pane_count = rows * cols;
+        let pane_indices = self.export_pane_indices(pane_count);
+        let mut labels = Vec::new();
+        for pane_index in pane_indices {
+            for channel_index in &selections.primary {
+                if self.channel_in_scope_pane(*channel_index, pane_index, pane_count) {
+                    labels.push(ExportCurveLabel {
+                        name: self.channel_name(*channel_index),
+                        color: self.plot_channel_color(*channel_index, 0, pane_index, pane_count),
+                    });
+                }
+            }
+            for (dataset_index, dataset) in self.imported_datasets.iter().enumerate() {
+                let compare_selected = selections
+                    .imported
+                    .get(dataset_index)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                for channel_index in compare_selected {
+                    if self.channel_in_scope_pane(*channel_index, pane_index, pane_count) {
+                        labels.push(ExportCurveLabel {
+                            name: format!(
+                                "{}: {}",
+                                dataset.display_name,
+                                self.channel_name(*channel_index)
+                            ),
+                            color: self.plot_channel_color(
+                                *channel_index,
+                                dataset_index + 1,
+                                pane_index,
+                                pane_count,
+                            ),
+                        });
+                    }
+                }
+            }
+            for derived_index in &selections.derived {
+                if self.derived_in_scope_pane(*derived_index, pane_index, pane_count) {
+                    labels.push(ExportCurveLabel {
+                        name: Self::derived_channel_name(*derived_index).to_owned(),
+                        color: self.derived_channel_color(*derived_index),
+                    });
+                }
+            }
+        }
+        labels
+    }
+
+    fn sync_export_label_overrides(&mut self, labels: &[ExportCurveLabel]) {
+        let old = std::mem::take(&mut self.export_label_overrides);
+        self.export_label_overrides = labels
+            .iter()
+            .enumerate()
+            .map(|(index, label)| {
+                old.get(index)
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| label.name.clone())
+            })
+            .collect();
+        self.export_label_positions.resize(labels.len(), None);
+        self.export_label_anchor_x.resize(labels.len(), None);
+    }
+
+    fn export_label_for(&self, index: usize, default_label: String) -> String {
+        self.export_label_overrides
+            .get(index)
+            .filter(|label| !label.trim().is_empty())
+            .cloned()
+            .unwrap_or(default_label)
+    }
+
+    fn set_export_label_canvas_position(&mut self, index: usize, position: [i32; 2]) {
+        if index >= self.export_label_positions.len() {
+            self.export_label_positions.resize(index + 1, None);
+        }
+        self.export_label_positions[index] = Some(position);
+    }
+
+    fn set_export_label_anchor_x(&mut self, index: usize, x: f64) {
+        if index >= self.export_label_anchor_x.len() {
+            self.export_label_anchor_x.resize(index + 1, None);
+        }
+        self.export_label_anchor_x[index] = Some(x);
+    }
+
+    fn export_preview_state(&self) -> ExportPreviewEditState {
+        ExportPreviewEditState {
+            label_overrides: self.export_label_overrides.clone(),
+            label_positions: self.export_label_positions.clone(),
+            label_anchor_x: self.export_label_anchor_x.clone(),
+            text_annotations: self.export_text_annotations.clone(),
+            ink_strokes: self.export_ink_strokes.clone(),
+            arrow_size: self.export_arrow_size,
+            arrow_color_style: self.export_arrow_color_style,
+            style_preset: ExportStylePreset::Screenshot,
+            pane_scope: self.export_pane_scope,
+            time_range_mode: self.export_time_range_mode,
+            manual_start: self.export_manual_start,
+            manual_end: self.export_manual_end,
+            arrow_line_style: self.export_arrow_line_style,
+            arrow_custom_color: self.export_arrow_custom_color,
+            label_scale: self.export_label_scale,
+            label_font_style: self.export_label_font_style,
+            resolution: self.export_resolution,
+            dpi: self.export_dpi,
+            dpi_value: self.export_dpi_value(),
+            cursor_table_enabled: self.export_cursor_table_enabled,
+        }
+    }
+
+    fn restore_export_preview_state(&mut self, state: ExportPreviewEditState) {
+        self.export_label_overrides = state.label_overrides;
+        self.export_label_positions = state.label_positions;
+        self.export_label_anchor_x = state.label_anchor_x;
+        self.export_text_annotations = state.text_annotations;
+        self.export_ink_strokes = state.ink_strokes;
+        self.export_arrow_size = state.arrow_size;
+        self.export_arrow_color_style = state.arrow_color_style;
+        let _ = state.style_preset;
+        self.export_style_preset = ExportStylePreset::Screenshot;
+        self.export_pane_scope = state.pane_scope;
+        self.export_time_range_mode = state.time_range_mode;
+        self.export_manual_start = state.manual_start;
+        self.export_manual_end = state.manual_end;
+        self.export_arrow_line_style = state.arrow_line_style;
+        self.export_arrow_custom_color = state.arrow_custom_color;
+        self.export_label_scale = state.label_scale;
+        self.export_label_font_style = state.label_font_style;
+        self.export_resolution = state.resolution;
+        self.export_dpi = state.dpi;
+        self.export_dpi_value = state.dpi_value.clamp(50, 2400);
+        self.export_cursor_table_enabled = state.cursor_table_enabled;
+        self.export_preview_drag = None;
+        self.export_preview_anchor_drag = None;
+        self.export_preview_dirty = true;
+    }
+
+    fn push_export_preview_undo(&mut self, before: ExportPreviewEditState) {
+        if self.export_preview_state() == before {
+            return;
+        }
+        const MAX_EXPORT_PREVIEW_HISTORY: usize = 80;
+        self.export_preview_undo_stack.push(before);
+        if self.export_preview_undo_stack.len() > MAX_EXPORT_PREVIEW_HISTORY {
+            self.export_preview_undo_stack.remove(0);
+        }
+        self.export_preview_redo_stack.clear();
+    }
+
+    fn undo_export_preview_edit(&mut self) {
+        let Some(previous) = self.export_preview_undo_stack.pop() else {
+            return;
+        };
+        let current = self.export_preview_state();
+        self.export_preview_redo_stack.push(current);
+        self.restore_export_preview_state(previous);
+    }
+
+    fn redo_export_preview_edit(&mut self) {
+        let Some(next) = self.export_preview_redo_stack.pop() else {
+            return;
+        };
+        let current = self.export_preview_state();
+        self.export_preview_undo_stack.push(current);
+        self.restore_export_preview_state(next);
+    }
+
+    fn refresh_export_preview(&mut self, ctx: &egui::Context) {
+        let selections = self.current_plot_selections();
+        match self.render_current_waveform_canvas_with_layout(&selections) {
+            Ok((canvas, label_layout)) => {
+                let size = canvas.size();
+                let image = egui::ColorImage::from_rgba_unmultiplied(size, canvas.pixels());
+                self.export_preview_texture = Some(ctx.load_texture(
+                    "waveform_export_preview",
+                    image,
+                    egui::TextureOptions::LINEAR,
+                ));
+                self.export_preview_size = size;
+                self.export_preview_label_layout = label_layout;
+                self.export_preview_error = None;
+            }
+            Err(error) => {
+                self.export_preview_texture = None;
+                self.export_preview_size = [0, 0];
+                self.export_preview_label_layout.clear();
+                self.export_preview_error = Some(error);
+            }
+        }
+        self.export_preview_dirty = false;
+    }
+
+    fn mark_export_preview_dirty(&mut self) {
+        if self.show_export_preview {
+            self.export_preview_dirty = true;
+        }
+    }
+
+    fn batch_export_window(&mut self, ctx: &egui::Context) {
+        if !self.show_batch_export {
+            return;
+        }
+
+        let mut open = self.show_batch_export;
+        egui::Window::new(self.tr("批量导出波形 PNG", "Batch Export Waveform PNG"))
+            .open(&mut open)
+            .default_width(760.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(self.tr("数据组", "Datasets"));
+                    egui::ComboBox::from_id_source("batch_export_dataset_mode")
+                        .selected_text(self.batch_export_dataset_mode.label(self.language))
+                        .show_ui(ui, |ui| {
+                            for mode in BatchExportDatasetMode::ALL {
+                                ui.selectable_value(
+                                    &mut self.batch_export_dataset_mode,
+                                    mode,
+                                    mode.label(self.language),
+                                );
+                            }
+                        });
+                    ui.label(self.tr("示波器布局", "Scope panes"));
+                    egui::ComboBox::from_id_source("batch_export_pane_mode")
+                        .selected_text(self.batch_export_pane_mode.label(self.language))
+                        .show_ui(ui, |ui| {
+                            for mode in BatchExportPaneMode::ALL {
+                                ui.selectable_value(
+                                    &mut self.batch_export_pane_mode,
+                                    mode,
+                                    mode.label(self.language),
+                                );
+                            }
+                        });
+                });
+                ui.label(
+                    self.tr(
+                        "批量导出会使用当前图片导出分辨率、DPI、箭头和标注设置。",
+                        "Batch export uses the current image export resolution, DPI, arrows, and labels.",
+                    ),
+                );
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button(self.tr("添加当前视图", "Add Current View")).clicked() {
+                        self.batch_export_windows.push(BatchExportTimeWindow {
+                            enabled: true,
+                            start: self.view_start.min(self.view_end),
+                            end: self.view_start.max(self.view_end),
+                        });
+                    }
+                    if ui
+                        .add_enabled(
+                            self.show_cursor_a && self.show_cursor_b,
+                            egui::Button::new(self.tr("添加 X1-X2", "Add X1-X2")),
+                        )
+                        .clicked()
+                    {
+                        self.batch_export_windows.push(BatchExportTimeWindow {
+                            enabled: true,
+                            start: self.cursor_a.min(self.cursor_b),
+                            end: self.cursor_a.max(self.cursor_b),
+                        });
+                    }
+                    if ui.button(self.tr("添加空窗口", "Add Window")).clicked() {
+                        self.batch_export_windows.push(BatchExportTimeWindow {
+                            enabled: true,
+                            start: self.view_start.min(self.view_end),
+                            end: self.view_start.max(self.view_end),
+                        });
+                    }
+                });
+
+                let mut remove_index = None;
+                egui::Grid::new("batch_export_windows_grid")
+                    .num_columns(5)
+                    .spacing([10.0, 6.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label("");
+                        ui.strong(self.tr("开始 X(s)", "Start X(s)"));
+                        ui.strong(self.tr("结束 X(s)", "End X(s)"));
+                        ui.strong(self.tr("窗口", "Window"));
+                        ui.label("");
+                        ui.end_row();
+
+                        let language = self.language;
+                        for (index, window) in self.batch_export_windows.iter_mut().enumerate() {
+                            ui.checkbox(&mut window.enabled, "");
+                            ui.add(
+                                egui::DragValue::new(&mut window.start)
+                                    .speed(0.001)
+                                    .max_decimals(6),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut window.end)
+                                    .speed(0.001)
+                                    .max_decimals(6),
+                            );
+                            ui.label(format!("#{}", index + 1));
+                            let remove_label = match language {
+                                Language::Zh => "删除",
+                                Language::En => "Remove",
+                            };
+                            if ui.button(remove_label).clicked() {
+                                remove_index = Some(index);
+                            }
+                            ui.end_row();
+                        }
+                    });
+                if let Some(index) = remove_index {
+                    self.batch_export_windows.remove(index);
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(self.tr("选择文件夹并导出 PNG", "Choose Folder and Export PNG"))
+                        .clicked()
+                    {
+                        self.run_batch_waveform_png_export();
+                    }
+                    if let Some(summary) = &self.batch_export_last_summary {
+                        ui.label(summary);
+                    }
+                });
+            });
+        self.show_batch_export = open;
+    }
+
+    fn export_preview_window(&mut self, ctx: &egui::Context) {
+        if !self.show_export_preview {
+            return;
+        }
+        if self.export_preview_dirty {
+            self.refresh_export_preview(ctx);
+        }
+
+        let mut open = self.show_export_preview;
+        egui::Window::new(self.tr("导出图片预览", "Export Image Preview"))
+            .open(&mut open)
+            .default_width(1120.0)
+            .default_height(760.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                let mut changed = false;
+                let before_controls = self.export_preview_state();
+                let previous_resolution = self.export_resolution;
+                let previous_dpi_value = self.export_dpi_value();
+                let previous_pane_scope = self.export_pane_scope;
+                let previous_time_range_mode = self.export_time_range_mode;
+                let previous_manual_range = (self.export_manual_start, self.export_manual_end);
+                let previous_cursor_table_enabled = self.export_cursor_table_enabled;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(self.tr("子窗口", "Pane"));
+                    egui::ComboBox::from_id_source("export_preview_pane_scope")
+                        .selected_text(self.export_pane_scope.label(self.language))
+                        .show_ui(ui, |ui| {
+                            for scope in ExportPaneScope::ALL {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut self.export_pane_scope,
+                                        scope,
+                                        scope.label(self.language),
+                                    )
+                                    .changed();
+                            }
+                        });
+                    ui.label(self.tr("时间范围", "Time range"));
+                    egui::ComboBox::from_id_source("export_preview_time_range")
+                        .selected_text(self.export_time_range_mode.label(self.language))
+                        .show_ui(ui, |ui| {
+                            for mode in ExportTimeRangeMode::ALL {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut self.export_time_range_mode,
+                                        mode,
+                                        mode.label(self.language),
+                                    )
+                                    .changed();
+                            }
+                        });
+                    if self.export_time_range_mode == ExportTimeRangeMode::Manual {
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.export_manual_start)
+                                    .speed(0.0001)
+                                    .prefix("X0 "),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.export_manual_end)
+                                    .speed(0.0001)
+                                    .prefix("X1 "),
+                            )
+                            .changed();
+                    }
+                    ui.label(self.tr("分辨率", "Resolution"));
+                    egui::ComboBox::from_id_source("export_preview_resolution")
+                        .selected_text(self.export_resolution.label(self.language))
+                        .show_ui(ui, |ui| {
+                            for resolution in ExportResolution::ALL {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut self.export_resolution,
+                                        resolution,
+                                        resolution.label(self.language),
+                                    )
+                                    .changed();
+                            }
+                        });
+                    ui.label(self.tr("箭头", "Arrow"));
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(
+                                &mut self.export_arrow_size,
+                                MIN_EXPORT_ARROW_SIZE..=MAX_EXPORT_ARROW_SIZE,
+                            )
+                            .show_value(true),
+                        )
+                        .changed();
+                    ui.label(self.tr("字号", "Text"));
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(
+                                &mut self.export_label_scale,
+                                MIN_EXPORT_LABEL_SCALE..=MAX_EXPORT_LABEL_SCALE,
+                            )
+                            .show_value(true),
+                        )
+                        .changed();
+                    ui.label("DPI");
+                    changed |= self.export_dpi_controls(ui, "export_preview_dpi");
+                    egui::ComboBox::from_id_source("export_preview_color")
+                        .selected_text(self.export_arrow_color_style.label(self.language))
+                        .show_ui(ui, |ui| {
+                            for style in ExportArrowColorStyle::ALL {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut self.export_arrow_color_style,
+                                        style,
+                                        style.label(self.language),
+                                    )
+                                    .changed();
+                            }
+                        });
+                    changed |= self.export_arrow_style_controls(ui, "export_preview_arrow_line");
+                    egui::ComboBox::from_id_source("export_preview_font")
+                        .selected_text(self.export_label_font_style.label(self.language))
+                        .show_ui(ui, |ui| {
+                            for style in ExportLabelFontStyle::ALL {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut self.export_label_font_style,
+                                        style,
+                                        style.label(self.language),
+                                    )
+                                    .changed();
+                            }
+                        });
+                    if self.export_arrow_color_style == ExportArrowColorStyle::Custom {
+                        changed |= egui::color_picker::color_edit_button_srgba(
+                            ui,
+                            &mut self.export_arrow_custom_color,
+                            egui::color_picker::Alpha::Opaque,
+                        )
+                        .changed();
+                    }
+                    let cursor_table_label = self.tr("光标数据表", "Cursor Table");
+                    changed |= ui
+                        .checkbox(&mut self.export_cursor_table_enabled, cursor_table_label)
+                        .changed();
+                });
+                if changed {
+                    if self.export_resolution != previous_resolution
+                        || self.export_dpi_value() != previous_dpi_value
+                        || self.export_pane_scope != previous_pane_scope
+                        || self.export_time_range_mode != previous_time_range_mode
+                        || (self.export_manual_start, self.export_manual_end)
+                            != previous_manual_range
+                        || self.export_cursor_table_enabled != previous_cursor_table_enabled
+                    {
+                        self.export_label_positions.fill(None);
+                        self.export_label_anchor_x.fill(None);
+                    }
+                    if self.export_pane_scope != previous_pane_scope {
+                        self.export_label_overrides.clear();
+                        self.export_label_positions.clear();
+                        self.export_label_anchor_x.clear();
+                    }
+                    self.push_export_preview_undo(before_controls);
+                    self.mark_export_preview_dirty();
+                    ctx.request_repaint();
+                }
+
+                let select_tool_label = self.tr("选择", "Select").to_owned();
+                let text_tool_label = self.tr("文字", "Text").to_owned();
+                let brush_tool_label = self.tr("画笔", "Brush").to_owned();
+                let eraser_tool_label = self.tr("橡皮", "Eraser").to_owned();
+                let pen_width_label = self.tr("笔宽", "Pen").to_owned();
+                ui.horizontal_wrapped(|ui| {
+                    ui.selectable_value(
+                        &mut self.export_preview_tool,
+                        ExportPreviewTool::Select,
+                        select_tool_label.as_str(),
+                    );
+                    if ui
+                        .selectable_label(
+                            self.export_preview_tool == ExportPreviewTool::Text,
+                            text_tool_label.as_str(),
+                        )
+                        .clicked()
+                    {
+                        self.export_preview_tool = ExportPreviewTool::Text;
+                        self.add_export_text_annotation();
+                        ctx.request_repaint();
+                    }
+                    ui.selectable_value(
+                        &mut self.export_preview_tool,
+                        ExportPreviewTool::Brush,
+                        brush_tool_label.as_str(),
+                    );
+                    ui.selectable_value(
+                        &mut self.export_preview_tool,
+                        ExportPreviewTool::Eraser,
+                        eraser_tool_label.as_str(),
+                    );
+                    ui.separator();
+                    ui.label(pen_width_label.as_str());
+                    ui.add(
+                        egui::DragValue::new(&mut self.export_brush_width)
+                            .clamp_range(1..=32)
+                            .speed(1),
+                    );
+                    egui::color_picker::color_edit_button_srgba(
+                        ui,
+                        &mut self.export_brush_color,
+                        egui::color_picker::Alpha::Opaque,
+                    );
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            !self.export_preview_undo_stack.is_empty(),
+                            egui::Button::new("↶"),
+                        )
+                        .on_hover_text(self.tr("撤销", "Undo"))
+                        .clicked()
+                    {
+                        self.undo_export_preview_edit();
+                        ctx.request_repaint();
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.export_preview_redo_stack.is_empty(),
+                            egui::Button::new("↷"),
+                        )
+                        .on_hover_text(self.tr("重做", "Redo"))
+                        .clicked()
+                    {
+                        self.redo_export_preview_edit();
+                        ctx.request_repaint();
+                    }
+                });
+
+                let selections = self.current_plot_selections();
+                let labels = self.current_export_curve_labels(&selections);
+                if labels.len() != self.export_label_overrides.len() {
+                    self.sync_export_label_overrides(&labels);
+                    self.mark_export_preview_dirty();
+                }
+                egui::CollapsingHeader::new(self.tr("变量名标注", "Variable Labels"))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(150.0)
+                            .show(ui, |ui| {
+                                for (index, label) in labels.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(14.0, 14.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().rect_filled(rect, 2.0, label.color);
+                                        let before_label = self.export_preview_state();
+                                        let changed = {
+                                            let value = self
+                                                .export_label_overrides
+                                                .get_mut(index)
+                                                .expect("label overrides synced above");
+                                            ui.add(
+                                                egui::TextEdit::singleline(value)
+                                                    .desired_width(260.0),
+                                            )
+                                            .changed()
+                                        };
+                                        if changed {
+                                            self.push_export_preview_undo(before_label);
+                                            self.mark_export_preview_dirty();
+                                            ctx.request_repaint();
+                                        }
+                                    });
+                                }
+                            });
+                    });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.export_preview_undo_stack.is_empty(),
+                            egui::Button::new(self.tr("撤销", "Undo")),
+                        )
+                        .clicked()
+                    {
+                        self.undo_export_preview_edit();
+                        ctx.request_repaint();
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.export_preview_redo_stack.is_empty(),
+                            egui::Button::new(self.tr("重做", "Redo")),
+                        )
+                        .clicked()
+                    {
+                        self.redo_export_preview_edit();
+                        ctx.request_repaint();
+                    }
+                    if ui.button(self.tr("刷新预览", "Refresh Preview")).clicked() {
+                        self.export_preview_dirty = true;
+                    }
+                    if ui.button(self.tr("保存 PNG", "Save PNG")).clicked() {
+                        self.save_export_preview_png();
+                    }
+                    if ui.button(self.tr("保存 SVG", "Save SVG")).clicked() {
+                        self.save_export_preview_svg();
+                    }
+                    if self.export_preview_size != [0, 0] {
+                        let dpi = self.export_dpi_value() as f32;
+                        ui.label(format!(
+                            "{} x {} px @ {} DPI ({:.2} x {:.2} in)",
+                            self.export_preview_size[0],
+                            self.export_preview_size[1],
+                            self.export_dpi_value(),
+                            self.export_preview_size[0] as f32 / dpi,
+                            self.export_preview_size[1] as f32 / dpi,
+                        ));
+                    }
+                });
+
+                if let Some(error) = &self.export_preview_error {
+                    ui.label(
+                        RichText::new(self.localized_error_message(error))
+                            .color(Color32::LIGHT_RED),
+                    );
+                    return;
+                }
+                let Some(texture) = &self.export_preview_texture else {
+                    ui.label(self.tr("正在生成预览...", "Generating preview..."));
+                    return;
+                };
+                let texture_id = texture.id();
+                let image_size = egui::vec2(
+                    self.export_preview_size[0] as f32,
+                    self.export_preview_size[1] as f32,
+                );
+                egui::ScrollArea::both().show(ui, |ui| {
+                    let available = ui.available_size();
+                    let scale = (available.x / image_size.x)
+                        .min(available.y / image_size.y)
+                        .min(1.0)
+                        .max(0.05);
+                    let response =
+                        ui.add(egui::Image::from_texture((texture_id, image_size * scale)));
+                    self.export_preview_image_interactions(ui, response.rect, scale, ctx);
+                });
+            });
+        self.export_preview_text_editor(ctx);
+        self.show_export_preview = open;
+        if !self.show_export_preview {
+            self.export_preview_texture = None;
+            self.export_preview_label_layout.clear();
+            self.export_preview_drag = None;
+            self.export_preview_anchor_drag = None;
+            self.export_preview_text_drag = None;
+            self.export_preview_edit_label_index = None;
+            self.export_preview_edit_label_focus_pending = false;
+            self.export_preview_edit_text_index = None;
+        }
+    }
+
+    fn export_preview_image_interactions(
+        &mut self,
+        ui: &mut egui::Ui,
+        image_rect: egui::Rect,
+        scale: f32,
+        ctx: &egui::Context,
+    ) {
+        if scale <= 0.0 {
+            return;
+        }
+        if matches!(
+            self.export_preview_tool,
+            ExportPreviewTool::Brush | ExportPreviewTool::Eraser
+        ) {
+            self.export_preview_ink_interactions(ui, image_rect, scale, ctx);
+            return;
+        }
+        for placement in self.export_preview_label_layout.clone() {
+            let label_rect = Self::canvas_rect_to_preview(image_rect, placement.label_rect, scale);
+            let label_hit_rect = label_rect.expand((8.0 * scale).clamp(4.0, 12.0));
+            let anchor_rect =
+                Self::canvas_rect_to_preview(image_rect, placement.anchor_rect, scale);
+            let anchor_pos = egui::pos2(
+                image_rect.left() + placement.anchor_point[0] as f32 * scale,
+                image_rect.top() + placement.anchor_point[1] as f32 * scale,
+            );
+            let pointer_on_label = ui
+                .ctx()
+                .pointer_hover_pos()
+                .is_some_and(|pos| label_hit_rect.contains(pos));
+            let anchor_id = ui
+                .id()
+                .with(("export_preview_anchor", placement.label_index));
+            let anchor_sense = if pointer_on_label {
+                egui::Sense::hover()
+            } else {
+                egui::Sense::click_and_drag()
+            };
+            let anchor_response = ui.interact(anchor_rect, anchor_id, anchor_sense);
+            let anchor_active = anchor_response.dragged_by(PointerButton::Primary)
+                || anchor_response.drag_started_by(PointerButton::Primary);
+            let anchor_radius = (5.0 * scale).clamp(4.0, 8.0);
+            ui.painter().circle_filled(
+                anchor_pos,
+                anchor_radius,
+                Color32::from_rgba_premultiplied(255, 255, 255, 210),
+            );
+            ui.painter().circle_stroke(
+                anchor_pos,
+                anchor_radius,
+                Stroke::new(1.5, Color32::from_rgb(220, 20, 38)),
+            );
+            if anchor_response.hovered() {
+                ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::Grab);
+            }
+            if anchor_response.drag_started_by(PointerButton::Primary) {
+                self.export_preview_anchor_drag = Some(ExportPreviewAnchorDrag {
+                    label_index: placement.label_index,
+                    before_state: self.export_preview_state(),
+                    undo_recorded: false,
+                });
+            }
+            if anchor_response.dragged_by(PointerButton::Primary) {
+                let before_anchor = if let Some(drag) = self.export_preview_anchor_drag.as_mut() {
+                    if drag.label_index == placement.label_index {
+                        if !drag.undo_recorded {
+                            drag.undo_recorded = true;
+                            Some(drag.before_state.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(pointer_pos) = anchor_response.interact_pointer_pos() {
+                    if let Ok((x_min, x_max)) = self.export_time_range() {
+                        let canvas_x = ((pointer_pos.x - image_rect.left()) / scale).round() as i32;
+                        let clamped_x =
+                            canvas_x.clamp(placement.plot_rect.left, placement.plot_rect.right);
+                        let next_x = x_min
+                            + (clamped_x - placement.plot_rect.left) as f64
+                                / (placement.plot_rect.right - placement.plot_rect.left) as f64
+                                * (x_max - x_min);
+                        self.set_export_label_anchor_x(placement.label_index, next_x);
+                        if let Some(before_anchor) = before_anchor {
+                            self.push_export_preview_undo(before_anchor);
+                        }
+                        self.mark_export_preview_dirty();
+                        ctx.request_repaint();
+                        ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::Grabbing);
+                    }
+                }
+            }
+            if anchor_response.drag_stopped_by(PointerButton::Primary)
+                && self
+                    .export_preview_anchor_drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.label_index == placement.label_index)
+            {
+                self.export_preview_anchor_drag = None;
+            }
+            let id = ui
+                .id()
+                .with(("export_preview_label", placement.label_index));
+            let response = ui.interact(label_hit_rect, id, egui::Sense::click_and_drag());
+            if response.hovered() && !anchor_active {
+                ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::Grab);
+                ui.painter().rect_stroke(
+                    label_rect.expand(2.0),
+                    2.0,
+                    Stroke::new(1.0, Color32::from_rgb(20, 96, 180)),
+                );
+            }
+            if response.double_clicked() && !anchor_active {
+                self.export_preview_edit_label_index = Some(placement.label_index);
+                self.export_preview_edit_label_focus_pending = true;
+                ctx.request_repaint();
+            }
+            if self.export_preview_inline_label_editor(
+                ui,
+                image_rect,
+                label_rect,
+                placement.label_index,
+                ctx,
+            ) {
+                continue;
+            }
+            if response.drag_started_by(PointerButton::Primary) && !anchor_active {
+                let before_drag = self.export_preview_state();
+                let start_pos = self
+                    .export_label_positions
+                    .get(placement.label_index)
+                    .and_then(|position| *position)
+                    .unwrap_or([placement.label_rect[0] + 4, placement.label_rect[1] + 3]);
+                self.export_preview_drag = Some(ExportPreviewDrag {
+                    label_index: placement.label_index,
+                    start_pos,
+                    before_state: before_drag,
+                    undo_recorded: false,
+                });
+            }
+            if response.dragged_by(PointerButton::Primary) {
+                let drag_info = if let Some(drag) = self.export_preview_drag.as_mut() {
+                    if drag.label_index == placement.label_index {
+                        if !drag.undo_recorded {
+                            drag.undo_recorded = true;
+                            Some((drag.start_pos, Some(drag.before_state.clone())))
+                        } else {
+                            Some((drag.start_pos, None))
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some((start_pos, before_drag)) = drag_info {
+                    let delta = response.drag_delta() / scale;
+                    let next = [
+                        start_pos[0] + delta.x.round() as i32,
+                        start_pos[1] + delta.y.round() as i32,
+                    ];
+                    self.set_export_label_canvas_position(placement.label_index, next);
+                    if let Some(before_drag) = before_drag {
+                        self.push_export_preview_undo(before_drag);
+                    }
+                    self.mark_export_preview_dirty();
+                    ctx.request_repaint();
+                    ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::Grabbing);
+                }
+            }
+            if response.drag_stopped_by(PointerButton::Primary)
+                && self
+                    .export_preview_drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.label_index == placement.label_index)
+            {
+                self.export_preview_drag = None;
+            }
+        }
+        self.export_preview_text_interactions(ui, image_rect, scale, ctx);
+    }
+
+    fn export_preview_ink_interactions(
+        &mut self,
+        ui: &mut egui::Ui,
+        image_rect: egui::Rect,
+        scale: f32,
+        ctx: &egui::Context,
+    ) {
+        let id = ui.id().with("export_preview_ink_tool");
+        let response = ui.interact(image_rect, id, egui::Sense::click_and_drag());
+        if response.hovered() {
+            ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::Crosshair);
+        }
+        let Some(pointer_pos) = response.interact_pointer_pos() else {
+            if response.drag_stopped_by(PointerButton::Primary) {
+                self.export_ink_drag = None;
+            }
+            return;
+        };
+        let canvas_pos = [
+            ((pointer_pos.x - image_rect.left()) / scale).round() as i32,
+            ((pointer_pos.y - image_rect.top()) / scale).round() as i32,
+        ];
+        if response.drag_started_by(PointerButton::Primary) {
+            let before = self.export_preview_state();
+            let stroke_index = if self.export_preview_tool == ExportPreviewTool::Brush {
+                self.export_ink_strokes.push(ExportInkStroke {
+                    points: vec![canvas_pos],
+                    color: self.export_brush_color,
+                    width: self.export_brush_width.clamp(1, 32),
+                });
+                Some(self.export_ink_strokes.len() - 1)
+            } else {
+                None
+            };
+            self.export_ink_drag = Some(ExportInkDrag {
+                stroke_index,
+                before_state: before,
+                undo_recorded: false,
+            });
+        }
+        if response.dragged_by(PointerButton::Primary)
+            || response.clicked_by(PointerButton::Primary)
+        {
+            let before = self
+                .export_ink_drag
+                .as_ref()
+                .map(|drag| drag.before_state.clone());
+            match self.export_preview_tool {
+                ExportPreviewTool::Brush => {
+                    if let Some(index) = self
+                        .export_ink_drag
+                        .as_ref()
+                        .and_then(|drag| drag.stroke_index)
+                    {
+                        if let Some(stroke) = self.export_ink_strokes.get_mut(index) {
+                            if stroke.points.last().copied() != Some(canvas_pos) {
+                                stroke.points.push(canvas_pos);
+                            }
+                        }
+                    }
+                }
+                ExportPreviewTool::Eraser => {
+                    let radius = (self.export_brush_width.max(8) * 3) as f64;
+                    self.export_ink_strokes
+                        .retain(|stroke| !Self::stroke_near_point(stroke, canvas_pos, radius));
+                }
+                ExportPreviewTool::Select | ExportPreviewTool::Text => {}
+            }
+            if let Some(drag) = self.export_ink_drag.as_mut() {
+                if !drag.undo_recorded {
+                    drag.undo_recorded = true;
+                    if let Some(before) = before {
+                        self.push_export_preview_undo(before);
+                    }
+                }
+            }
+            self.mark_export_preview_dirty();
+            ctx.request_repaint();
+        }
+        if response.drag_stopped_by(PointerButton::Primary) {
+            self.export_ink_drag = None;
+        }
+    }
+
+    fn export_preview_text_interactions(
+        &mut self,
+        ui: &mut egui::Ui,
+        image_rect: egui::Rect,
+        scale: f32,
+        ctx: &egui::Context,
+    ) {
+        for (index, annotation) in self.export_text_annotations.clone().into_iter().enumerate() {
+            let text_w = Canvas::text_width(&annotation.text, annotation.scale).max(36);
+            let text_h = Canvas::text_height(annotation.scale).max(18);
+            let rect = Self::canvas_rect_to_preview(
+                image_rect,
+                [
+                    annotation.pos[0] - 4,
+                    annotation.pos[1] - 4,
+                    annotation.pos[0] + text_w + 4,
+                    annotation.pos[1] + text_h + 4,
+                ],
+                scale,
+            );
+            let response = ui.interact(
+                rect,
+                ui.id().with(("export_text_annotation", index)),
+                egui::Sense::click_and_drag(),
+            );
+            if response.hovered() {
+                ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::Grab);
+                ui.painter().rect_stroke(
+                    rect.expand(2.0),
+                    2.0,
+                    Stroke::new(1.0, Color32::from_rgb(20, 96, 180)),
+                );
+            }
+            if response.double_clicked() {
+                self.export_preview_edit_text_index = Some(index);
+            }
+            if response.drag_started_by(PointerButton::Primary) {
+                self.export_preview_text_drag = Some(ExportPreviewTextDrag {
+                    text_index: index,
+                    start_pos: annotation.pos,
+                    before_state: self.export_preview_state(),
+                    undo_recorded: false,
+                });
+            }
+            if response.dragged_by(PointerButton::Primary) {
+                let drag_info = self.export_preview_text_drag.as_mut().and_then(|drag| {
+                    (drag.text_index == index).then(|| {
+                        let before = if !drag.undo_recorded {
+                            drag.undo_recorded = true;
+                            Some(drag.before_state.clone())
+                        } else {
+                            None
+                        };
+                        (drag.start_pos, before)
+                    })
+                });
+                if let Some((start_pos, before)) = drag_info {
+                    let delta = response.drag_delta() / scale;
+                    if let Some(text) = self.export_text_annotations.get_mut(index) {
+                        text.pos = [
+                            start_pos[0] + delta.x.round() as i32,
+                            start_pos[1] + delta.y.round() as i32,
+                        ];
+                    }
+                    if let Some(before) = before {
+                        self.push_export_preview_undo(before);
+                    }
+                    self.mark_export_preview_dirty();
+                    ctx.request_repaint();
+                }
+            }
+            if response.drag_stopped_by(PointerButton::Primary) {
+                if self
+                    .export_preview_text_drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.text_index == index)
+                {
+                    self.export_preview_text_drag = None;
+                }
+            }
+        }
+    }
+
+    fn canvas_rect_to_preview(
+        image_rect: egui::Rect,
+        canvas_rect: [i32; 4],
+        scale: f32,
+    ) -> egui::Rect {
+        egui::Rect::from_min_max(
+            egui::pos2(
+                image_rect.left() + canvas_rect[0] as f32 * scale,
+                image_rect.top() + canvas_rect[1] as f32 * scale,
+            ),
+            egui::pos2(
+                image_rect.left() + canvas_rect[2] as f32 * scale,
+                image_rect.top() + canvas_rect[3] as f32 * scale,
+            ),
+        )
+    }
+
+    fn export_preview_inline_label_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        image_rect: egui::Rect,
+        label_rect: egui::Rect,
+        label_index: usize,
+        ctx: &egui::Context,
+    ) -> bool {
+        if self.export_preview_edit_label_index != Some(label_index) {
+            return false;
+        }
+        if label_index >= self.export_label_overrides.len() {
+            self.export_preview_edit_label_index = None;
+            self.export_preview_edit_label_focus_pending = false;
+            return false;
+        }
+
+        let editor_id = ui
+            .id()
+            .with(("export_preview_inline_label_editor", label_index));
+        let width = label_rect.width().max(180.0).min(520.0);
+        let editor_pos = egui::pos2(
+            label_rect
+                .left()
+                .clamp(image_rect.left(), image_rect.right() - 24.0),
+            label_rect
+                .top()
+                .clamp(image_rect.top(), image_rect.bottom() - 24.0),
+        );
+        let before_label = self.export_preview_state();
+        let mut changed = false;
+        let mut close_requested = false;
+        let mut focus_pending = self.export_preview_edit_label_focus_pending;
+
+        egui::Area::new(editor_id)
+            .order(egui::Order::Foreground)
+            .fixed_pos(editor_pos)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(255, 255, 255))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(20, 96, 180)))
+                    .rounding(2.0)
+                    .inner_margin(egui::Margin::same(2.0))
+                    .show(ui, |ui| {
+                        let value = self
+                            .export_label_overrides
+                            .get_mut(label_index)
+                            .expect("inline label editor index checked above");
+                        let response = ui.add(
+                            egui::TextEdit::singleline(value)
+                                .desired_width(width)
+                                .font(egui::TextStyle::Body),
+                        );
+                        if focus_pending {
+                            response.request_focus();
+                            focus_pending = false;
+                        }
+                        changed |= response.changed();
+                        if response.has_focus()
+                            && ui.input(|input| {
+                                input.key_pressed(egui::Key::Enter)
+                                    || input.key_pressed(egui::Key::Escape)
+                            })
+                        {
+                            close_requested = true;
+                        }
+                        if response.lost_focus() {
+                            close_requested = true;
+                        }
+                    });
+            });
+
+        self.export_preview_edit_label_focus_pending = focus_pending;
+        if changed {
+            self.push_export_preview_undo(before_label);
+            self.mark_export_preview_dirty();
+            ctx.request_repaint();
+        }
+        if close_requested {
+            self.export_preview_edit_label_index = None;
+            self.export_preview_edit_label_focus_pending = false;
+            ctx.request_repaint();
+        }
+        true
+    }
+
+    fn export_preview_text_editor(&mut self, ctx: &egui::Context) {
+        let Some(index) = self.export_preview_edit_text_index else {
+            return;
+        };
+        if index >= self.export_text_annotations.len() {
+            self.export_preview_edit_text_index = None;
+            return;
+        }
+        let mut open = true;
+        let mut close_requested = false;
+        let title = self.tr("编辑文字", "Edit Text").to_owned();
+        let size_label = self.tr("字号", "Size").to_owned();
+        let ok_label = self.tr("确定", "OK").to_owned();
+        let delete_label = self.tr("删除", "Delete").to_owned();
+        egui::Window::new(title)
+            .id(egui::Id::new("export_preview_text_editor"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                let before = self.export_preview_state();
+                let mut changed = false;
+                {
+                    let annotation = self
+                        .export_text_annotations
+                        .get_mut(index)
+                        .expect("text editor index checked above");
+                    changed |= ui
+                        .add(egui::TextEdit::singleline(&mut annotation.text).desired_width(320.0))
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(
+                                &mut annotation.scale,
+                                MIN_EXPORT_LABEL_SCALE..=MAX_EXPORT_LABEL_SCALE,
+                            )
+                            .text(size_label.as_str()),
+                        )
+                        .changed();
+                    changed |= egui::color_picker::color_edit_button_srgba(
+                        ui,
+                        &mut annotation.color,
+                        egui::color_picker::Alpha::Opaque,
+                    )
+                    .changed();
+                }
+                ui.horizontal(|ui| {
+                    if ui.button(ok_label.as_str()).clicked() {
+                        close_requested = true;
+                    }
+                    if ui.button(delete_label.as_str()).clicked() {
+                        let before = self.export_preview_state();
+                        self.export_text_annotations.remove(index);
+                        self.push_export_preview_undo(before);
+                        self.mark_export_preview_dirty();
+                        close_requested = true;
+                    }
+                });
+                if changed {
+                    self.push_export_preview_undo(before);
+                    self.mark_export_preview_dirty();
+                    ctx.request_repaint();
+                }
+            });
+        if !open || close_requested {
+            self.export_preview_edit_text_index = None;
+        }
+    }
+
+    fn save_export_preview_png(&mut self) {
+        let selections = self.current_plot_selections();
+        let Some(mut path) = rfd::FileDialog::new()
+            .add_filter(self.tr("PNG 图片", "PNG image"), &["png"])
+            .set_file_name(self.default_waveform_png_name())
+            .save_file()
+        else {
+            return;
+        };
+        if path.extension().is_none() {
+            path.set_extension("png");
+        }
+        match self.write_current_waveform_png(&path, &selections) {
+            Ok(()) => tracing::info!("exported waveform image to {}", path.display()),
+            Err(error) => {
+                self.export_preview_error = Some(error.clone());
+                self.last_error = Some(match self.language {
+                    Language::Zh => format!("导出波形图片失败: {error}"),
+                    Language::En => format!("Failed to export waveform image: {error}"),
+                });
+            }
+        }
+    }
+
+    fn save_export_preview_svg(&mut self) {
+        let selections = self.current_plot_selections();
+        let Some(mut path) = rfd::FileDialog::new()
+            .add_filter(self.tr("SVG 矢量图", "SVG vector image"), &["svg"])
+            .set_file_name(self.default_waveform_svg_name())
+            .save_file()
+        else {
+            return;
+        };
+        if path.extension().is_none() {
+            path.set_extension("svg");
+        }
+        match self.write_current_waveform_svg(&path, &selections) {
+            Ok(()) => tracing::info!("exported waveform SVG to {}", path.display()),
+            Err(error) => {
+                self.export_preview_error = Some(error.clone());
+                self.last_error = Some(match self.language {
+                    Language::Zh => format!("导出波形 SVG 失败: {error}"),
+                    Language::En => format!("Failed to export waveform SVG: {error}"),
+                });
+            }
+        }
+    }
+
+    fn add_export_text_annotation(&mut self) {
+        let before = self.export_preview_state();
+        let offset = (self.export_text_annotations.len() as i32 * 28).min(160);
+        let text = match self.language {
+            Language::Zh => "文字标注",
+            Language::En => "Text note",
+        };
+        self.export_text_annotations.push(ExportTextAnnotation {
+            text: text.to_owned(),
+            pos: [96 + offset, 96 + offset],
+            color: Color32::from_rgb(24, 36, 56),
+            scale: self
+                .export_label_scale
+                .clamp(MIN_EXPORT_LABEL_SCALE, MAX_EXPORT_LABEL_SCALE),
+        });
+        self.push_export_preview_undo(before);
+        self.mark_export_preview_dirty();
+    }
+
+    fn draw_export_text_annotations<C: WaveformCanvas>(&self, canvas: &mut C) {
+        for annotation in &self.export_text_annotations {
+            if annotation.text.trim().is_empty() {
+                continue;
+            }
+            canvas.text_styled(
+                annotation.pos[0],
+                annotation.pos[1],
+                &annotation.text,
+                Self::export_color(annotation.color),
+                annotation.scale,
+                TextStyle::Outline,
+            );
+        }
+    }
+
+    fn draw_export_ink_strokes<C: WaveformCanvas>(&self, canvas: &mut C) {
+        for stroke in &self.export_ink_strokes {
+            let color = Self::export_color(stroke.color);
+            for pair in stroke.points.windows(2) {
+                canvas.line(
+                    pair[0][0],
+                    pair[0][1],
+                    pair[1][0],
+                    pair[1][1],
+                    color,
+                    stroke.width,
+                );
+            }
+        }
+    }
+
+    fn run_batch_waveform_png_export(&mut self) {
+        let windows = self
+            .batch_export_windows
+            .iter()
+            .enumerate()
+            .filter(|(_, window)| window.enabled)
+            .map(|(index, window)| {
+                (
+                    index + 1,
+                    window.start.min(window.end),
+                    window.start.max(window.end),
+                )
+            })
+            .collect::<Vec<_>>();
+        if windows.is_empty() {
+            self.batch_export_last_summary = Some(
+                self.tr(
+                    "请至少启用一个时间窗口。",
+                    "Enable at least one time window.",
+                )
+                .to_owned(),
+            );
+            return;
+        }
+        if windows
+            .iter()
+            .any(|(_, start, end)| !start.is_finite() || !end.is_finite() || end <= start)
+        {
+            self.batch_export_last_summary = Some(
+                self.tr("时间窗口无效。", "One or more time windows are invalid.")
+                    .to_owned(),
+            );
+            return;
+        }
+
+        let Some(output_dir) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+
+        let saved_time_range_mode = self.export_time_range_mode;
+        let saved_manual_start = self.export_manual_start;
+        let saved_manual_end = self.export_manual_end;
+        let saved_pane_scope = self.export_pane_scope;
+        let saved_active_pane = self.active_scope_pane;
+        let saved_label_overrides = self.export_label_overrides.clone();
+        let saved_label_positions = self.export_label_positions.clone();
+        let saved_label_anchor_x = self.export_label_anchor_x.clone();
+
+        self.export_time_range_mode = ExportTimeRangeMode::Manual;
+        self.export_label_overrides.clear();
+        self.export_label_positions.clear();
+        self.export_label_anchor_x.clear();
+
+        let base_name = Self::sanitize_file_component(&self.batch_waveform_base_name());
+        let source_pane_count = self.scope_layout_rows.clamp(1, MAX_SCOPE_LAYOUT_ROWS)
+            * self.scope_layout_cols.clamp(1, MAX_SCOPE_LAYOUT_COLS);
+        let pane_jobs = self.batch_export_pane_jobs(source_pane_count);
+        let dataset_jobs = self.batch_export_dataset_jobs();
+
+        let mut exported = 0usize;
+        let mut errors = Vec::new();
+        for (window_index, start, end) in windows {
+            self.export_manual_start = start;
+            self.export_manual_end = end;
+            for (dataset_slug, selections) in &dataset_jobs {
+                if Self::plot_selection_curve_count(selections) == 0 {
+                    continue;
+                }
+                for (pane_slug, pane_scope, active_pane) in &pane_jobs {
+                    self.export_pane_scope = *pane_scope;
+                    self.active_scope_pane =
+                        (*active_pane).min(source_pane_count.saturating_sub(1));
+                    let file_name = format!(
+                        "{}_waveform_w{:02}_{}_{}_{}_{}.png",
+                        base_name,
+                        window_index,
+                        Self::time_slug(start),
+                        Self::time_slug(end),
+                        dataset_slug,
+                        pane_slug
+                    );
+                    let path = Self::unique_export_path(&output_dir, file_name);
+                    match self.write_current_waveform_png(&path, selections) {
+                        Ok(()) => exported += 1,
+                        Err(error) => errors.push(format!("{}: {error}", path.display())),
+                    }
+                }
+            }
+        }
+
+        self.export_time_range_mode = saved_time_range_mode;
+        self.export_manual_start = saved_manual_start;
+        self.export_manual_end = saved_manual_end;
+        self.export_pane_scope = saved_pane_scope;
+        self.active_scope_pane = saved_active_pane;
+        self.export_label_overrides = saved_label_overrides;
+        self.export_label_positions = saved_label_positions;
+        self.export_label_anchor_x = saved_label_anchor_x;
+
+        self.batch_export_last_summary = if errors.is_empty() {
+            Some(match self.language {
+                Language::Zh => format!("已导出 {exported} 张 PNG。"),
+                Language::En => format!("Exported {exported} PNG images."),
+            })
+        } else {
+            Some(match self.language {
+                Language::Zh => format!("已导出 {exported} 张 PNG，失败 {} 张。", errors.len()),
+                Language::En => format!("Exported {exported} PNG images, {} failed.", errors.len()),
+            })
+        };
+        if !errors.is_empty() {
+            self.last_error = Some(match self.language {
+                Language::Zh => format!("批量导出部分失败:\n{}", errors.join("\n")),
+                Language::En => format!("Batch export partially failed:\n{}", errors.join("\n")),
+            });
+        }
+    }
+
+    fn batch_export_dataset_jobs(&self) -> Vec<(String, PlotSelections)> {
+        match self.batch_export_dataset_mode {
+            BatchExportDatasetMode::Combined => {
+                vec![("combined".to_owned(), self.current_plot_selections())]
+            }
+            BatchExportDatasetMode::EachDataset => {
+                let mut jobs = Vec::new();
+                let imported_len = self.imported_datasets.len();
+                jobs.push((
+                    Self::sanitize_file_component(&self.dataset_short_label(0)),
+                    PlotSelections {
+                        primary: self.selected_channels(),
+                        imported: vec![Vec::new(); imported_len],
+                        derived: self.selected_derived_channels(),
+                    },
+                ));
+                for dataset_index in 0..imported_len {
+                    let mut imported = vec![Vec::new(); imported_len];
+                    imported[dataset_index] = self.selected_imported_channels(dataset_index);
+                    jobs.push((
+                        Self::sanitize_file_component(&self.dataset_short_label(dataset_index + 1)),
+                        PlotSelections {
+                            primary: Vec::new(),
+                            imported,
+                            derived: Vec::new(),
+                        },
+                    ));
+                }
+                jobs
+            }
+        }
+    }
+
+    fn batch_export_pane_jobs(&self, pane_count: usize) -> Vec<(String, ExportPaneScope, usize)> {
+        match self.batch_export_pane_mode {
+            BatchExportPaneMode::Current => vec![(
+                match self.export_pane_scope {
+                    ExportPaneScope::All => "current_all".to_owned(),
+                    ExportPaneScope::Active => {
+                        format!("current_pane{:02}", self.active_scope_pane + 1)
+                    }
+                },
+                self.export_pane_scope,
+                self.active_scope_pane,
+            )],
+            BatchExportPaneMode::AllPanes => {
+                vec![(
+                    "all_panes".to_owned(),
+                    ExportPaneScope::All,
+                    self.active_scope_pane,
+                )]
+            }
+            BatchExportPaneMode::EachPane => (0..pane_count)
+                .map(|pane| {
+                    (
+                        format!("pane{:02}", pane + 1),
+                        ExportPaneScope::Active,
+                        pane,
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn plot_selection_curve_count(selections: &PlotSelections) -> usize {
+        selections.primary.len()
+            + selections.derived.len()
+            + selections.imported.iter().map(Vec::len).sum::<usize>()
+    }
+
+    fn batch_waveform_base_name(&self) -> String {
+        self.loaded_path
+            .as_ref()
+            .and_then(|path| path.file_stem())
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.trim().is_empty())
+            .or_else(|| self.meta().map(|meta| meta.source_name.as_str()))
+            .unwrap_or("waveform")
+            .to_owned()
+    }
+
+    fn time_slug(value: f64) -> String {
+        format!("{value:.6}").replace('-', "m").replace('.', "p")
+    }
+
+    fn unique_export_path(output_dir: &Path, file_name: String) -> PathBuf {
+        let mut path = output_dir.join(&file_name);
+        if !path.exists() {
+            return path;
+        }
+        let file_path = Path::new(&file_name);
+        let stem = file_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("waveform");
+        let extension = file_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("png");
+        for index in 2.. {
+            path = output_dir.join(format!("{stem}_{index}.{extension}"));
+            if !path.exists() {
+                return path;
+            }
+        }
+        path
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_export_pane<C: WaveformCanvas>(
+        &self,
+        canvas: &mut C,
+        plot: ClipRect,
+        pane_index: usize,
+        pane_count: usize,
+        selections: &PlotSelections,
+        y_bounds: (f64, f64),
+        x_min: f64,
+        x_max: f64,
+        _title: &str,
+        label_cursor: &mut usize,
+        label_layout: &mut Vec<ExportLabelPlacement>,
+    ) {
+        let (y_min, y_max) = y_bounds;
+        let palette = self.export_style_palette();
+        canvas.fill_rect(
+            plot.left,
+            plot.top,
+            plot.right,
+            plot.bottom,
+            palette.plot_bg,
+        );
+        canvas.stroke_rect(
+            plot.left,
+            plot.top,
+            plot.right,
+            plot.bottom,
+            palette.border,
+            2,
+        );
+
+        for i in 1..6 {
+            let x = plot.left + (plot.right - plot.left) * i / 6;
+            canvas.line(x, plot.top, x, plot.bottom, palette.grid, 1);
+        }
+        for i in 1..5 {
+            let y = plot.top + (plot.bottom - plot.top) * i / 5;
+            canvas.line(plot.left, y, plot.right, y, palette.grid, 1);
+        }
+        canvas.text(
+            plot.left,
+            plot.bottom + 18,
+            &format!("{:.6}s", x_min),
+            palette.axis_text,
+            2,
+        );
+        let end_label = format!("{:.6}s", x_max);
+        canvas.text(
+            plot.right - Canvas::text_width(&end_label, 2),
+            plot.bottom + 18,
+            &end_label,
+            palette.axis_text,
+            2,
+        );
+        canvas.text(
+            plot.left - 82,
+            plot.top,
+            &format!("{:.2}", y_max),
+            palette.axis_text,
+            2,
+        );
+        canvas.text(
+            plot.left - 82,
+            plot.bottom - 14,
+            &format!("{:.2}", y_min),
+            palette.axis_text,
+            2,
+        );
+
+        let mut curves = Vec::<ExportCurve<'_>>::new();
+        let width_scale = palette.line_width_scale;
+        for (out_index, channel_index) in selections.primary.iter().enumerate() {
+            if !self.channel_in_scope_pane(*channel_index, pane_index, pane_count) {
+                continue;
+            }
+            let points = if let Some(summary) = &self.prepared_plot_summary {
+                summary.points.get(out_index)
+            } else {
+                self.prepared_plot_cache.points.get(out_index)
+            };
+            let Some(points) = points else {
+                continue;
+            };
+            let default_label = self.channel_name(*channel_index);
+            let label_index = *label_cursor;
+            let label = self.export_label_for(*label_cursor, default_label);
+            *label_cursor += 1;
+            curves.push(ExportCurve {
+                label_index,
+                label,
+                color: self.plot_channel_color(*channel_index, 0, pane_index, pane_count),
+                width: (self.visible_line_width(*channel_index) * 2.2 * width_scale)
+                    .round()
+                    .max(3.0) as i32,
+                points,
+            });
+        }
+
+        for (dataset_index, dataset) in self.imported_datasets.iter().enumerate() {
+            let compare_selected = selections
+                .imported
+                .get(dataset_index)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            for (out_index, channel_index) in compare_selected.iter().enumerate() {
+                if !self.channel_in_scope_pane(*channel_index, pane_index, pane_count) {
+                    continue;
+                }
+                let points = if let Some(summary) = &dataset.prepared_plot_summary {
+                    summary.points.get(out_index)
+                } else {
+                    dataset.prepared_plot_cache.points.get(out_index)
+                };
+                let Some(points) = points else {
+                    continue;
+                };
+                let default_label = format!(
+                    "{}: {}",
+                    self.dataset_label(dataset_index + 1),
+                    self.channel_name(*channel_index)
+                );
+                let label_index = *label_cursor;
+                let label = self.export_label_for(*label_cursor, default_label);
+                *label_cursor += 1;
+                curves.push(ExportCurve {
+                    label_index,
+                    label,
+                    color: self.plot_channel_color(
+                        *channel_index,
+                        dataset_index + 1,
+                        pane_index,
+                        pane_count,
+                    ),
+                    width: (self.compare_line_width(*channel_index) * 2.0 * width_scale)
+                        .round()
+                        .max(3.0) as i32,
+                    points,
+                });
+            }
+        }
+
+        for (out_index, derived_index) in selections.derived.iter().enumerate() {
+            if !self.derived_in_scope_pane(*derived_index, pane_index, pane_count) {
+                continue;
+            }
+            let Some(points) = self.prepared_derived_curve_cache.points.get(out_index) else {
+                continue;
+            };
+            let default_label = Self::derived_channel_name(*derived_index).to_owned();
+            let label_index = *label_cursor;
+            let label = self.export_label_for(*label_cursor, default_label);
+            *label_cursor += 1;
+            curves.push(ExportCurve {
+                label_index,
+                label,
+                color: self.derived_channel_color(*derived_index),
+                width: ((DEFAULT_CHANNEL_LINE_WIDTH + 0.2) * 2.0 * width_scale)
+                    .round()
+                    .max(3.0) as i32,
+                points,
+            });
+        }
+
+        for curve in &curves {
+            let color = self.export_scope_color(curve.color);
+            for pair in curve.points.windows(2) {
+                let Some((x0, y0)) =
+                    Self::export_map_point(pair[0], plot, x_min, x_max, y_min, y_max)
+                else {
+                    continue;
+                };
+                let Some((x1, y1)) =
+                    Self::export_map_point(pair[1], plot, x_min, x_max, y_min, y_max)
+                else {
+                    continue;
+                };
+                canvas.line_clipped(x0, y0, x1, y1, color, curve.width, plot);
+            }
+        }
+
+        if self.show_cursor_a {
+            self.draw_export_cursor(canvas, plot, self.cursor_a, "X1", x_min, x_max);
+            self.draw_export_cursor_markers(
+                canvas,
+                plot,
+                self.cursor_a,
+                &curves,
+                x_min,
+                x_max,
+                y_min,
+                y_max,
+            );
+        }
+        if self.show_cursor_b {
+            self.draw_export_cursor(canvas, plot, self.cursor_b, "X2", x_min, x_max);
+            self.draw_export_cursor_markers(
+                canvas,
+                plot,
+                self.cursor_b,
+                &curves,
+                x_min,
+                x_max,
+                y_min,
+                y_max,
+            );
+        }
+        self.draw_export_cursor_table(canvas, plot, &curves, x_min, x_max, y_min, y_max);
+        let mut occupied_rects =
+            self.export_cursor_obstacle_rects(plot, &curves, x_min, x_max, y_min, y_max);
+
+        let label_scale = self
+            .export_label_scale
+            .clamp(MIN_EXPORT_LABEL_SCALE, MAX_EXPORT_LABEL_SCALE);
+        let label_height = Canvas::text_height(label_scale);
+        let label_step = label_height + 10;
+        let max_labels = ((plot.bottom - plot.top - 10) / label_step).max(0) as usize;
+        for (index, curve) in curves.iter().take(max_labels).enumerate() {
+            let default_target_x = x_min + (x_max - x_min) * (0.62 + 0.10 * (index % 3) as f64);
+            let target_x = self
+                .export_label_anchor_x
+                .get(curve.label_index)
+                .and_then(|x| *x)
+                .filter(|x| x.is_finite() && *x >= x_min && *x <= x_max)
+                .unwrap_or(default_target_x);
+            let Some((target_px, target_py)) = self
+                .export_curve_target(curve.points, target_x, x_min, x_max)
+                .and_then(|point| Self::export_map_point(point, plot, x_min, x_max, y_min, y_max))
+            else {
+                continue;
+            };
+            let max_chars = (30 / label_scale).max(12) as usize;
+            let text = Self::truncate_export_label(&curve.label, max_chars);
+            let text_w = Canvas::text_width(&text, label_scale);
+            let (default_label_x, default_label_y, _) = Self::export_label_position(
+                plot,
+                target_px,
+                target_py,
+                text_w,
+                label_height,
+                index,
+            );
+            let (label_x, label_y) = self.export_label_canvas_position(
+                curve.label_index,
+                default_label_x,
+                default_label_y,
+                plot,
+                text_w,
+                label_height,
+                target_px,
+                target_py,
+                index,
+                &occupied_rects,
+                &curves,
+                x_min,
+                x_max,
+                y_min,
+                y_max,
+            );
+            let (arrow_start_x, arrow_start_y) = Self::export_arrow_start_for_label(
+                label_x,
+                label_y,
+                text_w,
+                label_height,
+                target_px,
+            );
+            let color = self.export_annotation_color(curve.color);
+            let label_rect = [
+                label_x - 4,
+                label_y - 3,
+                label_x + text_w + 4,
+                label_y + label_height + 4,
+            ];
+            canvas.fill_rect(
+                label_rect[0],
+                label_rect[1],
+                label_rect[2],
+                label_rect[3],
+                palette.label_bg,
+            );
+            canvas.text_styled(
+                label_x,
+                label_y,
+                &text,
+                color,
+                label_scale,
+                self.export_label_font_style.text_style(),
+            );
+            self.draw_export_annotation_arrow(
+                canvas,
+                arrow_start_x,
+                arrow_start_y,
+                target_px,
+                target_py,
+                color,
+            );
+            label_layout.push(ExportLabelPlacement {
+                label_index: curve.label_index,
+                label_rect,
+                anchor_rect: [
+                    target_px - 11,
+                    target_py - 11,
+                    target_px + 11,
+                    target_py + 11,
+                ],
+                anchor_point: [target_px, target_py],
+                plot_rect: plot,
+            });
+            occupied_rects.push(Self::inflate_rect(label_rect, 8));
+        }
+    }
+
+    fn draw_export_cursor<C: WaveformCanvas>(
+        &self,
+        canvas: &mut C,
+        plot: ClipRect,
+        cursor_x: f64,
+        label: &str,
+        x_min: f64,
+        x_max: f64,
+    ) {
+        if cursor_x < x_min || cursor_x > x_max {
+            return;
+        }
+        let x = plot.left
+            + ((cursor_x - x_min) / (x_max - x_min) * (plot.right - plot.left) as f64).round()
+                as i32;
+        let color = Rgba::rgb(235, 42, 48);
+        let mut y = plot.top;
+        while y < plot.bottom {
+            canvas.line(x, y, x, (y + 14).min(plot.bottom), color, 3);
+            y += 22;
+        }
+        canvas.fill_rect(
+            x - 9,
+            plot.top + 4,
+            x + 10,
+            plot.top + 17,
+            Rgba::rgba(255, 255, 255, 220),
+        );
+        canvas.text(x - 7, plot.top + 7, label, color, 1);
+        self.draw_export_cursor_x_axis_label(canvas, plot, x, cursor_x, label, color);
+    }
+
+    fn draw_export_cursor_x_axis_label<C: WaveformCanvas>(
+        &self,
+        canvas: &mut C,
+        plot: ClipRect,
+        cursor_px: i32,
+        cursor_x: f64,
+        label: &str,
+        color: Rgba,
+    ) {
+        let text = format!("{label} x={cursor_x:.6}s");
+        let scale = 2;
+        let text_w = Canvas::text_width(&text, scale);
+        let text_h = Canvas::text_height(scale);
+        let label_x = (cursor_px - text_w / 2).clamp(plot.left + 4, plot.right - text_w - 4);
+        let label_y = plot.bottom + 34;
+        let palette = self.export_style_palette();
+        canvas.fill_rect(
+            label_x - 6,
+            label_y - 4,
+            label_x + text_w + 6,
+            label_y + text_h + 5,
+            palette.cursor_label_bg,
+        );
+        canvas.stroke_rect(
+            label_x - 6,
+            label_y - 4,
+            label_x + text_w + 6,
+            label_y + text_h + 5,
+            color,
+            1,
+        );
+        canvas.text_styled(label_x, label_y, &text, color, scale, TextStyle::Bold);
+    }
+
+    fn draw_export_cursor_markers<C: WaveformCanvas>(
+        &self,
+        canvas: &mut C,
+        plot: ClipRect,
+        cursor_x: f64,
+        curves: &[ExportCurve<'_>],
+        x_min: f64,
+        x_max: f64,
+        y_min: f64,
+        y_max: f64,
+    ) {
+        if cursor_x < x_min || cursor_x > x_max {
+            return;
+        }
+        for curve in curves {
+            let Some(y) = Self::interpolated_y(curve.points, cursor_x) else {
+                continue;
+            };
+            let Some((px, py)) = Self::export_map_point(
+                PlotPoint::new(cursor_x, y),
+                plot,
+                x_min,
+                x_max,
+                y_min,
+                y_max,
+            ) else {
+                continue;
+            };
+            if px < plot.left || px > plot.right || py < plot.top || py > plot.bottom {
+                continue;
+            }
+            let color = self.export_annotation_color(curve.color);
+            canvas.fill_rect(
+                px - 5,
+                py - 5,
+                px + 6,
+                py + 6,
+                Rgba::rgba(255, 255, 255, 235),
+            );
+            canvas.stroke_rect(px - 5, py - 5, px + 6, py + 6, color, 2);
+        }
+    }
+
+    fn draw_export_cursor_table<C: WaveformCanvas>(
+        &self,
+        canvas: &mut C,
+        plot: ClipRect,
+        curves: &[ExportCurve<'_>],
+        x_min: f64,
+        x_max: f64,
+        _y_min: f64,
+        _y_max: f64,
+    ) {
+        if !self.export_cursor_table_enabled {
+            return;
+        }
+        let use_x1 = self.show_cursor_a && self.cursor_a >= x_min && self.cursor_a <= x_max;
+        let use_x2 = self.show_cursor_b && self.cursor_b >= x_min && self.cursor_b <= x_max;
+        if !(use_x1 || use_x2) || curves.is_empty() {
+            return;
+        }
+
+        let mut rows = Vec::new();
+        for curve in curves {
+            let y1 = use_x1
+                .then(|| Self::interpolated_y(curve.points, self.cursor_a))
+                .flatten();
+            let y2 = use_x2
+                .then(|| Self::interpolated_y(curve.points, self.cursor_b))
+                .flatten();
+            if y1.is_some() || y2.is_some() {
+                rows.push((curve, y1, y2));
+            }
+        }
+        if rows.is_empty() {
+            return;
+        }
+
+        let scale = self.export_cursor_table_text_scale();
+        let text_h = Canvas::text_height(scale);
+        let row_h = text_h + 9;
+        let title_h = text_h + 10;
+        let table_h = title_h + row_h * (rows.len() as i32 + 1) + 8;
+        let table_left = plot.left;
+        let table_right = plot.right;
+        let table_top = plot.bottom + 62;
+        let table_bottom = table_top + table_h;
+        let table_w = table_right - table_left;
+        if table_w <= 120 {
+            return;
+        }
+
+        let palette = self.export_style_palette();
+        canvas.fill_rect(
+            table_left,
+            table_top,
+            table_right,
+            table_bottom,
+            palette.cursor_label_bg,
+        );
+        canvas.stroke_rect(
+            table_left,
+            table_top,
+            table_right,
+            table_bottom,
+            palette.border,
+            1,
+        );
+
+        let delta_x = if use_x1 && use_x2 {
+            Some((self.cursor_b - self.cursor_a).abs())
+        } else {
+            None
+        };
+        let title = match (use_x1, use_x2, delta_x) {
+            (true, true, Some(dx)) => {
+                format!(
+                    "X1={:.6}s    X2={:.6}s    ΔX={dx:.6}s",
+                    self.cursor_a, self.cursor_b
+                )
+            }
+            (true, false, _) => format!("X1={:.6}s", self.cursor_a),
+            (false, true, _) => format!("X2={:.6}s", self.cursor_b),
+            _ => String::new(),
+        };
+        canvas.text_styled(
+            table_left + 8,
+            table_top + 5,
+            &title,
+            palette.axis_text,
+            scale,
+            TextStyle::Bold,
+        );
+        let title_bottom = table_top + title_h;
+        canvas.line(
+            table_left,
+            title_bottom,
+            table_right,
+            title_bottom,
+            palette.grid,
+            1,
+        );
+
+        let name_w = if table_w <= 320 {
+            table_w / 2
+        } else {
+            (table_w * 36 / 100).clamp(150, table_w / 2)
+        };
+        let remaining = table_w - name_w;
+        let columns = if use_x1 && use_x2 { 3 } else { 1 };
+        let value_w = (remaining / columns).max(60);
+        let x_name = table_left;
+        let x_y1 = table_left + name_w;
+        let x_y2 = x_y1 + value_w;
+        let x_delta = x_y2 + value_w;
+        let header_y = title_bottom + 5;
+        let header_color = palette.axis_text;
+        canvas.text_styled(
+            x_name + 8,
+            header_y,
+            self.tr("变量", "Variable"),
+            header_color,
+            scale,
+            TextStyle::Bold,
+        );
+        if use_x1 {
+            canvas.text_styled(
+                x_y1 + 8,
+                header_y,
+                "Y@X1",
+                header_color,
+                scale,
+                TextStyle::Bold,
+            );
+        }
+        if use_x2 {
+            let x = if use_x1 { x_y2 } else { x_y1 };
+            canvas.text_styled(
+                x + 8,
+                header_y,
+                "Y@X2",
+                header_color,
+                scale,
+                TextStyle::Bold,
+            );
+        }
+        if use_x1 && use_x2 {
+            canvas.text_styled(
+                x_delta + 8,
+                header_y,
+                "ΔY",
+                header_color,
+                scale,
+                TextStyle::Bold,
+            );
+        }
+
+        let header_bottom = title_bottom + row_h;
+        canvas.line(
+            table_left,
+            header_bottom,
+            table_right,
+            header_bottom,
+            palette.grid,
+            1,
+        );
+        canvas.line(x_y1, title_bottom, x_y1, table_bottom, palette.grid, 1);
+        if use_x1 && use_x2 {
+            canvas.line(x_y2, title_bottom, x_y2, table_bottom, palette.grid, 1);
+            canvas.line(
+                x_delta,
+                title_bottom,
+                x_delta,
+                table_bottom,
+                palette.grid,
+                1,
+            );
+        }
+
+        for (row_index, (curve, y1, y2)) in rows.into_iter().enumerate() {
+            let top = header_bottom + row_h * row_index as i32;
+            let bottom = top + row_h;
+            if row_index % 2 == 0 {
+                canvas.fill_rect(
+                    table_left + 1,
+                    top,
+                    table_right - 1,
+                    bottom,
+                    Rgba::rgba(245, 249, 255, 185),
+                );
+            }
+            canvas.line(table_left, bottom, table_right, bottom, palette.grid, 1);
+            let color = self.export_annotation_color(curve.color);
+            canvas.fill_rect(x_name + 8, top + 7, x_name + 20, top + 19, color);
+            let name = Self::truncate_export_label(&curve.label, 22);
+            canvas.text_styled(
+                x_name + 26,
+                top + 5,
+                &name,
+                color,
+                scale,
+                self.export_label_font_style.text_style(),
+            );
+
+            if use_x1 {
+                canvas.text(
+                    x_y1 + 8,
+                    top + 5,
+                    &Self::format_export_cursor_value(y1),
+                    palette.axis_text,
+                    scale,
+                );
+            }
+            if use_x2 {
+                let x = if use_x1 { x_y2 } else { x_y1 };
+                canvas.text(
+                    x + 8,
+                    top + 5,
+                    &Self::format_export_cursor_value(y2),
+                    palette.axis_text,
+                    scale,
+                );
+            }
+            if use_x1 && use_x2 {
+                let delta = match (y1, y2) {
+                    (Some(a), Some(b)) => Some(b - a),
+                    _ => None,
+                };
+                canvas.text(
+                    x_delta + 8,
+                    top + 5,
+                    &Self::format_export_cursor_value(delta),
+                    palette.axis_text,
+                    scale,
+                );
+            }
+        }
+    }
+
+    fn export_curve_target(
+        &self,
+        points: &[PlotPoint],
+        target_x: f64,
+        x_min: f64,
+        x_max: f64,
+    ) -> Option<PlotPoint> {
+        if let Some(y) = Self::interpolated_y(points, target_x) {
+            return Some(PlotPoint::new(target_x, y));
+        }
+        points
+            .iter()
+            .rev()
+            .find(|point| {
+                point.x >= x_min && point.x <= x_max && point.y.is_finite() && point.x.is_finite()
+            })
+            .copied()
+    }
+
+    fn export_map_point(
+        point: PlotPoint,
+        plot: ClipRect,
+        x_min: f64,
+        x_max: f64,
+        y_min: f64,
+        y_max: f64,
+    ) -> Option<(i32, i32)> {
+        if !point.x.is_finite()
+            || !point.y.is_finite()
+            || x_max <= x_min
+            || y_max <= y_min
+            || !y_min.is_finite()
+            || !y_max.is_finite()
+        {
+            return None;
+        }
+        let x = plot.left as f64
+            + (point.x - x_min) / (x_max - x_min) * (plot.right - plot.left) as f64;
+        let y = plot.bottom as f64
+            - (point.y - y_min) / (y_max - y_min) * (plot.bottom - plot.top) as f64;
+        Some((x.round() as i32, y.round() as i32))
+    }
+
+    fn export_label_position(
+        plot: ClipRect,
+        target_px: i32,
+        target_py: i32,
+        text_w: i32,
+        text_h: i32,
+        index: usize,
+    ) -> (i32, i32, i32) {
+        let prefer_right = target_px < plot.left + (plot.right - plot.left) * 2 / 3;
+        let gap = 20;
+        let y_offsets = [
+            -(text_h + 12),
+            10,
+            text_h + 16,
+            -(text_h * 2 + 22),
+            text_h * 2 + 24,
+        ];
+        let label_y = (target_py + y_offsets[index % y_offsets.len()])
+            .clamp(plot.top + 8, plot.bottom - text_h - 8);
+        let label_x = if prefer_right {
+            (target_px + gap).clamp(plot.left + 8, plot.right - text_w - 8)
+        } else {
+            (target_px - gap - text_w).clamp(plot.left + 8, plot.right - text_w - 8)
+        };
+        let arrow_start_x = if prefer_right {
+            label_x - 5
+        } else {
+            label_x + text_w + 5
+        };
+        (label_x, label_y, arrow_start_x)
+    }
+
+    fn export_label_canvas_position(
+        &self,
+        label_index: usize,
+        default_x: i32,
+        default_y: i32,
+        plot: ClipRect,
+        text_w: i32,
+        text_h: i32,
+        target_px: i32,
+        target_py: i32,
+        label_order: usize,
+        occupied_rects: &[[i32; 4]],
+        curves: &[ExportCurve<'_>],
+        x_min: f64,
+        x_max: f64,
+        y_min: f64,
+        y_max: f64,
+    ) -> (i32, i32) {
+        if let Some([x, y]) = self
+            .export_label_positions
+            .get(label_index)
+            .and_then(|position| *position)
+        {
+            return (
+                x.clamp(plot.left + 5, plot.right - text_w - 5),
+                y.clamp(plot.top + 5, plot.bottom - text_h - 5),
+            );
+        }
+        self.auto_export_label_position(
+            plot,
+            target_px,
+            target_py,
+            default_x,
+            default_y,
+            text_w,
+            text_h,
+            label_order,
+            occupied_rects,
+            curves,
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn auto_export_label_position(
+        &self,
+        plot: ClipRect,
+        target_px: i32,
+        target_py: i32,
+        default_x: i32,
+        default_y: i32,
+        text_w: i32,
+        text_h: i32,
+        label_order: usize,
+        occupied_rects: &[[i32; 4]],
+        curves: &[ExportCurve<'_>],
+        x_min: f64,
+        x_max: f64,
+        y_min: f64,
+        y_max: f64,
+    ) -> (i32, i32) {
+        let side_order = if target_px < plot.left + (plot.right - plot.left) * 2 / 3 {
+            [1, -1]
+        } else {
+            [-1, 1]
+        };
+        let mut best = (default_x, default_y, f64::INFINITY);
+        let gaps = [18, 30, 44, 62, 84];
+        let y_offsets = [
+            -(text_h + 12),
+            8,
+            text_h + 16,
+            -(text_h * 2 + 24),
+            text_h * 2 + 28,
+            -(text_h * 3 + 36),
+            text_h * 3 + 40,
+        ];
+
+        for side in side_order {
+            for (gap_index, gap) in gaps.iter().enumerate() {
+                for (offset_index, y_offset) in y_offsets.iter().enumerate() {
+                    let x = if side > 0 {
+                        target_px + gap
+                    } else {
+                        target_px - gap - text_w
+                    }
+                    .clamp(plot.left + 5, plot.right - text_w - 5);
+                    let y = (target_py + y_offset).clamp(plot.top + 5, plot.bottom - text_h - 5);
+                    let score = self.export_label_candidate_score(
+                        [x - 4, y - 3, x + text_w + 4, y + text_h + 4],
+                        target_px,
+                        target_py,
+                        occupied_rects,
+                        curves,
+                        plot,
+                        x_min,
+                        x_max,
+                        y_min,
+                        y_max,
+                    ) + (gap_index as f64 * 7.0)
+                        + (offset_index as f64 * 3.0)
+                        + ((x - default_x).abs() + (y - default_y).abs()) as f64 * 0.03
+                        + label_order as f64 * 0.2;
+                    if score < best.2 {
+                        best = (x, y, score);
+                    }
+                }
+            }
+        }
+        (best.0, best.1)
+    }
+
+    fn export_arrow_start_for_label(
+        label_x: i32,
+        label_y: i32,
+        text_w: i32,
+        text_h: i32,
+        target_px: i32,
+    ) -> (i32, i32) {
+        let x = if target_px < label_x {
+            label_x - 5
+        } else {
+            label_x + text_w + 5
+        };
+        (x, label_y + text_h / 2)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn export_label_candidate_score(
+        &self,
+        rect: [i32; 4],
+        target_px: i32,
+        target_py: i32,
+        occupied_rects: &[[i32; 4]],
+        curves: &[ExportCurve<'_>],
+        plot: ClipRect,
+        x_min: f64,
+        x_max: f64,
+        y_min: f64,
+        y_max: f64,
+    ) -> f64 {
+        let center_x = (rect[0] + rect[2]) / 2;
+        let center_y = (rect[1] + rect[3]) / 2;
+        let mut score =
+            (((center_x - target_px).pow(2) + (center_y - target_py).pow(2)) as f64).sqrt() * 0.08;
+        let (arrow_start_x, arrow_start_y) = Self::export_arrow_start_for_label(
+            rect[0] + 4,
+            rect[1] + 3,
+            rect[2] - rect[0] - 8,
+            rect[3] - rect[1] - 7,
+            target_px,
+        );
+        for occupied in occupied_rects {
+            let overlap = Self::rect_overlap_area(rect, *occupied);
+            if overlap > 0 {
+                score += overlap as f64 * 20.0;
+            }
+            if Self::segment_hits_rect(
+                arrow_start_x,
+                arrow_start_y,
+                target_px,
+                target_py,
+                *occupied,
+            ) {
+                score += 650.0;
+            }
+        }
+        if Self::rect_contains_point(rect, target_px, target_py) {
+            score += 1_200.0;
+        }
+        score += self.export_curve_coverage_penalty(
+            rect,
+            arrow_start_x,
+            arrow_start_y,
+            target_px,
+            target_py,
+            curves,
+            plot,
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+        );
+        score
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn export_curve_coverage_penalty(
+        &self,
+        rect: [i32; 4],
+        arrow_start_x: i32,
+        arrow_start_y: i32,
+        target_px: i32,
+        target_py: i32,
+        curves: &[ExportCurve<'_>],
+        plot: ClipRect,
+        x_min: f64,
+        x_max: f64,
+        y_min: f64,
+        y_max: f64,
+    ) -> f64 {
+        let mut penalty = 0.0;
+        let expanded_rect = Self::inflate_rect(rect, 3);
+        for curve in curves {
+            let step = (curve.points.len() / 500).max(1);
+            for point in curve.points.iter().step_by(step) {
+                let Some((px, py)) =
+                    Self::export_map_point(*point, plot, x_min, x_max, y_min, y_max)
+                else {
+                    continue;
+                };
+                if !Self::rect_contains_point(
+                    [plot.left, plot.top, plot.right, plot.bottom],
+                    px,
+                    py,
+                ) {
+                    continue;
+                }
+                if Self::rect_contains_point(expanded_rect, px, py) {
+                    penalty += 42.0;
+                }
+                let distance = Self::point_segment_distance_sq(
+                    px as f64,
+                    py as f64,
+                    arrow_start_x as f64,
+                    arrow_start_y as f64,
+                    target_px as f64,
+                    target_py as f64,
+                );
+                if distance < 36.0 {
+                    penalty += 1.4;
+                }
+            }
+        }
+        penalty
+    }
+
+    fn export_cursor_obstacle_rects(
+        &self,
+        plot: ClipRect,
+        curves: &[ExportCurve<'_>],
+        x_min: f64,
+        x_max: f64,
+        y_min: f64,
+        y_max: f64,
+    ) -> Vec<[i32; 4]> {
+        let mut rects = Vec::new();
+        if self.show_cursor_a {
+            self.collect_export_cursor_obstacles(
+                &mut rects,
+                plot,
+                self.cursor_a,
+                "X1",
+                curves,
+                x_min,
+                x_max,
+                y_min,
+                y_max,
+            );
+        }
+        if self.show_cursor_b {
+            self.collect_export_cursor_obstacles(
+                &mut rects,
+                plot,
+                self.cursor_b,
+                "X2",
+                curves,
+                x_min,
+                x_max,
+                y_min,
+                y_max,
+            );
+        }
+        rects
+    }
+
+    fn collect_export_cursor_obstacles(
+        &self,
+        rects: &mut Vec<[i32; 4]>,
+        plot: ClipRect,
+        cursor_x: f64,
+        cursor_label: &str,
+        _curves: &[ExportCurve<'_>],
+        x_min: f64,
+        x_max: f64,
+        _y_min: f64,
+        _y_max: f64,
+    ) {
+        if cursor_x < x_min || cursor_x > x_max {
+            return;
+        }
+        let cursor_px = plot.left
+            + ((cursor_x - x_min) / (x_max - x_min) * (plot.right - plot.left) as f64).round()
+                as i32;
+        let x_axis_text = format!("{cursor_label} x={cursor_x:.6}s");
+        let x_axis_scale = 2;
+        let x_axis_w = Canvas::text_width(&x_axis_text, x_axis_scale);
+        let x_axis_h = Canvas::text_height(x_axis_scale);
+        let x_axis_x = (cursor_px - x_axis_w / 2).clamp(plot.left + 4, plot.right - x_axis_w - 4);
+        let x_axis_y = plot.bottom + 34;
+        rects.push(Self::inflate_rect(
+            [
+                x_axis_x - 6,
+                x_axis_y - 4,
+                x_axis_x + x_axis_w + 6,
+                x_axis_y + x_axis_h + 5,
+            ],
+            4,
+        ));
+    }
+
+    fn rect_overlap_area(a: [i32; 4], b: [i32; 4]) -> i32 {
+        let width = (a[2].min(b[2]) - a[0].max(b[0])).max(0);
+        let height = (a[3].min(b[3]) - a[1].max(b[1])).max(0);
+        width * height
+    }
+
+    fn rect_contains_point(rect: [i32; 4], x: i32, y: i32) -> bool {
+        x >= rect[0] && x <= rect[2] && y >= rect[1] && y <= rect[3]
+    }
+
+    fn inflate_rect(rect: [i32; 4], amount: i32) -> [i32; 4] {
+        [
+            rect[0] - amount,
+            rect[1] - amount,
+            rect[2] + amount,
+            rect[3] + amount,
+        ]
+    }
+
+    fn segment_hits_rect(x0: i32, y0: i32, x1: i32, y1: i32, rect: [i32; 4]) -> bool {
+        if Self::rect_contains_point(rect, x0, y0) || Self::rect_contains_point(rect, x1, y1) {
+            return true;
+        }
+        let steps = (((x1 - x0).abs().max((y1 - y0).abs())) / 6).clamp(1, 120);
+        for step in 1..steps {
+            let t = step as f64 / steps as f64;
+            let x = x0 as f64 + (x1 - x0) as f64 * t;
+            let y = y0 as f64 + (y1 - y0) as f64 * t;
+            if Self::rect_contains_point(rect, x.round() as i32, y.round() as i32) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn point_segment_distance_sq(px: f64, py: f64, ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
+        let vx = bx - ax;
+        let vy = by - ay;
+        let wx = px - ax;
+        let wy = py - ay;
+        let len_sq = vx * vx + vy * vy;
+        if len_sq <= f64::EPSILON {
+            return (px - ax).powi(2) + (py - ay).powi(2);
+        }
+        let t = ((wx * vx + wy * vy) / len_sq).clamp(0.0, 1.0);
+        let cx = ax + vx * t;
+        let cy = ay + vy * t;
+        (px - cx).powi(2) + (py - cy).powi(2)
+    }
+
+    fn stroke_near_point(stroke: &ExportInkStroke, point: [i32; 2], radius: f64) -> bool {
+        let radius_sq = radius * radius;
+        if stroke.points.len() <= 1 {
+            return stroke.points.iter().any(|p| {
+                let dx = (p[0] - point[0]) as f64;
+                let dy = (p[1] - point[1]) as f64;
+                dx * dx + dy * dy <= radius_sq
+            });
+        }
+        stroke.points.windows(2).any(|pair| {
+            Self::point_segment_distance_sq(
+                point[0] as f64,
+                point[1] as f64,
+                pair[0][0] as f64,
+                pair[0][1] as f64,
+                pair[1][0] as f64,
+                pair[1][1] as f64,
+            ) <= radius_sq
+        })
+    }
+
+    fn export_color(color: Color32) -> Rgba {
+        Rgba::rgba(color.r(), color.g(), color.b(), color.a())
+    }
+
+    fn export_style_palette(&self) -> ExportStylePalette {
+        ExportStylePreset::Screenshot.palette()
+    }
+
+    fn export_arrow_style_controls(&mut self, ui: &mut egui::Ui, id: &'static str) -> bool {
+        let mut changed = false;
+        let mut base_style = self.export_arrow_line_style.base_style();
+        egui::ComboBox::from_id_source((id, "line"))
+            .selected_text(base_style.base_label(self.language))
+            .show_ui(ui, |ui| {
+                for style in ExportArrowLineStyle::BASE {
+                    changed |= ui
+                        .selectable_value(&mut base_style, style, style.base_label(self.language))
+                        .changed();
+                }
+            });
+        if changed {
+            self.export_arrow_line_style = base_style;
+        }
+        let mut thick = self.export_arrow_line_style == ExportArrowLineStyle::Thick;
+        let mut double = self.export_arrow_line_style == ExportArrowLineStyle::Double;
+        if ui
+            .checkbox(&mut thick, self.tr("粗箭头", "Thick"))
+            .changed()
+        {
+            self.export_arrow_line_style = if thick {
+                ExportArrowLineStyle::Thick
+            } else {
+                base_style
+            };
+            changed = true;
+        }
+        if ui
+            .checkbox(&mut double, self.tr("双线箭头", "Double"))
+            .changed()
+        {
+            self.export_arrow_line_style = if double {
+                ExportArrowLineStyle::Double
+            } else {
+                base_style
+            };
+            changed = true;
+        }
+        changed
+    }
+
+    fn export_dpi_value(&self) -> u32 {
+        self.export_dpi_value.clamp(50, 2400)
+    }
+
+    fn export_dpi_selected_text(&self) -> String {
+        let value = self.export_dpi_value();
+        if let Some(preset) = ExportDpi::ALL
+            .iter()
+            .copied()
+            .find(|preset| preset.value() == value)
+        {
+            preset.label(self.language).to_owned()
+        } else {
+            format!("{value} DPI")
+        }
+    }
+
+    fn export_dpi_controls(&mut self, ui: &mut egui::Ui, id: &'static str) -> bool {
+        let mut changed = false;
+        egui::ComboBox::from_id_source((id, "preset"))
+            .selected_text(self.export_dpi_selected_text())
+            .show_ui(ui, |ui| {
+                for dpi in ExportDpi::ALL {
+                    if ui
+                        .selectable_label(
+                            self.export_dpi_value() == dpi.value(),
+                            dpi.label(self.language),
+                        )
+                        .clicked()
+                    {
+                        self.export_dpi = dpi;
+                        self.export_dpi_value = dpi.value();
+                        changed = true;
+                    }
+                }
+            });
+        let mut dpi_value = self.export_dpi_value() as i32;
+        if ui
+            .add(
+                egui::DragValue::new(&mut dpi_value)
+                    .speed(10)
+                    .clamp_range(50..=2400)
+                    .suffix(" DPI"),
+            )
+            .changed()
+        {
+            self.export_dpi_value = (dpi_value as u32).clamp(50, 2400);
+            if let Some(preset) = ExportDpi::ALL
+                .iter()
+                .copied()
+                .find(|preset| preset.value() == self.export_dpi_value)
+            {
+                self.export_dpi = preset;
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    fn export_scope_color(&self, color: Color32) -> Rgba {
+        let r = color.r() as f32;
+        let g = color.g() as f32;
+        let b = color.b() as f32;
+        if self.export_style_preset == ExportStylePreset::PaperMono {
+            let luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            let gray = if luminance > 170 { 75 } else { 35 };
+            return Rgba::rgb(gray, gray, gray);
+        }
+        if self.export_style_preset == ExportStylePreset::HighContrastPrint {
+            let luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let factor = if luminance > 185.0 { 0.42 } else { 0.72 };
+            return Rgba::rgb(
+                (r * factor).round().clamp(0.0, 255.0) as u8,
+                (g * factor).round().clamp(0.0, 255.0) as u8,
+                (b * factor).round().clamp(0.0, 255.0) as u8,
+            );
+        }
+        let luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let factor = if luminance > 185.0 { 0.58 } else { 0.86 };
+        Rgba::rgb(
+            (r * factor).round().clamp(0.0, 255.0) as u8,
+            (g * factor).round().clamp(0.0, 255.0) as u8,
+            (b * factor).round().clamp(0.0, 255.0) as u8,
+        )
+    }
+
+    fn export_annotation_color(&self, curve_color: Color32) -> Rgba {
+        if matches!(
+            self.export_style_preset,
+            ExportStylePreset::PaperMono | ExportStylePreset::HighContrastPrint
+        ) {
+            return Rgba::rgb(0, 0, 0);
+        }
+        match self.export_arrow_color_style {
+            ExportArrowColorStyle::Curve => self.export_scope_color(curve_color),
+            ExportArrowColorStyle::Dark => Rgba::rgb(12, 21, 35),
+            ExportArrowColorStyle::Red => Rgba::rgb(220, 20, 38),
+            ExportArrowColorStyle::Blue => Rgba::rgb(18, 86, 210),
+            ExportArrowColorStyle::Custom => Self::export_color(self.export_arrow_custom_color),
+        }
+    }
+
+    fn export_arrow_width(&self) -> i32 {
+        (self.export_arrow_size / 5.0).round().clamp(1.0, 6.0) as i32
+    }
+
+    fn draw_export_annotation_arrow<C: WaveformCanvas>(
+        &self,
+        canvas: &mut C,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        color: Rgba,
+    ) {
+        let style = self.export_arrow_line_style;
+        let width = self.export_arrow_width() + style.width_extra();
+        let head_size = self
+            .export_arrow_size
+            .clamp(MIN_EXPORT_ARROW_SIZE, MAX_EXPORT_ARROW_SIZE)
+            * style.head_scale();
+        if style == ExportArrowLineStyle::Double {
+            let dx = (x1 - x0) as f32;
+            let dy = (y1 - y0) as f32;
+            let len = (dx * dx + dy * dy).sqrt().max(1.0);
+            let ox = (-dy / len * 3.0).round() as i32;
+            let oy = (dx / len * 3.0).round() as i32;
+            canvas.arrow(
+                x0 + ox,
+                y0 + oy,
+                x1 + ox,
+                y1 + oy,
+                color,
+                head_size,
+                width,
+                StrokeStyle::Solid,
+            );
+            canvas.arrow(
+                x0 - ox,
+                y0 - oy,
+                x1 - ox,
+                y1 - oy,
+                color,
+                head_size,
+                width,
+                StrokeStyle::Solid,
+            );
+        } else {
+            canvas.arrow(
+                x0,
+                y0,
+                x1,
+                y1,
+                color,
+                head_size,
+                width,
+                style.stroke_style(),
+            );
+        }
+    }
+
+    fn truncate_export_label(label: &str, max_chars: usize) -> String {
+        let mut output = label.chars().take(max_chars).collect::<String>();
+        if label.chars().count() > max_chars {
+            output.push_str("...");
+        }
+        output
+    }
+
     fn write_dataset_export(
         &self,
         source: Arc<dyn DataSource>,
         meta: &DatasetMeta,
         dataset_index: usize,
+        channels: &[usize],
         path: &Path,
         format: DatasetExportFormat,
         start_time: f64,
@@ -2128,11 +7859,20 @@ impl ScopeApp {
                 .tr("Invalid export range.", "Invalid export range.")
                 .to_owned());
         }
+        if channels.is_empty() {
+            return Err(self
+                .tr(
+                    "没有可导出的通道。",
+                    "No channels are available for export.",
+                )
+                .to_owned());
+        }
         match format {
             DatasetExportFormat::StandardCsv => self.write_dataset_delimited(
                 source,
                 meta,
                 dataset_index,
+                channels,
                 path,
                 b',',
                 start_time,
@@ -2142,6 +7882,7 @@ impl ScopeApp {
                 source,
                 meta,
                 dataset_index,
+                channels,
                 path,
                 start_time,
                 end_time,
@@ -2150,32 +7891,51 @@ impl ScopeApp {
                 source,
                 meta,
                 dataset_index,
+                channels,
                 path,
                 b'\t',
                 start_time,
                 end_time,
             ),
-            DatasetExportFormat::Json => {
-                self.write_dataset_json(source, meta, dataset_index, path, start_time, end_time)
-            }
+            DatasetExportFormat::Json => self.write_dataset_json(
+                source,
+                meta,
+                dataset_index,
+                channels,
+                path,
+                start_time,
+                end_time,
+            ),
         }
     }
 
-    fn export_channel_names(&self, meta: &DatasetMeta, dataset_index: usize) -> Vec<String> {
-        meta.channels
+    fn export_channel_names_for_channels(
+        &self,
+        meta: &DatasetMeta,
+        dataset_index: usize,
+        channels: &[usize],
+    ) -> Vec<String> {
+        channels
             .iter()
-            .map(|channel| {
+            .map(|channel_index| {
+                let channel = meta
+                    .channels
+                    .iter()
+                    .find(|channel| channel.index == *channel_index);
                 let name = if dataset_index == 0 {
                     self.display_names
-                        .get(channel.index)
+                        .get(*channel_index)
                         .filter(|name| !name.trim().is_empty())
                         .cloned()
-                        .unwrap_or_else(|| channel.name.clone())
+                        .or_else(|| channel.map(|channel| channel.name.clone()))
+                        .unwrap_or_else(|| format!("CH{}", *channel_index + 1))
                 } else {
-                    channel.name.clone()
+                    channel
+                        .map(|channel| channel.name.clone())
+                        .unwrap_or_else(|| format!("CH{}", *channel_index + 1))
                 };
                 if name.trim().is_empty() {
-                    format!("CH{}", channel.index + 1)
+                    format!("CH{}", *channel_index + 1)
                 } else {
                     name
                 }
@@ -2225,16 +7985,12 @@ impl ScopeApp {
         source: Arc<dyn DataSource>,
         meta: &DatasetMeta,
         dataset_index: usize,
+        channels: &[usize],
         path: &Path,
         delimiter: u8,
         start_time: f64,
         end_time: f64,
     ) -> Result<u64, String> {
-        let channels = meta
-            .channels
-            .iter()
-            .map(|channel| channel.index)
-            .collect::<Vec<_>>();
         let mut writer = csv::WriterBuilder::new()
             .has_headers(false)
             .delimiter(delimiter)
@@ -2243,7 +7999,7 @@ impl ScopeApp {
 
         let mut header = Vec::with_capacity(channels.len() + 1);
         header.push("time".to_owned());
-        header.extend(self.export_channel_names(meta, dataset_index));
+        header.extend(self.export_channel_names_for_channels(meta, dataset_index, channels));
         writer
             .write_record(header)
             .map_err(|error| error.to_string())?;
@@ -2258,7 +8014,7 @@ impl ScopeApp {
         while start_time <= end_time {
             let range_end = (start_time + chunk_duration).min(end_time);
             let block = source
-                .read_range(start_time, range_end, &channels, EXPORT_CHUNK_SAMPLES + 2)
+                .read_range(start_time, range_end, channels, EXPORT_CHUNK_SAMPLES + 2)
                 .map_err(|error| error.to_string())?;
 
             for (row_index, time) in block.times.iter().enumerate() {
@@ -2297,15 +8053,11 @@ impl ScopeApp {
         source: Arc<dyn DataSource>,
         meta: &DatasetMeta,
         dataset_index: usize,
+        channels: &[usize],
         path: &Path,
         start_time: f64,
         end_time: f64,
     ) -> Result<u64, String> {
-        let channels = meta
-            .channels
-            .iter()
-            .map(|channel| channel.index)
-            .collect::<Vec<_>>();
         let mut writer = csv::WriterBuilder::new()
             .has_headers(false)
             .from_path(path)
@@ -2336,7 +8088,7 @@ impl ScopeApp {
             .write_record(["END"])
             .map_err(|error| error.to_string())?;
         writer
-            .write_record(self.export_channel_names(meta, dataset_index))
+            .write_record(self.export_channel_names_for_channels(meta, dataset_index, channels))
             .map_err(|error| error.to_string())?;
 
         let sample_rate_hz = meta.nominal_sample_rate_hz.max(1.0);
@@ -2349,7 +8101,7 @@ impl ScopeApp {
         while start_time <= end_time {
             let range_end = (start_time + chunk_duration).min(end_time);
             let block = source
-                .read_range(start_time, range_end, &channels, EXPORT_CHUNK_SAMPLES + 2)
+                .read_range(start_time, range_end, channels, EXPORT_CHUNK_SAMPLES + 2)
                 .map_err(|error| error.to_string())?;
 
             for (row_index, time) in block.times.iter().enumerate() {
@@ -2387,18 +8139,14 @@ impl ScopeApp {
         source: Arc<dyn DataSource>,
         meta: &DatasetMeta,
         dataset_index: usize,
+        channels: &[usize],
         path: &Path,
         start_time: f64,
         end_time: f64,
     ) -> Result<u64, String> {
-        let channels = meta
-            .channels
-            .iter()
-            .map(|channel| channel.index)
-            .collect::<Vec<_>>();
         let file = File::create(path).map_err(|error| error.to_string())?;
         let mut writer = BufWriter::new(file);
-        let channel_names = self.export_channel_names(meta, dataset_index);
+        let channel_names = self.export_channel_names_for_channels(meta, dataset_index, channels);
 
         write!(writer, "{{\n  \"source_name\": ").map_err(|error| error.to_string())?;
         serde_json::to_writer(&mut writer, &meta.source_name).map_err(|error| error.to_string())?;
@@ -2412,16 +8160,21 @@ impl ScopeApp {
         )
         .map_err(|error| error.to_string())?;
 
-        for (index, channel) in meta.channels.iter().enumerate() {
+        for (index, channel_index) in channels.iter().enumerate() {
+            let channel = meta
+                .channels
+                .iter()
+                .find(|channel| channel.index == *channel_index);
             if index > 0 {
                 write!(writer, ",").map_err(|error| error.to_string())?;
             }
-            write!(writer, "\n    {{\"index\": {}, \"name\": ", channel.index)
+            write!(writer, "\n    {{\"index\": {}, \"name\": ", channel_index)
                 .map_err(|error| error.to_string())?;
             serde_json::to_writer(&mut writer, &channel_names[index])
                 .map_err(|error| error.to_string())?;
             write!(writer, ", \"unit\": ").map_err(|error| error.to_string())?;
-            serde_json::to_writer(&mut writer, &channel.unit).map_err(|error| error.to_string())?;
+            let unit = channel.map(|channel| channel.unit.as_str()).unwrap_or("");
+            serde_json::to_writer(&mut writer, unit).map_err(|error| error.to_string())?;
             write!(writer, "}}").map_err(|error| error.to_string())?;
         }
         write!(writer, "\n  ],\n  \"samples\": [").map_err(|error| error.to_string())?;
@@ -2436,7 +8189,7 @@ impl ScopeApp {
         while start_time <= end_time {
             let range_end = (start_time + chunk_duration).min(end_time);
             let block = source
-                .read_range(start_time, range_end, &channels, EXPORT_CHUNK_SAMPLES + 2)
+                .read_range(start_time, range_end, channels, EXPORT_CHUNK_SAMPLES + 2)
                 .map_err(|error| error.to_string())?;
 
             for (row_index, time) in block.times.iter().enumerate() {
@@ -2564,47 +8317,255 @@ impl ScopeApp {
         }
     }
 
+    fn export_display_config(&mut self) {
+        if self.display_names.is_empty() {
+            self.last_error = Some(
+                self.tr(
+                    "请先打开波形文件，再导出显示配置。",
+                    "Open a waveform file before exporting display settings.",
+                )
+                .to_owned(),
+            );
+            return;
+        }
+        self.export_json_config(
+            &self.current_display_config(),
+            self.tr("显示配置", "Display settings"),
+            "scope-display.json",
+            self.tr("导出显示配置失败", "Failed to export display settings"),
+        );
+    }
+
+    fn import_display_config(&mut self) {
+        if self.display_names.is_empty() {
+            self.last_error = Some(
+                self.tr(
+                    "请先打开波形文件，再导入显示配置。",
+                    "Open a waveform file before importing display settings.",
+                )
+                .to_owned(),
+            );
+            return;
+        }
+        let filter_name = self.tr("显示配置", "Display settings");
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(filter_name, &["json"])
+            .pick_file()
+        else {
+            return;
+        };
+        self.import_json_config::<DisplayConfig, _>(
+            &path,
+            |app, config| app.apply_display_config(config),
+            self.tr("导入显示配置失败", "Failed to import display settings"),
+        );
+    }
+
+    fn export_shortcut_config(&mut self) {
+        let shortcuts = self.shortcuts;
+        let filter_name = self.tr("快捷键配置", "Shortcut settings");
+        let error_prefix = self.tr("导出快捷键配置失败", "Failed to export shortcut settings");
+        self.export_json_config(
+            &shortcuts,
+            filter_name,
+            "scope-shortcuts.json",
+            error_prefix,
+        );
+    }
+
+    fn import_shortcut_config(&mut self) {
+        let filter_name = self.tr("快捷键配置", "Shortcut settings");
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(filter_name, &["json"])
+            .pick_file()
+        else {
+            return;
+        };
+        self.import_json_config::<ShortcutConfig, _>(
+            &path,
+            |app, config| app.shortcuts = config,
+            self.tr("导入快捷键配置失败", "Failed to import shortcut settings"),
+        );
+    }
+
+    fn export_dataset_config(&mut self) {
+        if self.source.is_none() {
+            self.last_error = Some(self.tr("请先导入数据。", "Import data first.").to_owned());
+            return;
+        }
+        self.export_json_config(
+            &self.current_dataset_config(),
+            self.tr("数据组配置", "Dataset settings"),
+            "scope-datasets.json",
+            self.tr("导出数据组配置失败", "Failed to export dataset settings"),
+        );
+    }
+
+    fn import_dataset_config(&mut self) {
+        if self.source.is_none() {
+            self.last_error = Some(self.tr("请先导入数据。", "Import data first.").to_owned());
+            return;
+        }
+        let filter_name = self.tr("数据组配置", "Dataset settings");
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(filter_name, &["json"])
+            .pick_file()
+        else {
+            return;
+        };
+        self.import_json_config::<DatasetConfig, _>(
+            &path,
+            |app, config| app.apply_dataset_config(config),
+            self.tr("导入数据组配置失败", "Failed to import dataset settings"),
+        );
+    }
+
+    fn export_json_config<T: Serialize>(
+        &mut self,
+        config: &T,
+        filter_name: &str,
+        default_name: &str,
+        error_prefix: &str,
+    ) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(filter_name, &["json"])
+            .set_file_name(default_name)
+            .save_file()
+        else {
+            return;
+        };
+        match serde_json::to_string_pretty(config)
+            .map_err(|error| error.to_string())
+            .and_then(|json| std::fs::write(&path, json).map_err(|error| error.to_string()))
+        {
+            Ok(()) => {}
+            Err(error) => self.last_error = Some(format!("{error_prefix}: {error}")),
+        }
+    }
+
+    fn import_json_config<T, F>(&mut self, path: &Path, apply: F, error_prefix: &str)
+    where
+        T: DeserializeOwned,
+        F: FnOnce(&mut Self, T),
+    {
+        match std::fs::read_to_string(path)
+            .map_err(|error| error.to_string())
+            .and_then(|text| serde_json::from_str::<T>(&text).map_err(|error| error.to_string()))
+        {
+            Ok(config) => apply(self, config),
+            Err(error) => self.last_error = Some(format!("{error_prefix}: {error}")),
+        }
+    }
+
     fn selected_channels(&self) -> Vec<usize> {
-        let valid_channels = self
-            .meta()
+        self.meta()
             .map(|meta| {
                 meta.channels
                     .iter()
-                    .map(|channel| channel.index)
-                    .collect::<Vec<_>>()
+                    .filter_map(|channel| {
+                        self.visible
+                            .get(channel.index)
+                            .copied()
+                            .unwrap_or(false)
+                            .then_some(channel.index)
+                    })
+                    .collect()
             })
-            .unwrap_or_default();
-        self.visible
-            .iter()
-            .enumerate()
-            .filter_map(|(index, visible)| {
-                (*visible && valid_channels.contains(&index)).then_some(index)
-            })
-            .collect()
+            .unwrap_or_default()
     }
 
     fn selected_imported_channels(&self, dataset_index: usize) -> Vec<usize> {
         let Some(compare_meta) = self.imported_meta(dataset_index) else {
             return Vec::new();
         };
-        let valid_channels = compare_meta
-            .channels
-            .iter()
-            .map(|channel| channel.index)
-            .collect::<Vec<_>>();
         self.imported_datasets
             .get(dataset_index)
             .map(|dataset| {
-                dataset
-                    .visible
+                compare_meta
+                    .channels
                     .iter()
-                    .enumerate()
-                    .filter_map(|(index, visible)| {
-                        (*visible && valid_channels.contains(&index)).then_some(index)
+                    .filter_map(|channel| {
+                        dataset
+                            .visible
+                            .get(channel.index)
+                            .copied()
+                            .unwrap_or(false)
+                            .then_some(channel.index)
                     })
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn current_plot_selections(&self) -> PlotSelections {
+        PlotSelections {
+            primary: self.selected_channels(),
+            imported: (0..self.imported_datasets.len())
+                .map(|dataset_index| self.selected_imported_channels(dataset_index))
+                .collect(),
+            derived: self.selected_derived_channels(),
+        }
+    }
+
+    fn pane_plot_selections(
+        &self,
+        selections: &PlotSelections,
+        pane_count: usize,
+    ) -> Vec<PanePlotSelections> {
+        let pane_count = pane_count.max(1);
+        let mut panes = vec![PanePlotSelections::default(); pane_count];
+        for (out_index, channel_index) in selections.primary.iter().copied().enumerate() {
+            let pane_index = self.channel_scope_pane(channel_index, pane_count);
+            panes[pane_index].primary.push((out_index, channel_index));
+        }
+        for pane in &mut panes {
+            pane.imported = vec![Vec::new(); selections.imported.len()];
+        }
+        for (dataset_index, channels) in selections.imported.iter().enumerate() {
+            for (out_index, channel_index) in channels.iter().copied().enumerate() {
+                let pane_index = self.channel_scope_pane(channel_index, pane_count);
+                if let Some(dataset_channels) = panes[pane_index].imported.get_mut(dataset_index) {
+                    dataset_channels.push((out_index, channel_index));
+                }
+            }
+        }
+        for (out_index, derived_index) in selections.derived.iter().copied().enumerate() {
+            let pane_index = self.derived_scope_pane(derived_index, pane_count);
+            panes[pane_index].derived.push((out_index, derived_index));
+        }
+        panes
+    }
+
+    fn plot_data_series_budget_count(&self, primary_channels: &[usize]) -> usize {
+        let imported_count = (0..self.imported_datasets.len())
+            .map(|dataset_index| self.selected_imported_channels(dataset_index).len())
+            .sum::<usize>();
+        primary_channels.len() + imported_count + self.selected_derived_channels().len()
+    }
+
+    fn plot_cache_key(
+        &self,
+        generation: u64,
+        start: f64,
+        end: f64,
+        channels: &[usize],
+        time_offset: f64,
+        plot_pixel_width: f32,
+        budget_series_count: usize,
+    ) -> PlotCacheKey {
+        PlotCacheKey {
+            generation,
+            start_bits: start.to_bits(),
+            end_bits: end.to_bits(),
+            channels: channels.to_vec(),
+            scale_bits: channels
+                .iter()
+                .map(|channel| self.channel_scale(*channel).to_bits())
+                .collect(),
+            time_offset_bits: time_offset.to_bits(),
+            plot_pixel_width: plot_pixel_width.max(80.0).ceil() as u32,
+            budget_series_count,
+        }
     }
 
     fn dataset_channel_visible(&self, dataset_index: usize, channel_index: usize) -> bool {
@@ -2670,23 +8631,23 @@ impl ScopeApp {
 
     fn fft_channel_options(&self) -> Vec<usize> {
         let dataset_index = self.selected_fft_dataset_index();
+        self.analog_channel_options_for_dataset(dataset_index)
+    }
+
+    fn analog_channel_options_for_dataset(&self, dataset_index: usize) -> Vec<usize> {
         let Some(meta) = self.dataset_meta_by_index(dataset_index) else {
             return Vec::new();
         };
-        match self.dataset_kind_by_index(dataset_index) {
-            Some(SourceKind::Cloud) => meta
-                .channels
-                .iter()
-                .filter(|channel| channel.index < 30)
-                .map(|channel| channel.index)
-                .collect(),
-            _ => meta
-                .channels
-                .iter()
-                .filter(|channel| !Self::looks_like_digital_name(&channel.name))
-                .map(|channel| channel.index)
-                .collect(),
-        }
+        let kind = self.dataset_kind_by_index(dataset_index);
+        meta.channels
+            .iter()
+            .filter(|channel| !Self::channel_is_digital(kind, channel))
+            .map(|channel| channel.index)
+            .collect()
+    }
+
+    fn primary_time_sync_channel_options(&self) -> Vec<usize> {
+        self.analog_channel_options_for_dataset(0)
     }
 
     fn default_sequence_channels_from_options(options: &[usize]) -> Option<[usize; 3]> {
@@ -2738,6 +8699,15 @@ impl ScopeApp {
         options: &[usize],
     ) -> Option<[usize; 3]> {
         let dataset_index = self.selected_fft_dataset_index();
+        self.related_three_phase_channels_from_anchor_in_dataset(dataset_index, anchor, options)
+    }
+
+    fn related_three_phase_channels_from_anchor_in_dataset(
+        &self,
+        dataset_index: usize,
+        anchor: usize,
+        options: &[usize],
+    ) -> Option<[usize; 3]> {
         let anchor_name = self.normalized_channel_name(dataset_index, anchor);
         let phase = anchor_name.chars().last()?;
         if !matches!(phase, 'a' | 'b' | 'c') {
@@ -2764,6 +8734,15 @@ impl ScopeApp {
         prefer_stvg: bool,
     ) -> Option<[usize; 3]> {
         let dataset_index = self.selected_fft_dataset_index();
+        self.preferred_three_phase_channels_in_dataset(dataset_index, options, prefer_stvg)
+    }
+
+    fn preferred_three_phase_channels_in_dataset(
+        &self,
+        dataset_index: usize,
+        options: &[usize],
+        prefer_stvg: bool,
+    ) -> Option<[usize; 3]> {
         let normalized_name =
             |channel_index: usize| self.normalized_channel_name(dataset_index, channel_index);
         let find_exact = |target: &str| {
@@ -2798,6 +8777,10 @@ impl ScopeApp {
             return Some([a, b, c]);
         }
         Self::default_sequence_channels_from_options(options)
+    }
+
+    fn preferred_time_sync_source_channels(&self, options: &[usize]) -> Option<[usize; 3]> {
+        self.preferred_three_phase_channels_in_dataset(0, options, true)
     }
 
     fn preferred_pll_source_channels(&self, options: &[usize]) -> Option<[usize; 3]> {
@@ -2901,7 +8884,13 @@ impl ScopeApp {
     }
 
     fn preferred_fft_channel(&self, fft_channels: &[usize]) -> Option<usize> {
-        self.selected_channels()
+        let dataset_index = self.selected_fft_dataset_index();
+        let visible_channels = if dataset_index == 0 {
+            self.selected_channels()
+        } else {
+            self.selected_imported_channels(dataset_index - 1)
+        };
+        visible_channels
             .into_iter()
             .find(|channel| fft_channels.contains(channel))
             .or_else(|| fft_channels.first().copied())
@@ -2916,7 +8905,13 @@ impl ScopeApp {
         .any(|pattern| lower.contains(pattern))
     }
 
-    fn channel_is_digital(kind: Option<SourceKind>, channel: &crate::data::ChannelMeta) -> bool {
+    fn channel_is_digital(kind: Option<SourceKind>, channel: &ChannelMeta) -> bool {
+        if channel.unit == CHANNEL_UNIT_DIGITAL {
+            return true;
+        }
+        if channel.unit == CHANNEL_UNIT_ANALOG {
+            return false;
+        }
         match kind {
             Some(SourceKind::Cloud) => channel.index >= 30,
             _ => Self::looks_like_digital_name(&channel.name),
@@ -2941,20 +8936,46 @@ impl ScopeApp {
             .collect()
     }
 
-    fn find_sync_channel(meta: &DatasetMeta, target: &str) -> Option<usize> {
+    fn find_matching_sync_channel(meta: &DatasetMeta, target_name: &str) -> Option<usize> {
+        let target = Self::sync_channel_key(target_name);
+        if target.is_empty() {
+            return None;
+        }
         meta.channels
             .iter()
-            .find(|channel| Self::sync_channel_key(&channel.name).contains(target))
+            .find(|channel| Self::sync_channel_key(&channel.name) == target)
             .map(|channel| channel.index)
+            .or_else(|| {
+                (target.len() >= 4)
+                    .then(|| {
+                        meta.channels
+                            .iter()
+                            .find(|channel| {
+                                let key = Self::sync_channel_key(&channel.name);
+                                key.contains(&target) || target.contains(&key)
+                            })
+                            .map(|channel| channel.index)
+                    })
+                    .flatten()
+            })
     }
 
-    fn sync_channel_pairs(primary: &DatasetMeta, other: &DatasetMeta) -> Vec<(usize, usize)> {
-        ["stvg0ia", "stvg0ib", "stvg0ic"]
-            .iter()
-            .filter_map(|target| {
+    fn sync_channel_pairs(
+        primary: &DatasetMeta,
+        other: &DatasetMeta,
+        primary_channels: [usize; 3],
+    ) -> Vec<(usize, usize)> {
+        primary_channels
+            .into_iter()
+            .filter_map(|primary_channel| {
+                let primary_name = primary
+                    .channels
+                    .iter()
+                    .find(|channel| channel.index == primary_channel)
+                    .map(|channel| channel.name.as_str())?;
                 Some((
-                    Self::find_sync_channel(primary, target)?,
-                    Self::find_sync_channel(other, target)?,
+                    primary_channel,
+                    Self::find_matching_sync_channel(other, primary_name)?,
                 ))
             })
             .collect()
@@ -3003,10 +9024,11 @@ impl ScopeApp {
         primary: &dyn DataSource,
         other: &dyn DataSource,
         frequency_hz: f64,
+        primary_channels: [usize; 3],
     ) -> DataResult<Option<f64>> {
         let primary_meta = primary.metadata();
         let other_meta = other.metadata();
-        let pairs = Self::sync_channel_pairs(primary_meta, other_meta);
+        let pairs = Self::sync_channel_pairs(primary_meta, other_meta, primary_channels);
         if pairs.is_empty() {
             return Ok(None);
         }
@@ -3071,7 +9093,7 @@ impl ScopeApp {
     }
 
     fn sync_time_axes_by_phase(&mut self) {
-        let Some(primary) = self.source.as_deref() else {
+        let Some(primary) = self.source.clone() else {
             self.time_sync_status = self.tr("请先导入数据。", "Import data first.").to_owned();
             return;
         };
@@ -3085,11 +9107,17 @@ impl ScopeApp {
             return;
         }
 
+        let primary_channels = self.time_sync_source_channels;
         let frequency_hz = self.harmonic_base_hz.max(0.001);
         let mut synced = 0usize;
         let mut failed = 0usize;
         for dataset in &mut self.imported_datasets {
-            match Self::phase_sync_offset_for(primary, dataset.source.as_ref(), frequency_hz) {
+            match Self::phase_sync_offset_for(
+                primary.as_ref(),
+                dataset.source.as_ref(),
+                frequency_hz,
+                primary_channels,
+            ) {
                 Ok(Some(offset)) if offset.is_finite() => {
                     dataset.time_offset = offset;
                     dataset.plot_cache = SampleBlock::default();
@@ -3113,9 +9141,10 @@ impl ScopeApp {
         self.needs_compare_plot_reload = true;
         self.fft_results.clear();
         self.needs_fft_reload = true;
-        self.time_sync_status = format!(
-            "Synced {synced} group(s), failed {failed}; base frequency {frequency_hz:.3} Hz."
-        );
+        self.time_sync_status = match self.language {
+            Language::Zh => format!("已同步 {synced} 个数据组，失败 {failed} 个。"),
+            Language::En => format!("Synced {synced} group(s), failed {failed}."),
+        };
     }
 
     fn clear_time_axis_sync(&mut self) {
@@ -3146,11 +9175,16 @@ impl ScopeApp {
             .unwrap_or_else(|| format!("CH{}", index + 1))
     }
 
-    fn dataset_channel_name(
-        &self,
-        dataset_index: usize,
-        channel: &crate::data::ChannelMeta,
-    ) -> String {
+    fn compact_label(label: &str, max_chars: usize) -> String {
+        let mut chars = label.chars();
+        let mut output = chars.by_ref().take(max_chars).collect::<String>();
+        if chars.next().is_some() {
+            output.push_str("...");
+        }
+        output
+    }
+
+    fn dataset_channel_name(&self, dataset_index: usize, channel: &ChannelMeta) -> String {
         if dataset_index > 0 && self.dataset_kind_by_index(dataset_index) == Some(SourceKind::Dat) {
             if channel.name.trim().is_empty() {
                 format!("CH{}", channel.index + 1)
@@ -3162,17 +9196,59 @@ impl ScopeApp {
         }
     }
 
-    fn draw_points_per_channel(channel_count: usize) -> usize {
-        if channel_count == 0 {
+    fn draw_points_per_channel(series_count: usize) -> usize {
+        if series_count == 0 {
             return 0;
         }
-        (MAX_TOTAL_DRAW_POINTS / channel_count)
+        (MAX_TOTAL_DRAW_POINTS / series_count)
             .clamp(MIN_DRAW_POINTS_PER_CHANNEL, MAX_DRAW_POINTS_PER_CHANNEL)
     }
 
-    fn summary_bins_for_channels(channel_count: usize) -> usize {
-        // Each summary bin is drawn as min+max, so use half the raw point budget.
-        (Self::draw_points_per_channel(channel_count) / 2).max(128)
+    fn summary_bins_for_channels(channel_count: usize, plot_pixel_width: f32) -> usize {
+        // Each summary bin is drawn as min+max. Use roughly one envelope bin per horizontal
+        // screen pixel so dense ranges preserve spikes without drawing every sample.
+        let max_budget_bins = (Self::draw_points_per_channel(channel_count) / 2).max(128);
+        let pixel_bins = plot_pixel_width
+            .max(80.0)
+            .ceil()
+            .clamp(128.0, max_budget_bins as f32) as usize;
+        pixel_bins.max(1)
+    }
+
+    fn lightweight_plot_points(points: &Arc<[PlotPoint]>) -> Arc<[PlotPoint]> {
+        if points.len() <= LAYOUT_RESIZE_DRAW_POINTS_PER_CHANNEL {
+            return Arc::clone(points);
+        }
+
+        let stride = points.len().div_ceil(LAYOUT_RESIZE_DRAW_POINTS_PER_CHANNEL);
+        let mut reduced =
+            Vec::with_capacity((points.len() / stride).saturating_add(2).min(points.len()));
+        for index in (0..points.len()).step_by(stride) {
+            reduced.push(points[index]);
+        }
+        if let Some(last) = points.last() {
+            if reduced
+                .last()
+                .is_none_or(|point| point.x != last.x || point.y != last.y)
+            {
+                reduced.push(*last);
+            }
+        }
+        Arc::from(reduced)
+    }
+
+    fn frame_plot_points(
+        points: &Arc<[PlotPoint]>,
+        lightweight_points: Option<&Arc<[PlotPoint]>>,
+        lightweight: bool,
+    ) -> Arc<[PlotPoint]> {
+        if lightweight {
+            lightweight_points
+                .map(PreparedPlotSeries::shared_points)
+                .unwrap_or_else(|| PreparedPlotSeries::shared_points(points))
+        } else {
+            PreparedPlotSeries::shared_points(points)
+        }
     }
 
     fn prepare_sample_series(
@@ -3183,6 +9259,7 @@ impl ScopeApp {
     ) -> PreparedPlotSeries {
         let count = block.channels.len().min(channels.len());
         let mut points = Vec::with_capacity(count);
+        let mut lightweight_points = Vec::with_capacity(count);
         let mut bounds = Vec::with_capacity(count);
         for (out_index, channel_index) in channels.iter().take(count).enumerate() {
             let Some(values) = block.channels.get(out_index) else {
@@ -3203,10 +9280,16 @@ impl ScopeApp {
                 series.push(PlotPoint::new(x, y));
             }
             let bounds_for_series = (min.is_finite() && max.is_finite()).then_some((min, max));
-            points.push(Arc::from(series));
+            let series: Arc<[PlotPoint]> = Arc::from(series);
+            lightweight_points.push(Self::lightweight_plot_points(&series));
+            points.push(series);
             bounds.push(bounds_for_series);
         }
-        PreparedPlotSeries { points, bounds }
+        PreparedPlotSeries {
+            points,
+            lightweight_points,
+            bounds,
+        }
     }
 
     fn prepare_summary_series(
@@ -3217,6 +9300,7 @@ impl ScopeApp {
     ) -> PreparedPlotSeries {
         let count = summary.min.len().min(summary.max.len()).min(channels.len());
         let mut points = Vec::with_capacity(count);
+        let mut lightweight_points = Vec::with_capacity(count);
         let mut bounds = Vec::with_capacity(count);
         let bin_count = summary.bin_start.len().min(summary.bin_end.len());
         for (out_index, channel_index) in channels.iter().take(count).enumerate() {
@@ -3227,26 +9311,47 @@ impl ScopeApp {
                 break;
             };
             let len = bin_count.min(mins.len()).min(maxes.len());
-            let mut envelope = Vec::with_capacity(len * 2);
+            let mut lower = Vec::with_capacity(len * 2);
+            let mut upper = Vec::with_capacity(len * 2);
             let mut min = f64::INFINITY;
             let mut max = f64::NEG_INFINITY;
             for i in 0..len {
-                let x = (summary.bin_start[i] + summary.bin_end[i]) * 0.5 + time_offset;
+                let x0 = summary.bin_start[i] + time_offset;
+                let x1 = summary.bin_end[i] + time_offset;
                 let (scaled_min, scaled_max) =
                     self.scaled_min_max(*channel_index, mins[i], maxes[i]);
-                if !x.is_finite() || !scaled_min.is_finite() || !scaled_max.is_finite() {
+                if !x0.is_finite()
+                    || !x1.is_finite()
+                    || x1 < x0
+                    || !scaled_min.is_finite()
+                    || !scaled_max.is_finite()
+                {
                     continue;
                 }
                 min = min.min(scaled_min);
                 max = max.max(scaled_max);
-                envelope.push(PlotPoint::new(x, scaled_min));
-                envelope.push(PlotPoint::new(x, scaled_max));
+                lower.push(PlotPoint::new(x0, scaled_min));
+                lower.push(PlotPoint::new(x1, scaled_min));
+                upper.push(PlotPoint::new(x0, scaled_max));
+                upper.push(PlotPoint::new(x1, scaled_max));
+            }
+            let mut envelope = Vec::with_capacity(lower.len() + upper.len() + 1);
+            envelope.extend(lower);
+            envelope.extend(upper.into_iter().rev());
+            if let Some(first) = envelope.first().copied() {
+                envelope.push(first);
             }
             let bounds_for_series = (min.is_finite() && max.is_finite()).then_some((min, max));
-            points.push(Arc::from(envelope));
+            let envelope: Arc<[PlotPoint]> = Arc::from(envelope);
+            lightweight_points.push(Self::lightweight_plot_points(&envelope));
+            points.push(envelope);
             bounds.push(bounds_for_series);
         }
-        PreparedPlotSeries { points, bounds }
+        PreparedPlotSeries {
+            points,
+            lightweight_points,
+            bounds,
+        }
     }
 
     fn prepare_derived_sample_series(
@@ -3257,6 +9362,7 @@ impl ScopeApp {
     ) -> PreparedPlotSeries {
         let count = block.channels.len().min(channels.len());
         let mut points = Vec::with_capacity(count);
+        let mut lightweight_points = Vec::with_capacity(count);
         let mut bounds = Vec::with_capacity(count);
         for derived_index in channels.iter().take(count) {
             let Some(values) = block.channels.get(*derived_index) else {
@@ -3277,10 +9383,16 @@ impl ScopeApp {
                 series.push(PlotPoint::new(x, y));
             }
             let bounds_for_series = (min.is_finite() && max.is_finite()).then_some((min, max));
-            points.push(Arc::from(series));
+            let series: Arc<[PlotPoint]> = Arc::from(series);
+            lightweight_points.push(Self::lightweight_plot_points(&series));
+            points.push(series);
             bounds.push(bounds_for_series);
         }
-        PreparedPlotSeries { points, bounds }
+        PreparedPlotSeries {
+            points,
+            lightweight_points,
+            bounds,
+        }
     }
 
     fn load_plot_data(
@@ -3288,12 +9400,15 @@ impl ScopeApp {
         start_time: f64,
         end_time: f64,
         channels: &[usize],
+        budget_series_count: usize,
+        plot_pixel_width: f32,
     ) -> Result<Option<PlotJobData>, String> {
         if channels.is_empty() || end_time <= start_time {
             return Ok(None);
         }
-        let max_points = Self::draw_points_per_channel(channels.len());
-        let summary_bins = Self::summary_bins_for_channels(channels.len());
+        let budget_series_count = budget_series_count.max(channels.len()).max(1);
+        let max_points = Self::draw_points_per_channel(budget_series_count);
+        let summary_bins = Self::summary_bins_for_channels(budget_series_count, plot_pixel_width);
         let estimated_points =
             ((end_time - start_time) * source.metadata().nominal_sample_rate_hz).max(0.0) as usize;
         if estimated_points > max_points {
@@ -3309,7 +9424,26 @@ impl ScopeApp {
         }
     }
 
-    fn apply_plot_job_data(&mut self, data: Option<PlotJobData>) {
+    #[cfg(test)]
+    pub(crate) fn perf_load_plot_data(
+        source: Arc<dyn DataSource>,
+        start_time: f64,
+        end_time: f64,
+        channels: &[usize],
+        budget_series_count: usize,
+    ) -> Result<bool, String> {
+        Self::load_plot_data(
+            source,
+            start_time,
+            end_time,
+            channels,
+            budget_series_count,
+            DEFAULT_PLOT_PIXEL_WIDTH,
+        )
+        .map(|data| data.is_some())
+    }
+
+    fn apply_plot_job_data(&mut self, data: Option<PlotJobData>, key: Option<PlotCacheKey>) {
         let selected = self.selected_channels();
         match data {
             Some(PlotJobData::Samples(block)) => {
@@ -3317,6 +9451,7 @@ impl ScopeApp {
                 self.plot_cache = block;
                 self.plot_summary = None;
                 self.prepared_plot_summary = None;
+                self.plot_cache_key = key;
             }
             Some(PlotJobData::Summary(summary)) => {
                 self.prepared_plot_summary =
@@ -3324,12 +9459,14 @@ impl ScopeApp {
                 self.plot_cache = SampleBlock::default();
                 self.prepared_plot_cache = PreparedPlotSeries::default();
                 self.plot_summary = Some(summary);
+                self.plot_cache_key = key;
             }
             None => {
                 self.plot_cache = SampleBlock::default();
                 self.plot_summary = None;
                 self.prepared_plot_cache = PreparedPlotSeries::default();
                 self.prepared_plot_summary = None;
+                self.plot_cache_key = None;
             }
         }
     }
@@ -3422,64 +9559,96 @@ impl ScopeApp {
     }
 
     fn poll_plot_worker(&mut self) {
-        let Some(worker) = self.plot_worker.take_if(|worker| worker.is_finished()) else {
+        let Some(joined) = Self::take_finished_job(&mut self.plot_worker, "Plot worker panicked.")
+        else {
             return;
         };
-        let Ok(result) = worker.join() else {
+        let Ok(result) = joined else {
             if !self.needs_plot_reload {
                 self.last_error = Some("Plot worker panicked.".to_owned());
             }
             return;
         };
-        if result.generation != self.data_generation || self.needs_plot_reload {
+        if !self.result_matches_generation(result.generation, self.needs_plot_reload) {
             return;
         }
         match result.result {
-            Ok(data) => self.apply_plot_job_data(data),
+            Ok(data) => self.apply_plot_job_data(data, Some(result.key)),
             Err(error) => self.last_error = Some(error),
         }
     }
 
-    fn reload_plot_cache(&mut self) {
+    fn reload_plot_cache(&mut self, plot_pixel_width: f32) {
         self.poll_plot_worker();
         if !self.needs_plot_reload || self.plot_worker.is_some() {
             return;
         }
         let Some(source) = self.source.clone() else {
-            self.apply_plot_job_data(None);
+            self.apply_plot_job_data(None, None);
             self.needs_plot_reload = false;
             return;
         };
         let channels = self.selected_channels();
         if channels.is_empty() {
-            self.apply_plot_job_data(None);
+            self.apply_plot_job_data(None, None);
             self.needs_plot_reload = false;
             return;
         }
         let generation = self.data_generation;
-        let start = self.view_start;
-        let end = self.view_end;
-        self.needs_plot_reload = false;
-        self.plot_worker = Some(thread::spawn(move || PlotJobResult {
+        let meta = source.metadata();
+        let start = self.view_start.max(meta.start_time);
+        let end = self.view_end.min(meta.end_time);
+        if end <= start {
+            self.apply_plot_job_data(None, None);
+            self.needs_plot_reload = false;
+            return;
+        }
+        let budget_series_count = self.plot_data_series_budget_count(&channels);
+        let key = self.plot_cache_key(
             generation,
-            result: Self::load_plot_data(source, start, end, &channels),
-        }));
+            start,
+            end,
+            &channels,
+            0.0,
+            plot_pixel_width,
+            budget_series_count,
+        );
+        if self.plot_cache_key.as_ref() == Some(&key) {
+            self.needs_plot_reload = false;
+            return;
+        }
+        self.needs_plot_reload = false;
+        let result_key = key.clone();
+        Self::spawn_job(&mut self.plot_worker, move || PlotJobResult {
+            generation,
+            key: result_key,
+            result: Self::worker_result("Plot worker panicked.", || {
+                Self::load_plot_data(
+                    source,
+                    start,
+                    end,
+                    &channels,
+                    budget_series_count,
+                    plot_pixel_width,
+                )
+            }),
+        });
     }
 
     fn poll_compare_plot_worker(&mut self) {
-        let Some(worker) = self
-            .compare_plot_worker
-            .take_if(|worker| worker.is_finished())
-        else {
+        let Some(joined) = Self::take_finished_job(
+            &mut self.compare_plot_worker,
+            "Compare plot worker panicked.",
+        ) else {
             return;
         };
-        let Ok(result) = worker.join() else {
+        let Ok(result) = joined else {
             if !self.needs_compare_plot_reload {
                 self.last_error = Some("Compare plot worker panicked.".to_owned());
             }
             return;
         };
-        if result.generation != self.data_generation || self.needs_compare_plot_reload {
+        if !self.result_matches_generation(result.generation, self.needs_compare_plot_reload) {
             return;
         }
         for dataset_result in result.datasets {
@@ -3494,6 +9663,7 @@ impl ScopeApp {
                         dataset.plot_summary = None;
                         dataset.prepared_plot_cache = prepared;
                         dataset.prepared_plot_summary = None;
+                        dataset.plot_cache_key = Some(dataset_result.key);
                     }
                 }
                 Ok(Some(PlotJobData::Summary(summary))) => {
@@ -3505,6 +9675,7 @@ impl ScopeApp {
                         dataset.plot_summary = Some(summary);
                         dataset.prepared_plot_cache = PreparedPlotSeries::default();
                         dataset.prepared_plot_summary = Some(prepared);
+                        dataset.plot_cache_key = Some(dataset_result.key);
                     }
                 }
                 Ok(None) => {
@@ -3513,6 +9684,7 @@ impl ScopeApp {
                         dataset.plot_summary = None;
                         dataset.prepared_plot_cache = PreparedPlotSeries::default();
                         dataset.prepared_plot_summary = None;
+                        dataset.plot_cache_key = None;
                     }
                 }
                 Err(error) => self.last_error = Some(error),
@@ -3520,71 +9692,151 @@ impl ScopeApp {
         }
     }
 
-    fn reload_compare_plot_cache(&mut self) {
+    fn reload_compare_plot_cache(&mut self, plot_pixel_width: f32) {
         self.poll_compare_plot_worker();
         if !self.needs_compare_plot_reload || self.compare_plot_worker.is_some() {
             return;
         }
         let sync_time_axes = self.sync_time_axes;
-        let inputs = self
+        let primary_channels = self.selected_channels();
+        let selected_inputs = self
             .imported_datasets
             .iter()
             .enumerate()
-            .map(|(index, dataset)| ComparePlotJobInput {
-                index,
-                source: dataset.source.clone(),
-                visible: dataset.visible.clone(),
-                offset: if sync_time_axes {
+            .map(|(index, dataset)| {
+                let offset = if sync_time_axes {
                     dataset.time_offset
                 } else {
                     0.0
-                },
+                };
+                (
+                    index,
+                    dataset.source.clone(),
+                    self.selected_imported_channels(index),
+                    offset,
+                )
             })
             .collect::<Vec<_>>();
+        let budget_series_count = primary_channels.len()
+            + selected_inputs
+                .iter()
+                .map(|(_, _, channels, _)| channels.len())
+                .sum::<usize>();
+        let generation = self.data_generation;
+        let view_start = self.view_start;
+        let view_end = self.view_end;
+        let mut inputs = Vec::new();
+        for (index, source, channels, offset) in selected_inputs {
+            if channels.is_empty() {
+                if let Some(dataset) = self.imported_datasets.get_mut(index) {
+                    dataset.plot_cache = SampleBlock::default();
+                    dataset.plot_summary = None;
+                    dataset.prepared_plot_cache = PreparedPlotSeries::default();
+                    dataset.prepared_plot_summary = None;
+                    dataset.plot_cache_key = None;
+                }
+                continue;
+            }
+            let meta = source.metadata();
+            let read_start = (view_start - offset).max(meta.start_time);
+            let read_end = (view_end - offset).min(meta.end_time);
+            if read_end <= read_start {
+                if let Some(dataset) = self.imported_datasets.get_mut(index) {
+                    dataset.plot_cache = SampleBlock::default();
+                    dataset.plot_summary = None;
+                    dataset.prepared_plot_cache = PreparedPlotSeries::default();
+                    dataset.prepared_plot_summary = None;
+                    dataset.plot_cache_key = None;
+                }
+                continue;
+            }
+            let key = self.plot_cache_key(
+                generation,
+                read_start,
+                read_end,
+                &channels,
+                offset,
+                plot_pixel_width,
+                budget_series_count,
+            );
+            if self
+                .imported_datasets
+                .get(index)
+                .is_some_and(|dataset| dataset.plot_cache_key.as_ref() == Some(&key))
+            {
+                continue;
+            }
+            inputs.push(ComparePlotJobInput {
+                index,
+                source,
+                channels,
+                offset,
+                key,
+            });
+        }
         if inputs.is_empty() {
             self.needs_compare_plot_reload = false;
             return;
         }
-        let generation = self.data_generation;
-        let view_start = self.view_start;
-        let view_end = self.view_end;
+        let input_error_keys = inputs
+            .iter()
+            .map(|input| (input.index, input.key.clone()))
+            .collect::<Vec<_>>();
         self.needs_compare_plot_reload = false;
-        self.compare_plot_worker = Some(thread::spawn(move || {
-            let datasets = inputs
-                .into_iter()
-                .map(|input| {
-                    let compare_count = input.source.metadata().channels.len();
-                    let channels = input
-                        .visible
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(channel, visible)| {
-                            (*visible && channel < compare_count).then_some(channel)
+        Self::spawn_job(&mut self.compare_plot_worker, move || {
+            let datasets = match panic::catch_unwind(AssertUnwindSafe(|| {
+                inputs
+                    .into_iter()
+                    .map(|input| {
+                        let ComparePlotJobInput {
+                            index,
+                            source,
+                            channels,
+                            offset,
+                            key,
+                        } = input;
+                        let result = Self::worker_result("Compare plot worker panicked.", || {
+                            if channels.is_empty() {
+                                return Ok(None);
+                            }
+                            let meta = source.metadata();
+                            let read_start = (view_start - offset).max(meta.start_time);
+                            let read_end = (view_end - offset).min(meta.end_time);
+                            if read_end <= read_start {
+                                return Ok(None);
+                            }
+                            Self::load_plot_data(
+                                source,
+                                read_start,
+                                read_end,
+                                &channels,
+                                budget_series_count,
+                                plot_pixel_width,
+                            )
+                        });
+                        CompareDatasetJobResult { index, key, result }
+                    })
+                    .collect::<Vec<_>>()
+            })) {
+                Ok(datasets) => datasets,
+                Err(payload) => {
+                    let error =
+                        Self::recover_worker_panic("Compare plot worker panicked.", payload);
+                    input_error_keys
+                        .into_iter()
+                        .map(|(index, key)| CompareDatasetJobResult {
+                            index,
+                            key,
+                            result: Err(error.clone()),
                         })
-                        .collect::<Vec<_>>();
-                    let result = if channels.is_empty() {
-                        Ok(None)
-                    } else {
-                        let meta = input.source.metadata();
-                        let read_start = (view_start - input.offset).max(meta.start_time);
-                        let read_end = (view_end - input.offset).min(meta.end_time);
-                        if read_end <= read_start {
-                            Ok(None)
-                        } else {
-                            Self::load_plot_data(input.source, read_start, read_end, &channels)
-                        }
-                    };
-                    CompareDatasetJobResult {
-                        index: input.index,
-                        result,
-                    }
-                })
-                .collect();
+                        .collect()
+                }
+            };
             ComparePlotJobResult {
                 generation,
                 datasets,
             }
-        }));
+        });
     }
 
     fn dataset_read_request_for_range(
@@ -3627,14 +9879,13 @@ impl ScopeApp {
     }
 
     fn poll_derived_curve_worker(&mut self, expected_key: &DerivedJobKey) {
-        let Some(worker) = self
-            .derived_curve_worker
-            .take_if(|worker| worker.is_finished())
+        let Some(joined) =
+            Self::take_finished_job(&mut self.derived_curve_worker, "PLL/dq0 worker panicked.")
         else {
             return;
         };
         self.derived_curve_worker_key = None;
-        let Ok(result) = worker.join() else {
+        let Ok(result) = joined else {
             self.derived_curve_cache = Some(DerivedCurveCache {
                 dataset_index: expected_key.dataset_index,
                 start: expected_key.start,
@@ -3643,6 +9894,7 @@ impl ScopeApp {
                 dq_channels: expected_key.dq_channels,
             });
             self.prepared_derived_curve_cache = PreparedPlotSeries::default();
+            self.last_error = Some("PLL/dq0 worker panicked.".to_owned());
             return;
         };
         let result_key = DerivedJobKey {
@@ -3700,24 +9952,29 @@ impl ScopeApp {
         let harmonic_base_hz = self.harmonic_base_hz.max(0.001);
         let skip_digital_by_samples =
             self.dataset_kind_by_index(key.dataset_index) != Some(SourceKind::Cloud);
-        let max_points = Self::draw_points_per_channel(self.selected_derived_channels().len());
+        let visible_primary = self.selected_channels();
+        let max_points = Self::draw_points_per_channel(
+            self.plot_data_series_budget_count(&visible_primary).max(1),
+        );
         let generation = key.generation;
         self.derived_curve_worker_key = Some(key.clone());
         self.needs_derived_reload = false;
-        self.derived_curve_worker = Some(thread::spawn(move || {
-            let result = Self::load_derived_data(
-                source,
-                read_start,
-                read_end,
-                key.pll_channels,
-                key.dq_channels,
-                pll_scales,
-                dq_scales,
-                sample_rate_hz,
-                harmonic_base_hz,
-                skip_digital_by_samples,
-                max_points,
-            );
+        Self::spawn_job(&mut self.derived_curve_worker, move || {
+            let result = Self::worker_result("PLL/dq0 worker panicked.", || {
+                Self::load_derived_data(
+                    source,
+                    read_start,
+                    read_end,
+                    key.pll_channels,
+                    key.dq_channels,
+                    pll_scales,
+                    dq_scales,
+                    sample_rate_hz,
+                    harmonic_base_hz,
+                    skip_digital_by_samples,
+                    max_points,
+                )
+            });
             DerivedCurveJobResult {
                 generation,
                 dataset_index: key.dataset_index,
@@ -3727,7 +9984,7 @@ impl ScopeApp {
                 dq_channels: key.dq_channels,
                 result,
             }
-        }));
+        });
     }
 
     fn reload_derived_curve_cache(&mut self) {
@@ -3795,14 +10052,19 @@ impl ScopeApp {
         pane_index: usize,
         pane_count: usize,
     ) -> bool {
-        pane_count <= 1
-            || self
-                .channel_panes
+        self.channel_scope_pane(channel_index, pane_count) == pane_index
+    }
+
+    fn channel_scope_pane(&self, channel_index: usize, pane_count: usize) -> usize {
+        if pane_count <= 1 {
+            0
+        } else {
+            self.channel_panes
                 .get(channel_index)
                 .copied()
                 .unwrap_or(0)
                 .min(pane_count.saturating_sub(1))
-                == pane_index
+        }
     }
 
     fn defer_plot_reload(&mut self) {
@@ -3823,6 +10085,11 @@ impl ScopeApp {
             self.plot_reload_deferred_until = None;
             true
         }
+    }
+
+    fn plot_interaction_debounce_active(&self) -> bool {
+        self.plot_reload_deferred_until
+            .is_some_and(|deadline| Instant::now() < deadline)
     }
 
     fn zoom(&mut self, center: f64, factor: f64) {
@@ -3875,110 +10142,132 @@ impl ScopeApp {
         }
     }
 
-    fn current_y_bounds_for(
-        &self,
-        selected: &[usize],
-        pane_index: usize,
-        pane_count: usize,
-    ) -> (f64, f64) {
-        if pane_count <= 1 {
-            if let (Some(min), Some(max)) = (self.y_min, self.y_max) {
-                if min.is_finite() && max.is_finite() && max > min {
-                    return (min, max);
-                }
-            }
-        } else if let Some(Some((min, max))) = self.pane_y_bounds.get(pane_index) {
-            if min.is_finite() && max.is_finite() && max > min {
-                return (*min, *max);
-            }
-        }
+    fn add_bounds(accum: &mut (f64, f64), bounds: Option<(f64, f64)>) {
+        let Some((series_min, series_max)) = bounds else {
+            return;
+        };
+        let (min, max) = accum;
+        *min = min.min(series_min);
+        *max = max.max(series_max);
+    }
 
-        let mut min = f64::INFINITY;
-        let mut max = f64::NEG_INFINITY;
-        if let Some(summary) = &self.prepared_plot_summary {
-            for (out_index, channel_index) in selected.iter().enumerate() {
-                if !self.channel_in_scope_pane(*channel_index, pane_index, pane_count) {
-                    continue;
-                }
-                if let Some((series_min, series_max)) =
-                    summary.bounds.get(out_index).copied().flatten()
-                {
-                    min = min.min(series_min);
-                    max = max.max(series_max);
-                }
-            }
-        } else {
-            for (out_index, channel_index) in selected.iter().enumerate() {
-                if !self.channel_in_scope_pane(*channel_index, pane_index, pane_count) {
-                    continue;
-                }
-                if let Some((series_min, series_max)) = self
-                    .prepared_plot_cache
-                    .bounds
-                    .get(out_index)
-                    .copied()
-                    .flatten()
-                {
-                    min = min.min(series_min);
-                    max = max.max(series_max);
-                }
-            }
-        }
-
-        for (dataset_index, dataset) in self.imported_datasets.iter().enumerate() {
-            let compare_selected = self.selected_imported_channels(dataset_index);
-            if let Some(summary) = &dataset.prepared_plot_summary {
-                for (out_index, channel_index) in compare_selected.iter().enumerate() {
-                    if !self.channel_in_scope_pane(*channel_index, pane_index, pane_count) {
-                        continue;
-                    }
-                    if let Some((series_min, series_max)) =
-                        summary.bounds.get(out_index).copied().flatten()
-                    {
-                        min = min.min(series_min);
-                        max = max.max(series_max);
-                    }
-                }
-            } else {
-                for (out_index, channel_index) in compare_selected.iter().enumerate() {
-                    if !self.channel_in_scope_pane(*channel_index, pane_index, pane_count) {
-                        continue;
-                    }
-                    if let Some((series_min, series_max)) = dataset
-                        .prepared_plot_cache
-                        .bounds
-                        .get(out_index)
-                        .copied()
-                        .flatten()
-                    {
-                        min = min.min(series_min);
-                        max = max.max(series_max);
-                    }
-                }
-            }
-        }
-
-        for (out_index, derived_index) in self.selected_derived_channels().iter().enumerate() {
-            if !self.derived_in_scope_pane(*derived_index, pane_index, pane_count) {
-                continue;
-            }
-            if let Some((series_min, series_max)) = self
-                .prepared_derived_curve_cache
-                .bounds
-                .get(out_index)
-                .copied()
-                .flatten()
-            {
-                min = min.min(series_min);
-                max = max.max(series_max);
-            }
-        }
-
+    fn finalize_y_bounds(min: f64, max: f64) -> (f64, f64) {
         if !min.is_finite() || !max.is_finite() || max <= min {
             return (-1.0, 1.0);
         }
         let padding = ((max - min) * 0.08).max(f64::EPSILON);
         (min - padding, max + padding)
+    }
+
+    fn current_y_bounds_for_panes(
+        &self,
+        pane_selections: &[PanePlotSelections],
+        pane_count: usize,
+    ) -> Vec<(f64, f64)> {
+        if pane_count <= 1 {
+            if let (Some(min), Some(max)) = (self.y_min, self.y_max) {
+                if min.is_finite() && max.is_finite() && max > min {
+                    return vec![(min, max)];
+                }
+            }
+        }
+
+        let mut accum = vec![(f64::INFINITY, f64::NEG_INFINITY); pane_count.max(1)];
+        if let Some(summary) = &self.prepared_plot_summary {
+            for (pane_index, pane) in pane_selections.iter().enumerate() {
+                for (out_index, _) in &pane.primary {
+                    if let Some(accum) = accum.get_mut(pane_index) {
+                        Self::add_bounds(accum, summary.bounds.get(*out_index).copied().flatten());
+                    }
+                }
+            }
+        } else {
+            for (pane_index, pane) in pane_selections.iter().enumerate() {
+                for (out_index, _) in &pane.primary {
+                    if let Some(accum) = accum.get_mut(pane_index) {
+                        Self::add_bounds(
+                            accum,
+                            self.prepared_plot_cache
+                                .bounds
+                                .get(*out_index)
+                                .copied()
+                                .flatten(),
+                        );
+                    }
+                }
+            }
+        }
+
+        for (dataset_index, dataset) in self.imported_datasets.iter().enumerate() {
+            if let Some(summary) = &dataset.prepared_plot_summary {
+                for (pane_index, pane) in pane_selections.iter().enumerate() {
+                    let compare_selected = pane
+                        .imported
+                        .get(dataset_index)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    for (out_index, _) in compare_selected {
+                        if let Some(accum) = accum.get_mut(pane_index) {
+                            Self::add_bounds(
+                                accum,
+                                summary.bounds.get(*out_index).copied().flatten(),
+                            );
+                        }
+                    }
+                }
+            } else {
+                for (pane_index, pane) in pane_selections.iter().enumerate() {
+                    let compare_selected = pane
+                        .imported
+                        .get(dataset_index)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    for (out_index, _) in compare_selected {
+                        if let Some(accum) = accum.get_mut(pane_index) {
+                            Self::add_bounds(
+                                accum,
+                                dataset
+                                    .prepared_plot_cache
+                                    .bounds
+                                    .get(*out_index)
+                                    .copied()
+                                    .flatten(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        for (pane_index, pane) in pane_selections.iter().enumerate() {
+            for (out_index, _) in &pane.derived {
+                if let Some(accum) = accum.get_mut(pane_index) {
+                    Self::add_bounds(
+                        accum,
+                        self.prepared_derived_curve_cache
+                            .bounds
+                            .get(*out_index)
+                            .copied()
+                            .flatten(),
+                    );
+                }
+            }
+        }
+
+        let mut bounds = accum
+            .into_iter()
+            .map(|(min, max)| Self::finalize_y_bounds(min, max))
+            .collect::<Vec<_>>();
+        if pane_count > 1 {
+            for (pane_index, bound) in bounds.iter_mut().enumerate() {
+                if let Some(Some((min, max))) = self.pane_y_bounds.get(pane_index) {
+                    if min.is_finite() && max.is_finite() && max > min {
+                        *bound = (*min, *max);
+                    }
+                }
+            }
+        }
+        bounds
     }
 
     fn pan(&mut self, delta_time: f64) {
@@ -4214,7 +10503,9 @@ impl ScopeApp {
         self.fft_results = next_fft;
         self.needs_fft_reload = false;
         if let Some(error) = next_error {
-            self.last_error = Some(error);
+            if !Self::is_nonfatal_fft_message(&error) {
+                self.last_error = Some(error);
+            }
         } else if self
             .last_error
             .as_deref()
@@ -4282,52 +10573,55 @@ impl ScopeApp {
 
         let generation = self.data_generation;
         self.needs_fft_reload = false;
-        self.fft_worker = Some(thread::spawn(move || {
-            let result = source
-                .read_range(read_start, read_end, &[fft_channel], MAX_FFT_POINTS)
-                .map_err(|error| error.to_string())
-                .and_then(|block| {
-                    let Some(samples) = block.channels.first() else {
-                        return Ok(Vec::new());
-                    };
-                    if skip_digital_by_samples && Self::samples_look_digital(samples) {
-                        return Err("Selected channel is digital, so FFT is skipped.".to_owned());
-                    }
-                    let scaled_samples =
-                        if (channel_scale - DEFAULT_CHANNEL_SCALE).abs() <= f32::EPSILON {
-                            samples.to_vec()
-                        } else {
-                            samples
-                                .iter()
-                                .map(|sample| *sample * channel_scale)
-                                .collect()
+        Self::spawn_job(&mut self.fft_worker, move || {
+            let result = Self::worker_result("FFT worker panicked.", || {
+                source
+                    .read_range(read_start, read_end, &[fft_channel], MAX_FFT_POINTS)
+                    .map_err(|error| error.to_string())
+                    .and_then(|block| {
+                        let Some(samples) = block.channels.first() else {
+                            return Ok(Vec::new());
                         };
-                    Ok(fft::analyze(
-                        channel_name,
-                        &scaled_samples,
-                        sample_rate_hz,
-                        harmonic_base_hz,
-                        10,
-                    )
-                    .map(|result| vec![(fft_channel, result)])
-                    .unwrap_or_default())
-                });
+                        if skip_digital_by_samples && Self::samples_look_digital(samples) {
+                            return Ok(Vec::new());
+                        }
+                        let scaled_samples =
+                            if (channel_scale - DEFAULT_CHANNEL_SCALE).abs() <= f32::EPSILON {
+                                samples.to_vec()
+                            } else {
+                                samples
+                                    .iter()
+                                    .map(|sample| *sample * channel_scale)
+                                    .collect()
+                            };
+                        Ok(fft::analyze(
+                            channel_name,
+                            &scaled_samples,
+                            sample_rate_hz,
+                            harmonic_base_hz,
+                            10,
+                        )
+                        .map(|result| vec![(fft_channel, result)])
+                        .unwrap_or_default())
+                    })
+            });
             FftJobResult { generation, result }
-        }));
+        });
         true
     }
 
     fn poll_fft_worker(&mut self) {
-        let Some(worker) = self.fft_worker.take_if(|worker| worker.is_finished()) else {
+        let Some(joined) = Self::take_finished_job(&mut self.fft_worker, "FFT worker panicked.")
+        else {
             return;
         };
-        let Ok(result) = worker.join() else {
+        let Ok(result) = joined else {
             if !self.needs_fft_reload {
                 self.last_error = Some("FFT worker panicked.".to_owned());
             }
             return;
         };
-        if result.generation != self.data_generation || self.needs_fft_reload {
+        if !self.result_matches_generation(result.generation, self.needs_fft_reload) {
             return;
         }
         match result.result {
@@ -4343,9 +10637,18 @@ impl ScopeApp {
             }
             Err(error) => {
                 self.fft_results.clear();
-                self.last_error = Some(error);
+                if !Self::is_nonfatal_fft_message(&error) {
+                    self.last_error = Some(error);
+                }
             }
         }
+    }
+
+    fn is_nonfatal_fft_message(message: &str) -> bool {
+        message.contains("FFT needs at least 16 samples")
+            || message.contains("Selected channel is digital")
+            || message.contains("已跳过 FFT")
+            || message.contains("至少 16")
     }
 
     fn analysis_read_request(
@@ -4385,7 +10688,7 @@ impl ScopeApp {
         let dataset_index = self.selected_fft_dataset_index();
         let block = self
             .read_analysis_range(dataset_index, &self.sequence_channels, MAX_FFT_POINTS)
-            .ok_or_else(|| self.tr("未加载数据。", "No data loaded.").to_owned())?
+            .ok_or_else(|| self.t(UiText::NoDataLoaded).to_owned())?
             .map_err(|error| error.to_string())?;
         if block.channels.len() < 3 {
             return Err(self
@@ -4492,14 +10795,19 @@ impl ScopeApp {
         pane_index: usize,
         pane_count: usize,
     ) -> bool {
-        pane_count <= 1
-            || self
-                .derived_panes
+        self.derived_scope_pane(derived_index, pane_count) == pane_index
+    }
+
+    fn derived_scope_pane(&self, derived_index: usize, pane_count: usize) -> usize {
+        if pane_count <= 1 {
+            0
+        } else {
+            self.derived_panes
                 .get(derived_index)
                 .copied()
                 .unwrap_or(0)
                 .min(pane_count.saturating_sub(1))
-                == pane_index
+        }
     }
 
     fn selected_derived_channels(&self) -> Vec<usize> {
@@ -4584,6 +10892,42 @@ impl ScopeApp {
         count
     }
 
+    fn pane_has_dataset_comparison(
+        &self,
+        selections: &PanePlotSelections,
+        pane_index: usize,
+        pane_count: usize,
+    ) -> bool {
+        selections.primary.iter().any(|(_, channel_index)| {
+            self.pane_dataset_count_for_channel(*channel_index, pane_index, pane_count) > 1
+        }) || selections.imported.iter().any(|channels| {
+            channels.iter().any(|(_, channel_index)| {
+                self.pane_dataset_count_for_channel(*channel_index, pane_index, pane_count) > 1
+            })
+        })
+    }
+
+    fn plot_legend_name(
+        &self,
+        dataset_index: usize,
+        channel_name: &str,
+        show_dataset_prefix: bool,
+        suffix: Option<&str>,
+    ) -> String {
+        let base = if show_dataset_prefix {
+            format!(
+                "{}: {channel_name}",
+                self.dataset_short_label(dataset_index)
+            )
+        } else {
+            channel_name.to_owned()
+        };
+        match suffix {
+            Some(suffix) if !suffix.is_empty() => format!("{base} {suffix}"),
+            _ => base,
+        }
+    }
+
     fn plot_channel_color(
         &self,
         channel_index: usize,
@@ -4597,6 +10941,27 @@ impl ScopeApp {
         } else {
             base
         }
+    }
+
+    fn sidebar_channel_color(&self, channel_index: usize, dataset_index: usize) -> Color32 {
+        let pane_count = self.scope_pane_count();
+        let pane_index = self.channel_scope_pane(channel_index, pane_count);
+        self.plot_channel_color(channel_index, dataset_index, pane_index, pane_count)
+    }
+
+    fn color_swatch(ui: &mut egui::Ui, color: Color32) -> egui::Response {
+        let size = egui::vec2(48.0, ui.spacing().interact_size.y);
+        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+        if ui.is_rect_visible(rect) {
+            let rounding = egui::Rounding::same(3.0);
+            ui.painter().rect_filled(rect.shrink(2.0), rounding, color);
+            ui.painter().rect_stroke(
+                rect.shrink(2.0),
+                rounding,
+                Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
+            );
+        }
+        response
     }
 
     fn channel_line_width(&self, index: usize) -> f32 {
@@ -4632,12 +10997,10 @@ impl ScopeApp {
         if dataset_index == 0 {
             if self.line_patterns.iter().any(|current| *current != pattern) {
                 self.line_patterns.fill(pattern);
-                self.needs_plot_reload = true;
             }
         } else if let Some(dataset) = self.imported_datasets.get_mut(dataset_index - 1) {
             if dataset.line_pattern != pattern {
                 dataset.line_pattern = pattern;
-                self.needs_compare_plot_reload = true;
             }
         }
     }
@@ -4746,6 +11109,8 @@ impl ScopeApp {
         }
     }
 
+    // Compatibility helper for long explanatory text and transitional messages.
+    // New short UI labels should be added to UiText and accessed through self.t(...).
     fn tr(&self, zh: &'static str, en: &'static str) -> &'static str {
         match self.language {
             Language::Zh => {
@@ -4759,8 +11124,52 @@ impl ScopeApp {
         }
     }
 
-    fn icon_label(_icon: &str, label: &str) -> String {
-        label.to_owned()
+    fn t(&self, text: UiText) -> &'static str {
+        text.get(self.language)
+    }
+
+    fn icon_label(icon: &str, label: &str) -> String {
+        let icon = match icon {
+            "\u{E8E5}" => "+",
+            "\u{EDE1}" => "^",
+            "\u{E91B}" => "□",
+            "\u{E823}" => "≡",
+            "\u{E74D}" => "×",
+            "\u{E80A}" => "▦",
+            "\u{E890}" => "◎",
+            "\u{E72C}" => "↺",
+            "\u{E9A6}" => "↔",
+            "\u{E9D2}" => "Y",
+            "\u{E713}" => "⚙",
+            "\u{E897}" => "?",
+            "\u{E783}" => "!",
+            _ => icon,
+        };
+        format!("{icon} {label}")
+    }
+
+    fn fixed_grid_label(
+        ui: &mut egui::Ui,
+        width: f32,
+        text: impl Into<egui::WidgetText>,
+        right_aligned: bool,
+        truncate: bool,
+    ) -> egui::Response {
+        let mut label = egui::Label::new(text);
+        if truncate {
+            label = label.truncate(true);
+        }
+        let layout = if right_aligned {
+            egui::Layout::right_to_left(egui::Align::Center)
+        } else {
+            egui::Layout::left_to_right(egui::Align::Center)
+        };
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, ui.spacing().interact_size.y),
+            layout,
+            |ui| ui.add(label),
+        )
+        .inner
     }
 
     fn error_banner(&mut self, ctx: &egui::Context) {
@@ -4784,19 +11193,16 @@ impl ScopeApp {
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(
-                                RichText::new(Self::icon_label(
-                                    "\u{E783}",
-                                    self.tr("错误", "Error"),
-                                ))
-                                .strong()
-                                .color(Color32::from_rgb(255, 80, 88)),
+                                RichText::new(Self::icon_label("\u{E783}", self.t(UiText::Error)))
+                                    .strong()
+                                    .color(Color32::from_rgb(255, 80, 88)),
                             );
                             ui.separator();
                             ui.label(RichText::new(self.localized_error_message(&error)).strong());
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.button(self.tr("关闭", "Dismiss")).clicked() {
+                                    if ui.button(self.t(UiText::Dismiss)).clicked() {
                                         dismiss = true;
                                     }
                                 },
@@ -4965,6 +11371,25 @@ impl ScopeApp {
         if self.language != Language::Zh {
             return message.to_owned();
         }
+        if message.contains('\n') {
+            return message
+                .lines()
+                .map(|line| self.localized_error_message(line))
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        if message == "Data import is already running." {
+            return "数据正在导入中，请稍后再试。".to_owned();
+        }
+        if message == "PLL/dq0 worker panicked." {
+            return "PLL/dq0 计算任务异常退出。".to_owned();
+        }
+        if message == "PLL/dq0 only supports analog channels." {
+            return "PLL/dq0 仅支持模拟量通道。".to_owned();
+        }
+        if message == "PLL/dq0 needs six source channel reads." {
+            return "PLL/dq0 需要读取六路源通道。".to_owned();
+        }
         match message {
             "Import data first." => "请先导入数据。".to_owned(),
             "Select at least one waveform data file." => "请选择至少一个波形数据文件。".to_owned(),
@@ -4989,21 +11414,38 @@ impl ScopeApp {
             "Sequence analysis needs at least 16 samples in the cursor range." => {
                 "正负序分析需要光标区间内至少 16 个采样点。".to_owned()
             }
-            _ => message.to_owned(),
+            _ => self.localized_unknown_error_message(message),
+        }
+    }
+
+    fn localized_unknown_error_message(&self, message: &str) -> String {
+        if message.contains("Unsupported waveform file extension") {
+            "不支持该波形文件格式，请选择 .csv 或 .dat 文件。".to_owned()
+        } else if message.contains("Empty CSV") {
+            "CSV 文件为空，缺少表头或数据。".to_owned()
+        } else if message.contains("No such file")
+            || message.contains("cannot find")
+            || message.contains("系统找不到")
+        {
+            format!("文件无法打开，请检查路径是否存在。详情：{message}")
+        } else if message.contains("worker panicked") {
+            format!("后台任务异常退出，软件已拦截并继续运行。详情：{message}")
+        } else {
+            format!("操作失败，请检查数据文件或参数。详情：{message}")
         }
     }
 
     fn scope_layout_menu(&mut self, ui: &mut egui::Ui) {
-        ui.strong(self.tr("示波器布局", "Scope Layout"));
+        ui.strong(self.t(UiText::ScopeLayout));
         ui.horizontal(|ui| {
-            ui.label(self.tr("纵向", "Rows"));
+            ui.label(self.t(UiText::Rows));
             ui.add(
                 egui::Slider::new(&mut self.scope_layout_rows, 1..=MAX_SCOPE_LAYOUT_ROWS)
                     .show_value(true),
             );
         });
         ui.horizontal(|ui| {
-            ui.label(self.tr("横向", "Columns"));
+            ui.label(self.t(UiText::Columns));
             ui.add(
                 egui::Slider::new(&mut self.scope_layout_cols, 1..=MAX_SCOPE_LAYOUT_COLS)
                     .show_value(true),
@@ -5018,15 +11460,12 @@ impl ScopeApp {
         ui.separator();
         ui.label(format!(
             "{}: {}",
-            self.tr("当前示波器", "Active Pane"),
+            self.t(UiText::ActivePane),
             self.current_scope_pane() + 1
         ));
-        ui.label(self.tr(
-            "请先点击一个示波器子窗口，再勾选变量，变量会放入该子窗口。",
-            "Click a scope pane first, then check variables to place them there.",
-        ));
+        ui.label(self.t(UiText::PaneSelectHint));
         ui.separator();
-        ui.label(self.tr("快速选择", "Quick Select"));
+        ui.label(self.t(UiText::QuickSelect));
         egui::Grid::new("scope_layout_picker")
             .spacing([2.0, 2.0])
             .show(ui, |ui| {
@@ -5060,7 +11499,7 @@ impl ScopeApp {
                 "{} x {}",
                 self.scope_layout_rows, self.scope_layout_cols
             ));
-            if ui.button(self.tr("单栏", "Single")).clicked() {
+            if ui.button(self.t(UiText::Single)).clicked() {
                 self.scope_layout_rows = 1;
                 self.scope_layout_cols = 1;
                 self.active_scope_pane = 0;
@@ -5074,8 +11513,7 @@ impl ScopeApp {
         filter_terms: &[String],
         hovered_channel: &mut Option<usize>,
     ) {
-        let delete_group_label =
-            Self::icon_label("\u{E74D}", self.tr("删除数据组", "Delete Dataset"));
+        let delete_group_label = Self::icon_label("\u{E74D}", self.t(UiText::DeleteDataset));
         let mut delete_group = None;
         let primary_header = self.dataset_label(0);
         let primary_meta = self.meta().cloned();
@@ -5089,36 +11527,7 @@ impl ScopeApp {
             });
         let mut delete_primary = false;
         primary_response.header_response.context_menu(|ui| {
-            ui.strong(self.tr("数据组设置", "Dataset Settings"));
-            let mut all_visible = self.dataset_all_channels_visible(0);
-            if ui
-                .checkbox(&mut all_visible, self.tr("全选通道", "Select All Channels"))
-                .changed()
-            {
-                self.set_dataset_all_channels_visible(0, all_visible);
-            }
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label(self.tr("线型", "Line style"));
-                let mut pattern = self.dataset_line_pattern(0);
-                egui::ComboBox::from_id_source(("dataset_line_pattern", 0usize))
-                    .selected_text(pattern.label(self.language))
-                    .show_ui(ui, |ui| {
-                        for candidate in ChannelLinePattern::ALL {
-                            ui.selectable_value(
-                                &mut pattern,
-                                candidate,
-                                candidate.label(self.language),
-                            );
-                        }
-                    });
-                self.set_dataset_line_pattern(0, pattern);
-            });
-            ui.separator();
-            if ui.button(delete_group_label.clone()).clicked() {
-                delete_primary = true;
-                ui.close_menu();
-            }
+            self.dataset_context_menu(ui, 0, delete_group_label.as_str(), &mut delete_primary);
         });
         if delete_primary {
             delete_group = Some(0);
@@ -5143,37 +11552,12 @@ impl ScopeApp {
                 });
             let mut delete_this = false;
             response.header_response.context_menu(|ui| {
-                ui.strong(self.tr("数据组设置", "Dataset Settings"));
-                let dataset_index = index + 1;
-                let mut all_visible = self.dataset_all_channels_visible(dataset_index);
-                if ui
-                    .checkbox(&mut all_visible, self.tr("全选通道", "Select All Channels"))
-                    .changed()
-                {
-                    self.set_dataset_all_channels_visible(dataset_index, all_visible);
-                }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label(self.tr("线型", "Line style"));
-                    let mut pattern = self.dataset_line_pattern(dataset_index);
-                    egui::ComboBox::from_id_source(("dataset_line_pattern", dataset_index))
-                        .selected_text(pattern.label(self.language))
-                        .show_ui(ui, |ui| {
-                            for candidate in ChannelLinePattern::ALL {
-                                ui.selectable_value(
-                                    &mut pattern,
-                                    candidate,
-                                    candidate.label(self.language),
-                                );
-                            }
-                        });
-                    self.set_dataset_line_pattern(dataset_index, pattern);
-                });
-                ui.separator();
-                if ui.button(delete_group_label.clone()).clicked() {
-                    delete_this = true;
-                    ui.close_menu();
-                }
+                self.dataset_context_menu(
+                    ui,
+                    index + 1,
+                    delete_group_label.as_str(),
+                    &mut delete_this,
+                );
             });
             if delete_this {
                 delete_group = Some(index + 1);
@@ -5185,6 +11569,70 @@ impl ScopeApp {
         }
     }
 
+    fn dataset_context_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        dataset_index: usize,
+        delete_group_label: &str,
+        delete_requested: &mut bool,
+    ) {
+        ui.strong(self.t(UiText::DatasetSettings));
+        ui.horizontal(|ui| {
+            ui.label(self.t(UiText::DatasetName));
+            if dataset_index == 0 {
+                ui.text_edit_singleline(&mut self.primary_dataset_name);
+            } else if let Some(dataset) = self.imported_datasets.get_mut(dataset_index - 1) {
+                ui.text_edit_singleline(&mut dataset.display_name);
+            }
+        });
+        ui.separator();
+
+        let mut all_visible = self.dataset_all_channels_visible(dataset_index);
+        if ui
+            .checkbox(&mut all_visible, self.t(UiText::SelectAllChannels))
+            .changed()
+        {
+            self.set_dataset_all_channels_visible(dataset_index, all_visible);
+        }
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.label(self.t(UiText::LineStyle));
+            let mut pattern = self.dataset_line_pattern(dataset_index);
+            egui::ComboBox::from_id_source(("dataset_line_pattern", dataset_index))
+                .selected_text(pattern.label(self.language))
+                .show_ui(ui, |ui| {
+                    for candidate in ChannelLinePattern::ALL {
+                        ui.selectable_value(
+                            &mut pattern,
+                            candidate,
+                            candidate.label(self.language),
+                        );
+                    }
+                });
+            self.set_dataset_line_pattern(dataset_index, pattern);
+        });
+        ui.separator();
+
+        let mut selected_for_delete = self.dataset_selected_for_delete(dataset_index);
+        if ui
+            .checkbox(&mut selected_for_delete, self.t(UiText::MarkForDeletion))
+            .changed()
+        {
+            self.set_dataset_selected_for_delete(dataset_index, selected_for_delete);
+        }
+        if self.any_dataset_selected_for_delete()
+            && ui.button(self.t(UiText::DeleteSelectedDatasets)).clicked()
+        {
+            self.delete_selected_datasets();
+            ui.close_menu();
+        }
+        if ui.button(delete_group_label).clicked() {
+            *delete_requested = true;
+            ui.close_menu();
+        }
+    }
+
     fn channel_sections_ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -5193,7 +11641,7 @@ impl ScopeApp {
         filter_terms: &[String],
         hovered_channel: &mut Option<usize>,
     ) {
-        let source_label = self.tr("原始", "src");
+        let source_label = self.t(UiText::Source);
         let mut entries = Vec::new();
         let source_kind = self.dataset_kind_by_index(dataset_index);
 
@@ -5229,7 +11677,7 @@ impl ScopeApp {
             self.channel_section_ui(
                 ui,
                 dataset_index,
-                self.tr("模拟量", "Analog"),
+                self.t(UiText::Analog),
                 true,
                 &analog_entries,
                 source_label,
@@ -5238,7 +11686,7 @@ impl ScopeApp {
             self.channel_section_ui(
                 ui,
                 dataset_index,
-                self.tr("数字量", "Digital"),
+                self.t(UiText::Digital),
                 false,
                 &digital_entries,
                 source_label,
@@ -5248,7 +11696,7 @@ impl ScopeApp {
         }
 
         if entries.is_empty() {
-            ui.label(self.tr("没有匹配的通道。", "No matching channels."));
+            ui.label(self.t(UiText::NoMatchingChannels));
             return;
         }
         for (channel, display_name) in &entries {
@@ -5279,7 +11727,7 @@ impl ScopeApp {
             .default_open(default_open)
             .show(ui, |ui| {
                 if entries.is_empty() {
-                    ui.label(self.tr("没有匹配的通道。", "No matching channels."));
+                    ui.label(self.t(UiText::NoMatchingChannels));
                     return;
                 }
                 for (channel, display_name) in entries {
@@ -5291,18 +11739,16 @@ impl ScopeApp {
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.spacing_mut().button_padding.x = 6.0;
+        ui.horizontal_wrapped(|ui| {
             ui.menu_button(
-                Self::icon_label("\u{E8E5}", self.tr("导入数据", "Import Data")),
+                Self::icon_label("\u{E8E5}", self.t(UiText::ImportData)),
                 |ui| {
                     if ui
-                        .button(Self::icon_label(
-                            "\u{E8E5}",
-                            self.tr("导入数据", "Import Data"),
-                        ))
+                        .button(Self::icon_label("\u{E8E5}", self.t(UiText::ImportData)))
                         .clicked()
                     {
-                        let filter_name = self.tr("波形 CSV", "Waveform CSV");
+                        let filter_name = self.t(UiText::WaveformCsv);
                         if let Some(paths) = rfd::FileDialog::new()
                             .add_filter(filter_name, &["csv", "dat"])
                             .pick_files()
@@ -5313,187 +11759,221 @@ impl ScopeApp {
                     }
 
                     if self.source.is_some() {
-                        let export_title =
-                            Self::icon_label("\u{EDE1}", self.tr("导出数据", "Export Data"));
+                        let export_title = Self::icon_label("\u{EDE1}", self.t(UiText::ExportData));
                         ui.menu_button(export_title, |ui| {
-                            for format in DatasetExportFormat::ALL {
-                                if ui.button(format.label(self.language)).clicked() {
-                                    self.export_dataset(0, format);
-                                    ui.close_menu();
-                                }
-                            }
+                            let dataset_indices =
+                                (0..=self.imported_datasets.len()).collect::<Vec<_>>();
+                            self.export_data_menu(ui, &dataset_indices);
                         });
-                        if !self.imported_datasets.is_empty() {
-                            let export_extra_title =
-                                self.tr("导出附加数据", "Export Extra Data").to_owned();
-                            ui.menu_button(export_extra_title, |ui| {
-                                let labels = (0..self.imported_datasets.len())
-                                    .map(|index| (index + 1, self.dataset_label(index + 1)))
-                                    .collect::<Vec<_>>();
-                                for (dataset_index, label) in labels {
-                                    ui.menu_button(label, |ui| {
-                                        for format in DatasetExportFormat::ALL {
-                                            if ui.button(format.label(self.language)).clicked() {
-                                                self.export_dataset(dataset_index, format);
-                                                ui.close_menu();
-                                            }
-                                        }
-                                    });
-                                }
-                            });
-                        }
-                    }
-                    ui.separator();
-                    ui.strong(Self::icon_label(
-                        "\u{E823}",
-                        self.tr("最近文件", "Recent Files"),
-                    ));
-                    if self.recent_files.is_empty() {
-                        ui.label(self.tr("暂无最近文件", "No recent files"));
-                    } else {
-                        let recent_files = self.recent_files.clone();
-                        for path in recent_files {
-                            let label = Self::recent_file_label(&path);
-                            if path.exists() {
-                                if ui.button(label).clicked() {
-                                    self.import_data_files(vec![path.clone()]);
-                                    ui.close_menu();
-                                }
-                            } else {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{} {}",
-                                        label,
-                                        self.tr("(文件不存在)", "(missing)")
-                                    ))
-                                    .color(Color32::GRAY),
-                                );
-                            }
-                        }
-                        ui.separator();
                         if ui
                             .button(Self::icon_label(
-                                "\u{E74D}",
-                                self.tr("清空最近文件", "Clear Recent Files"),
+                                "\u{E91B}",
+                                self.t(UiText::ExportWaveformPng),
                             ))
                             .clicked()
                         {
-                            self.clear_recent_files();
+                            self.export_waveform_png();
                             ui.close_menu();
                         }
                     }
-                },
-            );
-            ui.menu_button(
-                Self::icon_label("\u{E80A}", self.tr("布局", "Layout")),
-                |ui| self.scope_layout_menu(ui),
-            );
-            ui.menu_button(
-                Self::icon_label("\u{E890}", self.tr("视图", "View")),
-                |ui| {
-                    if ui
-                        .button(Self::icon_label(
-                            "\u{E72C}",
-                            self.tr("重置视图", "Reset View"),
-                        ))
-                        .clicked()
-                    {
-                        self.reset_view();
-                        ui.close_menu();
-                    }
-                    if ui
-                        .button(Self::icon_label(
-                            "\u{E9A6}",
-                            self.tr("适配光标", "Fit Cursors"),
-                        ))
-                        .clicked()
-                    {
-                        self.fit_to_cursors();
-                        ui.close_menu();
-                    }
-                    if ui
-                        .button(Self::icon_label("\u{E9D2}", self.tr("Y轴自适应", "Auto Y")))
-                        .clicked()
-                    {
-                        self.auto_fit_y_axis();
-                        ui.close_menu();
-                    }
-                },
-            );
-            let config_title = self.tr("变量名", "Names");
-            ui.menu_button(Self::icon_label("\u{E713}", config_title), |ui| {
-                if ui
-                    .button(Self::icon_label(
-                        "\u{E8B5}",
-                        self.tr("导入变量名", "Import Names"),
-                    ))
-                    .clicked()
-                {
-                    self.import_config();
-                    ui.close_menu();
-                }
-                if ui
-                    .button(Self::icon_label(
-                        "\u{EDE1}",
-                        self.tr("导出变量名", "Export Names"),
-                    ))
-                    .clicked()
-                {
-                    self.export_config();
-                    ui.close_menu();
-                }
-                ui.separator();
-                ui.strong(Self::icon_label(
-                    "\u{E823}",
-                    self.tr("最近变量名", "Recent Names"),
-                ));
-                if self.recent_configs.is_empty() {
-                    ui.label(self.tr("暂无最近变量名", "No recent names"));
-                } else {
-                    let recent_configs = self.recent_configs.clone();
-                    for path in recent_configs {
-                        let label = Self::recent_file_label(&path);
-                        if path.exists() {
-                            if ui.button(label).clicked() {
-                                self.import_config_from_path(path);
-                                ui.close_menu();
-                            }
-                        } else {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} {}",
-                                    label,
-                                    self.tr("(文件不存在)", "(missing)")
-                                ))
-                                .color(Color32::GRAY),
-                            );
-                        }
-                    }
                     ui.separator();
-                    if ui
-                        .button(Self::icon_label(
-                            "\u{E74D}",
-                            self.tr("清空最近变量名", "Clear Recent Names"),
-                        ))
-                        .clicked()
-                    {
-                        self.clear_recent_configs();
-                        ui.close_menu();
-                    }
+                    ui.menu_button(
+                        Self::icon_label("\u{E823}", self.t(UiText::RecentFiles)),
+                        |ui| {
+                            if self.recent_files.is_empty() {
+                                ui.label(self.t(UiText::NoRecentFiles));
+                            } else {
+                                let recent_files = self.recent_files.clone();
+                                for path in recent_files {
+                                    let label = Self::recent_file_label(&path);
+                                    let full_path = path.display().to_string();
+                                    if path.exists() {
+                                        if ui.button(label).on_hover_text(full_path).clicked() {
+                                            self.import_data_files(vec![path.clone()]);
+                                            ui.close_menu();
+                                        }
+                                    } else {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{} {}",
+                                                label,
+                                                self.t(UiText::MissingFile)
+                                            ))
+                                            .color(Color32::GRAY),
+                                        )
+                                        .on_hover_text(full_path);
+                                    }
+                                }
+                                ui.separator();
+                                if ui
+                                    .button(Self::icon_label(
+                                        "\u{E74D}",
+                                        self.t(UiText::ClearRecentFiles),
+                                    ))
+                                    .clicked()
+                                {
+                                    self.clear_recent_files();
+                                    ui.close_menu();
+                                }
+                            }
+                        },
+                    );
+                },
+            );
+            ui.menu_button(Self::icon_label("\u{E80A}", self.t(UiText::Layout)), |ui| {
+                self.scope_layout_menu(ui)
+            });
+            ui.menu_button(Self::icon_label("\u{E890}", self.t(UiText::View)), |ui| {
+                if ui
+                    .button(Self::icon_label("\u{E72C}", self.t(UiText::ResetView)))
+                    .clicked()
+                {
+                    self.reset_view();
+                    ui.close_menu();
+                }
+                if ui
+                    .button(Self::icon_label("\u{E9A6}", self.t(UiText::FitCursors)))
+                    .clicked()
+                {
+                    self.fit_to_cursors();
+                    ui.close_menu();
+                }
+                if ui
+                    .button(Self::icon_label("\u{E9D2}", self.t(UiText::AutoY)))
+                    .clicked()
+                {
+                    self.auto_fit_y_axis();
+                    ui.close_menu();
                 }
             });
+            ui.menu_button(
+                Self::icon_label("\u{E713}", self.tr("配置", "Config")),
+                |ui| {
+                    ui.menu_button(self.tr("变量名配置", "Name Settings"), |ui| {
+                        if ui
+                            .button(Self::icon_label("\u{E8B5}", self.t(UiText::ImportNames)))
+                            .clicked()
+                        {
+                            self.import_config();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .button(Self::icon_label("\u{EDE1}", self.t(UiText::ExportNames)))
+                            .clicked()
+                        {
+                            self.export_config();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        ui.strong(Self::icon_label("\u{E823}", self.t(UiText::RecentNames)));
+                        if self.recent_configs.is_empty() {
+                            ui.label(self.t(UiText::NoRecentNames));
+                        } else {
+                            let recent_configs = self.recent_configs.clone();
+                            for path in recent_configs {
+                                let label = Self::recent_file_label(&path);
+                                let full_path = path.display().to_string();
+                                if path.exists() {
+                                    if ui.button(label).on_hover_text(full_path).clicked() {
+                                        self.import_config_from_path(path);
+                                        ui.close_menu();
+                                    }
+                                } else {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} {}",
+                                            label,
+                                            self.t(UiText::MissingFile)
+                                        ))
+                                        .color(Color32::GRAY),
+                                    )
+                                    .on_hover_text(full_path);
+                                }
+                            }
+                            ui.separator();
+                            if ui
+                                .button(Self::icon_label(
+                                    "\u{E74D}",
+                                    self.t(UiText::ClearRecentNames),
+                                ))
+                                .clicked()
+                            {
+                                self.clear_recent_configs();
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                    ui.menu_button(self.tr("显示配置", "Display Settings"), |ui| {
+                        if ui
+                            .button(Self::icon_label("\u{E8B5}", self.tr("导入", "Import")))
+                            .clicked()
+                        {
+                            self.import_display_config();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .button(Self::icon_label("\u{EDE1}", self.tr("导出", "Export")))
+                            .clicked()
+                        {
+                            self.export_display_config();
+                            ui.close_menu();
+                        }
+                    });
+                    ui.menu_button(self.tr("快捷键配置", "Shortcut Settings"), |ui| {
+                        if ui
+                            .button(Self::icon_label("\u{E8B5}", self.tr("导入", "Import")))
+                            .clicked()
+                        {
+                            self.import_shortcut_config();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .button(Self::icon_label("\u{EDE1}", self.tr("导出", "Export")))
+                            .clicked()
+                        {
+                            self.export_shortcut_config();
+                            ui.close_menu();
+                        }
+                    });
+                    ui.menu_button(self.tr("数据组配置", "Dataset Settings"), |ui| {
+                        if ui
+                            .button(Self::icon_label("\u{E8B5}", self.tr("导入", "Import")))
+                            .clicked()
+                        {
+                            self.import_dataset_config();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .button(Self::icon_label("\u{EDE1}", self.tr("导出", "Export")))
+                            .clicked()
+                        {
+                            self.export_dataset_config();
+                            ui.close_menu();
+                        }
+                    });
+                },
+            );
             if ui
-                .button(Self::icon_label("\u{E713}", self.tr("选项", "Options")))
+                .button(Self::icon_label("\u{E713}", self.t(UiText::Options)))
                 .clicked()
             {
                 self.show_options = true;
             }
-            if ui
-                .button(Self::icon_label("\u{E897}", self.tr("帮助", "Help")))
-                .clicked()
-            {
-                self.show_help = true;
-            }
+            ui.menu_button(Self::icon_label("\u{E897}", self.t(UiText::Help)), |ui| {
+                if ui.button(self.t(UiText::Help)).clicked() {
+                    self.show_help = true;
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button(self.t(UiText::CopyDiagnostics)).clicked() {
+                    self.copy_diagnostics_to_clipboard(ui.ctx());
+                    ui.close_menu();
+                }
+                if ui.button(self.t(UiText::OpenLogDirectory)).clicked() {
+                    self.open_log_directory();
+                    ui.close_menu();
+                }
+            });
             if let Some(meta) = self.meta() {
                 ui.separator();
                 if self.language == Language::Zh {
@@ -5532,19 +12012,34 @@ impl ScopeApp {
     }
 
     fn help_window(&mut self, ctx: &egui::Context) {
-        let title = self.tr("帮助", "Help");
+        let title = self.t(UiText::Help);
         let language = self.language;
+        let copy_label = self.t(UiText::CopyDiagnostics);
+        let open_log_label = self.t(UiText::OpenLogDirectory);
+        let diagnostics_label = self.t(UiText::Diagnostics);
+        let mut copy_diagnostics = false;
+        let mut open_log_directory = false;
         egui::Window::new(title)
             .open(&mut self.show_help)
             .default_width(720.0)
             .default_height(620.0)
             .resizable(true)
             .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong(diagnostics_label);
+                    if ui.button(copy_label).clicked() {
+                        copy_diagnostics = true;
+                    }
+                    if ui.button(open_log_label).clicked() {
+                        open_log_directory = true;
+                    }
+                });
+                ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     if language == Language::Zh {
                         ui.heading("示波器分析器");
                         ui.label("离线波形分析工具，支持通道勾选、示波器式缩放、光标测量、FFT 和 THD 分析。");
-                        ui.label("使用“导入数据”菜单选择一个或多个 CSV 或 DAT 数据文件。第一个文件作为主数据，后续文件作为附加数据叠加显示，Content CSV 会自动识别。");
+                        ui.label("使用“添加数据”菜单选择一个或多个 CSV 或 DAT 数据文件。第一个文件作为主数据，后续文件作为附加数据叠加显示，Content CSV 会自动识别。");
 
                         ui.separator();
                         ui.heading("支持的数据格式");
@@ -5564,8 +12059,8 @@ impl ScopeApp {
 
                         ui.separator();
                         ui.heading("波形操作");
-                        ui.label("导入数据：选择一个或多个波形文件，第一个作为主数据，后续作为附加数据。可用导出数据保存标准 CSV、DATA CSV、TSV 或 JSON。");
-                        ui.label("最近文件：成功导入的文件会自动加入列表，可在顶部“导入数据”菜单中重新打开或清空。");
+                        ui.label("添加数据：选择一个或多个波形文件，第一个作为主数据，后续作为附加数据。导出数据可选择全部导出或只导出光标内区间，并保存为标准 CSV、DATA CSV、TSV 或 JSON。");
+                        ui.label("最近文件：成功添加的文件会自动加入列表，可在顶部“添加数据”菜单中重新打开或清空。");
                         ui.label("布局：设置示波器行数和列数。点击某个子窗口后，再在左侧勾选变量，变量会放入当前子窗口。");
                         ui.label("选项：设置 FFT Fs、谐波基准频率、滚轮缩放灵敏度、界面语言、主题和快捷键。");
                         ui.label("鼠标滚轮：以鼠标位置为中心缩放纵轴幅值范围。Ctrl + 滚轮/触摸板滚动：缩放横轴时间范围。");
@@ -5577,6 +12072,15 @@ impl ScopeApp {
                         ui.label("测量：右侧表格显示 X1-X2 区间内已选通道的 Y1、Y2、dY、最大值和最小值，结果使用通道变比后的值。");
 
                         ui.separator();
+                        ui.heading("波形图片导出");
+                        ui.label("导出波形图片 PNG：从顶部菜单打开当前示波器视图的导出预览，不会直接保存文件。预览中保留当前波形、光标、X 轴坐标、变量标注和可选的光标数据表。");
+                        ui.label("导出预览工具栏：选择工具可拖动变量名和箭头锚点；双击变量名可在原位置直接编辑；文字工具可添加文字；画笔可手写标注；橡皮可擦除画笔笔迹。");
+                        ui.label("撤销/重做：拖动变量名、移动锚点、改变量名、改箭头样式、添加文字、画笔和橡皮操作都可撤销或重做。");
+                        ui.label("箭头与标注：可在预览窗口设置箭头大小、实线/虚线/点线/粗箭头/双线箭头、标注颜色、变量名字号和字体。箭头尖默认吸附并指向曲线。");
+                        ui.label("导出设置：在选项中可设置分辨率、DPI、导出子窗口范围、时间范围和是否显示光标数据表；DPI 支持预设，也可手动输入数值。导出风格固定为示波器截图风格。");
+                        ui.label("批量导出波形 PNG：在选项中勾选“批量导出波形 PNG”打开批量导出窗口，可按当前视图、X1-X2 区间或手动时间窗口批量保存 PNG。批量导出会沿用当前分辨率、DPI、箭头和标注设置。");
+
+                        ui.separator();
                         ui.heading("FFT 和 THD");
                         ui.label("FFT 面板可选择数据组和通道，分析 X1 到 X2 之间的选区。");
                         ui.label("谐波分析前会去除直流均值并使用 Hann 窗，按目标谐波频率做相量投影和窗增益补偿。");
@@ -5585,11 +12089,11 @@ impl ScopeApp {
                     } else {
                         ui.heading("Scope Analyzer");
                         ui.label("Windows offline waveform analyzer with channel selection, oscilloscope-style zooming, cursor measurement, FFT, and THD analysis.");
-                        ui.label("Use the Import Data menu to select one or more CSV or DAT data files. The first file becomes the primary dataset, and later files are overlaid as extra datasets. Content CSV files are detected automatically.");
+                        ui.label("Use the Add Data menu to select one or more CSV or DAT data files. The first file becomes the primary dataset, and later files are overlaid as extra datasets. Content CSV files are detected automatically.");
 
                         ui.separator();
                         ui.heading("Supported Data Formats");
-                        ui.label("Use the Import Data menu to load data. You can select multiple data files at once. CSV files are detected from the header; DAT files are decoded from their binary header and sample frames.");
+                        ui.label("Use the Add Data menu to load data. You can select multiple data files at once. CSV files are detected from the header; DAT files are decoded from their binary header and sample frames.");
                         ui.label("The primary dataset controls the channel list, display names, colors, line widths, measurements, and FFT. Extra datasets are overlaid as dashed lines by matching channel index.");
                         ui.strong("Cloud Content CSV");
                         ui.label("The first row is Content. Each following row is a hexadecimal record. Each record is decoded into two samples. Each sample contains 30 analog channels plus 30 digital/status channels.");
@@ -5605,13 +12109,22 @@ impl ScopeApp {
 
                         ui.separator();
                         ui.heading("Waveform Controls");
-                        ui.label("Import Data opens one or more waveform files. The first file becomes the primary dataset; later files are added as extra datasets.");
+                        ui.label("Add Data opens one or more waveform files. The first file becomes the primary dataset; later files are added as extra datasets. Export Data can save either the full time range or only the X1-X2 cursor range.");
                         ui.label("Layout sets the scope pane rows and columns. Click a pane, then select channels in the sidebar to add them to that pane.");
                         ui.label("Options controls FFT Fs, harmonic base frequency, wheel zoom sensitivity, language, theme, and shortcuts.");
                         ui.label("Mouse wheel zooms the vertical axis around the pointer. Ctrl + wheel or touchpad scroll zooms the time axis.");
                         ui.label("The left channel list is organized by dataset, analog/digital type, and channel name. Right-click datasets or channels for related settings.");
                         ui.label("Name import/export only stores display names; it does not overwrite visibility, color, line width, scale, FFT, language, theme, or shortcut settings.");
                         ui.label("Left-click the plot to move the nearest cursor. Drag with the left button to zoom a time range. Right-click for the cursor menu; right-drag pans the current view.");
+
+                        ui.separator();
+                        ui.heading("Waveform Image Export");
+                        ui.label("Export Waveform PNG opens an export preview for the current scope view instead of saving immediately. The preview keeps waveform traces, cursors, X-axis cursor labels, variable annotations, and the optional cursor data table.");
+                        ui.label("Preview toolbar: Select drags variable labels and arrow anchors; double-click a variable label to edit it in place; Text adds text notes; Brush draws freehand marks; Eraser removes brush strokes.");
+                        ui.label("Undo and redo cover label moves, anchor moves, label edits, arrow style changes, text notes, brush strokes, and eraser actions.");
+                        ui.label("Arrows and labels can be configured in the preview: arrow size, solid/dashed/dotted/thick/double arrows, annotation color, variable label size, and label font. Arrow tips stay snapped to the curve by default.");
+                        ui.label("Export settings in Options control resolution, DPI, scope pane range, time range, and the cursor data table. DPI can use presets or a custom typed value. The image style is fixed to the oscilloscope screenshot style.");
+                        ui.label("Batch Export Waveform PNG is opened from the checkbox in Options. It can save PNGs for the current view, X1-X2, or manual time windows, and uses the current resolution, DPI, arrow, and label settings.");
 
                         ui.separator();
                         ui.heading("FFT and THD");
@@ -5621,19 +12134,25 @@ impl ScopeApp {
                     }
                 });
             });
+        if copy_diagnostics {
+            self.copy_diagnostics_to_clipboard(ctx);
+        }
+        if open_log_directory {
+            self.open_log_directory();
+        }
     }
 
     fn options_window(&mut self, ctx: &egui::Context) {
-        let title = self.tr("选项", "Options");
+        let title = self.t(UiText::Options);
         let mut open = self.show_options;
         egui::Window::new(title)
             .open(&mut open)
-            .default_width(360.0)
+            .default_width(420.0)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.heading(self.tr("交互", "Interaction"));
+                ui.heading(self.t(UiText::Interaction));
                 ui.horizontal(|ui| {
-                    ui.label(self.tr("界面语言", "Language"));
+                    ui.label(self.t(UiText::UiLanguage));
                     egui::ComboBox::from_id_source("language_select")
                         .selected_text(self.language.label())
                         .show_ui(ui, |ui| {
@@ -5642,7 +12161,7 @@ impl ScopeApp {
                         });
                 });
                 ui.horizontal(|ui| {
-                    ui.label(self.tr("主题", "Theme"));
+                    ui.label(self.t(UiText::Theme));
                     let previous_theme = self.theme_mode;
                     egui::ComboBox::from_id_source("theme_select")
                         .selected_text(self.theme_mode.label(self.language))
@@ -5662,6 +12181,168 @@ impl ScopeApp {
                         self.apply_theme(ui.ctx());
                     }
                 });
+                ui.separator();
+                ui.heading(self.t(UiText::ImageExportLabels));
+                let mut batch_export_checked = self.show_batch_export;
+                let batch_export_label =
+                    self.tr("批量导出波形 PNG", "Batch Export Waveform PNG");
+                if ui
+                    .checkbox(&mut batch_export_checked, batch_export_label)
+                    .changed()
+                {
+                    if batch_export_checked {
+                        self.open_batch_waveform_export();
+                    } else {
+                        self.show_batch_export = false;
+                    }
+                }
+                ui.horizontal(|ui| {
+                    ui.label(self.tr("分辨率", "Resolution"));
+                    egui::ComboBox::from_id_source("export_resolution")
+                        .selected_text(self.export_resolution.label(self.language))
+                        .show_ui(ui, |ui| {
+                            for resolution in ExportResolution::ALL {
+                                ui.selectable_value(
+                                    &mut self.export_resolution,
+                                    resolution,
+                                    resolution.label(self.language),
+                                );
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("DPI");
+                    let _ = self.export_dpi_controls(ui, "export_dpi");
+                });
+                let cursor_table_label = self.tr("显示光标数据表", "Show cursor data table");
+                ui.checkbox(&mut self.export_cursor_table_enabled, cursor_table_label);
+                ui.horizontal(|ui| {
+                    ui.label(self.tr("子窗口", "Pane"));
+                    egui::ComboBox::from_id_source("export_pane_scope")
+                        .selected_text(self.export_pane_scope.label(self.language))
+                        .show_ui(ui, |ui| {
+                            for scope in ExportPaneScope::ALL {
+                                ui.selectable_value(
+                                    &mut self.export_pane_scope,
+                                    scope,
+                                    scope.label(self.language),
+                                );
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label(self.tr("时间范围", "Time range"));
+                    egui::ComboBox::from_id_source("export_time_range_mode")
+                        .selected_text(self.export_time_range_mode.label(self.language))
+                        .show_ui(ui, |ui| {
+                            for mode in ExportTimeRangeMode::ALL {
+                                ui.selectable_value(
+                                    &mut self.export_time_range_mode,
+                                    mode,
+                                    mode.label(self.language),
+                                );
+                            }
+                        });
+                });
+                if self.export_time_range_mode == ExportTimeRangeMode::Manual {
+                    ui.horizontal(|ui| {
+                        ui.label(self.tr("手动范围", "Manual range"));
+                        ui.add(
+                            egui::DragValue::new(&mut self.export_manual_start)
+                                .speed(0.0001)
+                                .prefix("X0 "),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut self.export_manual_end)
+                                .speed(0.0001)
+                                .prefix("X1 "),
+                        );
+                    });
+                }
+                let arrow_size_label = self.t(UiText::ArrowSize);
+                ui.add(
+                    egui::Slider::new(
+                        &mut self.export_arrow_size,
+                        MIN_EXPORT_ARROW_SIZE..=MAX_EXPORT_ARROW_SIZE,
+                    )
+                    .text(arrow_size_label),
+                );
+                self.export_arrow_size = self
+                    .export_arrow_size
+                    .clamp(MIN_EXPORT_ARROW_SIZE, MAX_EXPORT_ARROW_SIZE);
+                ui.horizontal(|ui| {
+                    ui.label(self.t(UiText::ArrowLabelColor));
+                    egui::ComboBox::from_id_source("export_arrow_color_style")
+                        .selected_text(self.export_arrow_color_style.label(self.language))
+                        .show_ui(ui, |ui| {
+                            for style in ExportArrowColorStyle::ALL {
+                                ui.selectable_value(
+                                    &mut self.export_arrow_color_style,
+                                    style,
+                                    style.label(self.language),
+                                );
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label(self.tr("箭头线型", "Arrow line style"));
+                    let _ = self.export_arrow_style_controls(ui, "export_arrow_line_style");
+                });
+                if self.export_arrow_color_style == ExportArrowColorStyle::Custom {
+                    ui.horizontal(|ui| {
+                        ui.label(self.t(UiText::CustomColor));
+                        egui::color_picker::color_edit_button_srgba(
+                            ui,
+                            &mut self.export_arrow_custom_color,
+                            egui::color_picker::Alpha::Opaque,
+                        );
+                    });
+                }
+                let label_size_label = self.t(UiText::VariableNameSize);
+                ui.add(
+                    egui::Slider::new(
+                        &mut self.export_label_scale,
+                        MIN_EXPORT_LABEL_SCALE..=MAX_EXPORT_LABEL_SCALE,
+                    )
+                    .text(label_size_label),
+                );
+                self.export_label_scale = self
+                    .export_label_scale
+                    .clamp(MIN_EXPORT_LABEL_SCALE, MAX_EXPORT_LABEL_SCALE);
+                ui.horizontal(|ui| {
+                    ui.label(self.t(UiText::VariableNameFont));
+                    egui::ComboBox::from_id_source("export_label_font_style")
+                        .selected_text(self.export_label_font_style.label(self.language))
+                        .show_ui(ui, |ui| {
+                            for style in ExportLabelFontStyle::ALL {
+                                ui.selectable_value(
+                                    &mut self.export_label_font_style,
+                                    style,
+                                    style.label(self.language),
+                                );
+                            }
+                        });
+                });
+                if ui
+                    .button(self.t(UiText::ResetExportLabelStyle))
+                    .clicked()
+                {
+                    self.export_style_preset = ExportStylePreset::Screenshot;
+                    self.export_arrow_size = DEFAULT_EXPORT_ARROW_SIZE;
+                    self.export_arrow_color_style = ExportArrowColorStyle::Curve;
+                    self.export_arrow_line_style = ExportArrowLineStyle::Solid;
+                    self.export_arrow_custom_color = Color32::from_rgb(20, 96, 180);
+                    self.export_label_scale = DEFAULT_EXPORT_LABEL_SCALE;
+                    self.export_label_font_style = ExportLabelFontStyle::Regular;
+                    self.export_resolution = DEFAULT_EXPORT_RESOLUTION;
+                    self.export_dpi = ExportDpi::Dpi300;
+                    self.export_dpi_value = 300;
+                    self.export_cursor_table_enabled = true;
+                    self.export_pane_scope = ExportPaneScope::All;
+                    self.export_time_range_mode = ExportTimeRangeMode::View;
+                    self.export_manual_start = self.view_start;
+                    self.export_manual_end = self.view_end;
+                }
                 ui.separator();
                 let old_sample_rate = self.sample_rate_hz;
                 let sample_rate_prefix = self.tr("FFT Fs: ", "FFT Fs: ");
@@ -5684,7 +12365,7 @@ impl ScopeApp {
                     "Default FFT Fs is 1000 Hz. Cloud Content CSV uses this value for the time axis; the FFT frequency axis explicitly uses it too.",
                 ));
                 let old_harmonic_base = self.harmonic_base_hz;
-                let harmonic_base_prefix = self.tr("谐波基准: ", "Harmonic base: ");
+                let harmonic_base_prefix = self.t(UiText::HarmonicBasePrefix);
                 ui.add(
                     egui::DragValue::new(&mut self.harmonic_base_hz)
                         .speed(1.0)
@@ -5705,39 +12386,59 @@ impl ScopeApp {
                 ));
                 ui.separator();
                 ui.heading("PLL / dq0");
-                let mut pll_sync_source = self.pll_sync_source;
-                ui.horizontal(|ui| {
-                    ui.label(self.tr("锁相环同步源", "PLL sync source"));
-                    egui::ComboBox::from_id_source("pll_sync_source_select")
-                        .selected_text(pll_sync_source.label(self.language))
-                        .show_ui(ui, |ui| {
-                            for source in PllSyncSource::ALL {
-                                ui.selectable_value(
-                                    &mut pll_sync_source,
-                                    source,
-                                    source.label(self.language),
-                                );
-                            }
-                        });
-                });
-                if pll_sync_source != self.pll_sync_source {
-                    self.pll_sync_source = pll_sync_source;
-                    self.pll_source_channels = self
-                        .preferred_pll_source_channels(&self.fft_channel_options())
-                        .unwrap_or(self.pll_source_channels);
-                    self.derived_curve_cache = None;
-                    self.prepared_derived_curve_cache = PreparedPlotSeries::default();
-                    self.derived_measurement_cache = None;
-                    self.needs_derived_reload = true;
+                let channel_options = self.fft_channel_options();
+                if channel_options.len() >= 3 {
+                    if !Self::valid_three_phase_selection(
+                        self.pll_source_channels,
+                        &channel_options,
+                    ) {
+                        self.pll_source_channels = self
+                            .preferred_pll_source_channels(&channel_options)
+                            .or_else(|| {
+                                Self::default_sequence_channels_from_options(&channel_options)
+                            })
+                            .unwrap_or([0, 1, 2]);
+                    }
+                    let options = channel_options
+                        .iter()
+                        .map(|channel| {
+                            (
+                                *channel,
+                                self.fft_channel_name(self.fft_dataset_index, *channel),
+                                self.related_three_phase_channels_from_anchor(
+                                    *channel,
+                                    &channel_options,
+                                ),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    ui.label(self.t(UiText::PllSyncSource));
+                    if Self::three_phase_channel_selectors_ui(
+                        ui,
+                        "options_pll_source_channel",
+                        self.fft_dataset_index,
+                        &options,
+                        &mut self.pll_source_channels,
+                    ) {
+                        self.derived_curve_cache = None;
+                        self.prepared_derived_curve_cache = PreparedPlotSeries::default();
+                        self.derived_measurement_cache = None;
+                        self.needs_derived_reload = true;
+                    }
+                } else {
+                    ui.label(self.tr(
+                        "PLL/dq0 至少需要三个模拟量通道。",
+                        "PLL/dq0 needs at least three analog channels.",
+                    ));
                 }
                 ui.label(self.tr(
-                    "PLL/dq0 使用所选分析数据组中的该同步源。",
-                    "PLL/dq0 uses this sync source in the selected Analysis Dataset.",
+                    "PLL/dq0 使用所选分析数据组中的变量作为锁相环输入。",
+                    "PLL/dq0 uses the selected variables in the Analysis Dataset as PLL inputs.",
                 ));
                 ui.separator();
-                ui.heading(self.tr("时间轴同步", "Time Axis Sync"));
+                ui.heading(self.t(UiText::TimeAxisSync));
                 let previous_sync = self.sync_time_axes;
-                let sync_axes_label = self.tr("统一数据组时间轴", "Align dataset time axes");
+                let sync_axes_label = self.t(UiText::AlignDatasetTimeAxes);
                 ui.checkbox(&mut self.sync_time_axes, sync_axes_label);
                 if self.sync_time_axes != previous_sync {
                     self.needs_compare_plot_reload = true;
@@ -5745,23 +12446,66 @@ impl ScopeApp {
                     self.fft_results.clear();
                     self.needs_fft_reload = true;
                 }
-                ui.horizontal(|ui| {
-                    if ui
-                        .button(self.tr(
-                            "按 stVg_0.iA/iB/iC 相位同步",
-                            "Sync by stVg_0.iA/iB/iC phase",
-                        ))
-                        .clicked()
+                let time_sync_options = self.primary_time_sync_channel_options();
+                if time_sync_options.len() >= 3 {
+                    if !Self::valid_three_phase_selection(
+                        self.time_sync_source_channels,
+                        &time_sync_options,
+                    ) || (!self.time_sync_source_channels_user_selected
+                        && self
+                            .preferred_time_sync_source_channels(&time_sync_options)
+                            .is_some())
                     {
+                        self.time_sync_source_channels = self
+                            .preferred_time_sync_source_channels(&time_sync_options)
+                            .or_else(|| {
+                                Self::default_sequence_channels_from_options(&time_sync_options)
+                            })
+                            .unwrap_or([0, 1, 2]);
+                        self.time_sync_source_channels_user_selected = false;
+                    }
+                    let options = time_sync_options
+                        .iter()
+                        .map(|channel| {
+                            (
+                                *channel,
+                                self.fft_channel_name(0, *channel),
+                                self.related_three_phase_channels_from_anchor_in_dataset(
+                                    0,
+                                    *channel,
+                                    &time_sync_options,
+                                ),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    ui.label(self.t(UiText::TimeSyncSource));
+                    if Self::three_phase_channel_selectors_ui(
+                        ui,
+                        "time_sync_source_channel",
+                        0,
+                        &options,
+                        &mut self.time_sync_source_channels,
+                    ) {
+                        self.time_sync_source_channels_user_selected = true;
+                        self.time_sync_status.clear();
+                    }
+                } else {
+                    ui.label(self.tr(
+                        "时间轴同步至少需要主数据组三个模拟量通道。",
+                        "Time-axis sync needs at least three analog channels in the primary dataset.",
+                    ));
+                }
+                ui.horizontal(|ui| {
+                    if ui.button(self.t(UiText::SyncByPhase)).clicked() {
                         self.sync_time_axes_by_phase();
                     }
-                    if ui.button(self.tr("清除同步", "Clear Sync")).clicked() {
+                    if ui.button(self.t(UiText::ClearSync)).clicked() {
                         self.clear_time_axis_sync();
                     }
                 });
                 ui.label(self.tr(
-                    "以主数据为参考，按谐波基准频率计算三相电压相位差，并平移附加数据组的时间轴。",
-                    "Uses the primary dataset as reference, calculates three-phase voltage phase difference at the harmonic base frequency, then shifts extra dataset time axes.",
+                    "以主数据为参考，按所选变量和谐波基准频率计算相位差，并平移附加数据组的时间轴。",
+                    "Uses the primary dataset as reference, calculates phase difference from the selected variables at the harmonic base frequency, then shifts extra dataset time axes.",
                 ));
                 if !self.time_sync_status.is_empty() {
                     ui.label(&self.time_sync_status);
@@ -5774,7 +12518,7 @@ impl ScopeApp {
                     ));
                 }
                 ui.separator();
-                let zoom_label = self.tr("滚轮缩放灵敏度", "Wheel zoom sensitivity");
+                let zoom_label = self.t(UiText::WheelZoomSensitivity);
                 ui.add(
                     egui::Slider::new(
                         &mut self.wheel_zoom_sensitivity,
@@ -5794,22 +12538,22 @@ impl ScopeApp {
                         self.wheel_zoom_sensitivity * 100.0
                     ));
                 }
-                if ui.button(self.tr("重置灵敏度", "Reset Sensitivity")).clicked() {
+                if ui.button(self.t(UiText::ResetSensitivity)).clicked() {
                     self.wheel_zoom_sensitivity = DEFAULT_WHEEL_ZOOM_SENSITIVITY;
                 }
                 ui.separator();
-                ui.heading(self.tr("快捷键", "Shortcuts"));
-                let reset_view_label = self.tr("复位视图", "Reset View");
-                let fit_cursors_label = self.tr("适配光标", "Fit Cursors");
-                let toggle_cursors_label = self.tr("隐藏/显示光标", "Hide/Show Cursors");
-                let select_all_label = self.tr("全选通道", "Select All Channels");
-                let select_none_label = self.tr("取消全选通道", "Deselect All Channels");
+                ui.heading(self.t(UiText::Shortcuts));
+                let reset_view_label = self.t(UiText::ResetView);
+                let fit_cursors_label = self.t(UiText::FitCursors);
+                let toggle_cursors_label = self.t(UiText::ToggleCursors);
+                let select_all_label = self.t(UiText::SelectAllChannels);
+                let select_none_label = self.t(UiText::DeselectAllChannels);
                 Self::shortcut_binding_ui(ui, "shortcut_reset_view", reset_view_label, &mut self.shortcuts.reset_view);
                 Self::shortcut_binding_ui(ui, "shortcut_fit_cursors", fit_cursors_label, &mut self.shortcuts.fit_cursors);
                 Self::shortcut_binding_ui(ui, "shortcut_toggle_cursors", toggle_cursors_label, &mut self.shortcuts.toggle_cursors);
                 Self::shortcut_binding_ui(ui, "shortcut_select_all", select_all_label, &mut self.shortcuts.select_all);
                 Self::shortcut_binding_ui(ui, "shortcut_select_none", select_none_label, &mut self.shortcuts.select_none);
-                if ui.button(self.tr("重置快捷键", "Reset Shortcuts")).clicked() {
+                if ui.button(self.t(UiText::ResetShortcuts)).clicked() {
                     self.shortcuts = ShortcutConfig::default();
                 }
                 ui.separator();
@@ -5851,6 +12595,25 @@ impl ScopeApp {
 
     fn ctrl_zoom_factor(&self, zoom_delta: f32) -> f64 {
         (zoom_delta as f64).powf(-self.wheel_zoom_sensitivity * 4.0)
+    }
+
+    fn observe_layout_panel_widths(&mut self, channel_width: f32, analysis_width: f32) {
+        let channel_changed = self
+            .last_channel_panel_width
+            .is_some_and(|last| (last - channel_width).abs() > 0.5);
+        let analysis_changed = self
+            .last_analysis_panel_width
+            .is_some_and(|last| (last - analysis_width).abs() > 0.5);
+        self.last_channel_panel_width = Some(channel_width);
+        self.last_analysis_panel_width = Some(analysis_width);
+        if channel_changed || analysis_changed {
+            self.layout_resize_active_until = Some(Instant::now() + LAYOUT_RESIZE_ACTIVE_GRACE);
+        }
+    }
+
+    fn layout_resize_active(&self) -> bool {
+        self.layout_resize_active_until
+            .is_some_and(|until| Instant::now() < until)
     }
 
     fn has_zoom_delta(zoom_delta: f32) -> bool {
@@ -6027,38 +12790,45 @@ impl ScopeApp {
             let row_response = ui.horizontal(|ui| {
                 let mut row_hovered = false;
                 let mut add_from_name = false;
-                let mut color = self.plot_channel_color(
-                    channel.index,
-                    dataset_index,
-                    self.current_scope_pane(),
-                    self.scope_pane_count(),
-                );
-                let color_response = egui::color_picker::color_edit_button_srgba(
-                    ui,
-                    &mut color,
-                    egui::color_picker::Alpha::Opaque,
-                );
-                row_hovered |= color_response.hovered();
-                if color_response.changed() {
-                    if let Some(stored_color) = self.channel_colors.get_mut(channel.index) {
-                        *stored_color = color;
-                        self.needs_plot_reload = true;
-                        self.needs_compare_plot_reload = true;
+                let mut color = self.sidebar_channel_color(channel.index, dataset_index);
+                let color_response = if dataset_index == 0 {
+                    let response = egui::color_picker::color_edit_button_srgba(
+                        ui,
+                        &mut color,
+                        egui::color_picker::Alpha::Opaque,
+                    );
+                    if response.changed() {
+                        if let Some(stored_color) = self.channel_colors.get_mut(channel.index) {
+                            *stored_color = color;
+                        }
                     }
-                }
+                    response
+                } else {
+                    Self::color_swatch(ui, color).on_hover_text(self.t(UiText::Color))
+                };
+                row_hovered |= color_response.hovered();
                 let mut visible = self.dataset_channel_visible(dataset_index, channel.index);
                 let checkbox_response = ui.checkbox(&mut visible, "");
                 row_hovered |= checkbox_response.hovered();
                 if checkbox_response.changed() {
                     self.set_dataset_channel_visible(dataset_index, channel.index, visible);
                 }
-                let rename_hint = self.tr("双击修改变量名", "Double-click to rename");
-                let name_width = 150.0;
+                let rename_hint = self.t(UiText::DoubleClickRename);
+                let name_width = ui
+                    .available_width()
+                    .min(CHANNEL_NAME_COLUMN_WIDTH)
+                    .max(96.0);
                 if editable_name {
                     let Some(name) = self.display_names.get_mut(channel.index) else {
                         return row_hovered;
                     };
                     if self.editing_display_name == Some(channel.index) {
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::IMEAllowed(true));
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::IMEPurpose(
+                                egui::viewport::IMEPurpose::Normal,
+                            ));
                         let name_response = ui.add(
                             egui::TextEdit::singleline(name)
                                 .id_source(("display_name_edit", dataset_index, channel.index))
@@ -6071,22 +12841,30 @@ impl ScopeApp {
                             self.pending_display_name_focus = None;
                         }
                         row_hovered |= name_response.hovered() || name_response.has_focus();
-                        if name_response.changed() {
-                            self.fft_results.clear();
-                            self.needs_fft_reload = true;
-                        }
-                        let finish_edit = ui.input(|input| {
-                            input.key_pressed(egui::Key::Enter)
-                                || input.key_pressed(egui::Key::Escape)
-                        }) || (!just_requested_focus
-                            && name_response.lost_focus());
-                        if finish_edit {
-                            if ui.input(|input| {
+                        let (finish_key_pressed, ime_composing) = ui.input(|input| {
+                            (
                                 input.key_pressed(egui::Key::Enter)
-                                    || input.key_pressed(egui::Key::Escape)
-                            }) {
+                                    || input.key_pressed(egui::Key::Escape),
+                                input.events.iter().any(|event| {
+                                    matches!(
+                                        event,
+                                        egui::Event::CompositionStart
+                                            | egui::Event::CompositionUpdate(_)
+                                            | egui::Event::CompositionEnd(_)
+                                    )
+                                }),
+                            )
+                        });
+                        let finish_edit = finish_key_pressed
+                            || (!ime_composing
+                                && !just_requested_focus
+                                && name_response.lost_focus());
+                        if finish_edit {
+                            if finish_key_pressed {
                                 name_response.surrender_focus();
                             }
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::IMEAllowed(false));
                             self.editing_display_name = None;
                         }
                     } else {
@@ -6155,9 +12933,9 @@ impl ScopeApp {
     }
 
     fn channel_style_menu(&mut self, ui: &mut egui::Ui, channel_index: usize) {
-        ui.strong(self.tr("颜色设置", "Color Settings"));
+        ui.strong(self.t(UiText::ColorSettings));
         ui.horizontal(|ui| {
-            ui.label(self.tr("颜色", "Color"));
+            ui.label(self.t(UiText::Color));
             let mut color = self.channel_color(channel_index);
             let color_response = egui::color_picker::color_edit_button_srgba(
                 ui,
@@ -6167,15 +12945,12 @@ impl ScopeApp {
             if color_response.changed() {
                 if let Some(stored_color) = self.channel_colors.get_mut(channel_index) {
                     *stored_color = color;
-                    self.needs_plot_reload = true;
-                    self.needs_compare_plot_reload = true;
                 }
             }
         });
         ui.horizontal(|ui| {
-            ui.label(self.tr("线形", "Line style"));
+            ui.label(self.t(UiText::LineStyle));
             if let Some(pattern) = self.line_patterns.get_mut(channel_index) {
-                let old_pattern = *pattern;
                 egui::ComboBox::from_id_source(("line_pattern", channel_index))
                     .selected_text(pattern.label(self.language))
                     .show_ui(ui, |ui| {
@@ -6183,14 +12958,10 @@ impl ScopeApp {
                             ui.selectable_value(pattern, candidate, candidate.label(self.language));
                         }
                     });
-                if *pattern != old_pattern {
-                    self.needs_plot_reload = true;
-                    self.needs_compare_plot_reload = true;
-                }
             }
         });
         ui.horizontal(|ui| {
-            ui.label(self.tr("线宽", "Line width"));
+            ui.label(self.t(UiText::LineWidth));
             if let Some(width) = self.line_widths.get_mut(channel_index) {
                 let width_response = ui.add(
                     egui::DragValue::new(width)
@@ -6199,16 +12970,14 @@ impl ScopeApp {
                 );
                 if width_response.changed() {
                     *width = (*width).clamp(MIN_CHANNEL_LINE_WIDTH, MAX_CHANNEL_LINE_WIDTH);
-                    self.needs_plot_reload = true;
-                    self.needs_compare_plot_reload = true;
                 }
             }
         });
 
         ui.separator();
-        ui.strong(self.tr("变比", "Scale Ratio"));
+        ui.strong(self.t(UiText::ScaleRatio));
         ui.horizontal(|ui| {
-            ui.label(self.tr("倍率", "Scale"));
+            ui.label(self.t(UiText::Scale));
             if let Some(scale) = self.channel_scales.get_mut(channel_index) {
                 let old_scale = *scale;
                 let scale_response = ui.add(
@@ -6232,22 +13001,22 @@ impl ScopeApp {
             }
         });
         ui.horizontal(|ui| {
-            if ui.button(self.tr("放大 2x", "Zoom 2x")).clicked() {
+            if ui.button(self.t(UiText::Zoom2x)).clicked() {
                 self.multiply_channel_scale(channel_index, 2.0);
             }
-            if ui.button(self.tr("缩小 1/2", "Shrink 1/2")).clicked() {
+            if ui.button(self.t(UiText::ShrinkHalf)).clicked() {
                 self.multiply_channel_scale(channel_index, 0.5);
             }
-            if ui.button(self.tr("重置", "Reset")).clicked() {
+            if ui.button(self.t(UiText::Reset)).clicked() {
                 self.set_channel_scale(channel_index, DEFAULT_CHANNEL_SCALE);
             }
         });
     }
 
     fn derived_channel_style_menu(&mut self, ui: &mut egui::Ui, derived_index: usize) {
-        ui.strong(self.tr("颜色设置", "Color Settings"));
+        ui.strong(self.t(UiText::ColorSettings));
         ui.horizontal(|ui| {
-            ui.label(self.tr("颜色", "Color"));
+            ui.label(self.t(UiText::Color));
             let mut color = self.derived_channel_color(derived_index);
             let color_response = egui::color_picker::color_edit_button_srgba(
                 ui,
@@ -6257,14 +13026,12 @@ impl ScopeApp {
             if color_response.changed() {
                 if let Some(stored_color) = self.derived_colors.get_mut(derived_index) {
                     *stored_color = color;
-                    self.needs_derived_reload = true;
                 }
             }
         });
         ui.horizontal(|ui| {
-            ui.label(self.tr("线形", "Line style"));
+            ui.label(self.t(UiText::LineStyle));
             if let Some(pattern) = self.derived_line_patterns.get_mut(derived_index) {
-                let old_pattern = *pattern;
                 egui::ComboBox::from_id_source(("derived_line_pattern", derived_index))
                     .selected_text(pattern.label(self.language))
                     .show_ui(ui, |ui| {
@@ -6272,9 +13039,6 @@ impl ScopeApp {
                             ui.selectable_value(pattern, candidate, candidate.label(self.language));
                         }
                     });
-                if *pattern != old_pattern {
-                    self.needs_derived_reload = true;
-                }
             }
         });
     }
@@ -6347,7 +13111,7 @@ impl ScopeApp {
         let selected_count = self.selected_derived_channels().len();
         ui.strong(format!(
             "{} ({selected_count}/{DERIVED_CHANNEL_COUNT})",
-            self.tr("派生量", "Derived")
+            self.t(UiText::Derived)
         ));
         for index in 0..DERIVED_CHANNEL_COUNT {
             self.derived_channel_row_ui(ui, index);
@@ -6355,37 +13119,39 @@ impl ScopeApp {
     }
 
     fn channel_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading(self.tr("变量", "Channels"));
+        ui.heading(self.t(UiText::Channels));
         if self.scope_pane_count() > 1 {
             ui.label(format!(
                 "{} {}",
-                self.tr("当前示波器", "Active pane"),
+                self.t(UiText::ActivePane),
                 self.current_scope_pane() + 1
             ));
         }
-        let filter_hint = self.tr(
-            "筛选变量，支持多关键词",
-            "Filter channels, multiple keywords",
-        );
+        let filter_hint = self.t(UiText::FilterChannelsHint);
         ui.horizontal(|ui| {
             let clear_width = if self.channel_filter.is_empty() {
                 0.0
             } else {
-                52.0
+                46.0
             };
-            let filter_width = (ui.available_width() - clear_width).clamp(80.0, 220.0);
+            let filter_width = (ui.available_width() - clear_width).clamp(72.0, 180.0);
             ui.add(
                 egui::TextEdit::singleline(&mut self.channel_filter)
                     .hint_text(filter_hint)
                     .desired_width(filter_width),
             );
-            if !self.channel_filter.is_empty() && ui.button(self.tr("清除", "Clear")).clicked() {
+            if !self.channel_filter.is_empty()
+                && ui
+                    .add_sized([42.0, ui.spacing().interact_size.y], egui::Button::new("×"))
+                    .on_hover_text(self.t(UiText::Clear))
+                    .clicked()
+            {
                 self.channel_filter.clear();
             }
         });
 
         let Some(meta) = self.meta().cloned() else {
-            ui.label(self.tr("未加载数据。", "No data loaded."));
+            ui.label(self.t(UiText::NoDataLoaded));
             return;
         };
         let filter_terms = self
@@ -6407,11 +13173,11 @@ impl ScopeApp {
         let mut hovered_channel = None;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.strong(self.tr("数据组", "Datasets"));
+            ui.strong(self.t(UiText::Datasets));
             self.dataset_groups_ui(ui, &filter_terms, &mut hovered_channel);
         });
         if matching_count == 0 {
-            ui.label(self.tr("没有匹配的通道。", "No matching channels."));
+            ui.label(self.t(UiText::NoMatchingChannels));
         }
         self.hovered_channel = hovered_channel;
     }
@@ -6422,8 +13188,9 @@ impl ScopeApp {
         }
         self.fft_dataset_index = self.selected_fft_dataset_index();
         let old_dataset = self.fft_dataset_index;
+        ui.strong(self.t(UiText::AnalysisInput));
         ui.horizontal_wrapped(|ui| {
-            ui.label(self.tr("分析数据组", "Analysis Dataset"));
+            ui.label(self.t(UiText::AnalysisDataset));
             egui::ComboBox::from_id_source("analysis_dataset_select")
                 .selected_text(self.dataset_label(self.fft_dataset_index))
                 .show_ui(ui, |ui| {
@@ -6456,17 +13223,85 @@ impl ScopeApp {
             self.needs_fft_reload = true;
             self.needs_derived_reload = true;
         }
+
+        let channel_options = self.fft_channel_options();
+        if channel_options.is_empty() {
+            self.fft_results.clear();
+            self.needs_fft_reload = false;
+            ui.label(self.t(UiText::NoAnalogFftChannels));
+            return;
+        }
+        let preferred_channel = self.preferred_fft_channel(&channel_options);
+        if !channel_options.contains(&self.fft_channel)
+            || (!self.fft_channel_user_selected && Some(self.fft_channel) != preferred_channel)
+        {
+            self.fft_channel = preferred_channel.unwrap_or(channel_options[0]);
+            self.fft_channel_user_selected = false;
+            self.measurement_cache = None;
+            self.derived_measurement_cache = None;
+            self.fft_results.clear();
+            self.needs_fft_reload = true;
+            self.sequence_channels = self
+                .related_three_phase_channels_from_anchor(self.fft_channel, &channel_options)
+                .or_else(|| self.preferred_sequence_channels(&channel_options))
+                .unwrap_or([self.fft_channel, self.fft_channel, self.fft_channel]);
+            self.sequence_channels_user_selected = false;
+        }
+
+        let mut changed_channel = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(self.t(UiText::AnalysisChannel));
+            let selected_name = self.fft_channel_name(self.fft_dataset_index, self.fft_channel);
+            let selected_short =
+                Self::compact_label(&selected_name, ANALYSIS_CHANNEL_LABEL_CHARS + 2);
+            let response = egui::ComboBox::from_id_source("analysis_channel_select")
+                .width(ANALYSIS_CHANNEL_COMBO_WIDTH)
+                .selected_text(selected_short)
+                .show_ui(ui, |ui| {
+                    for channel_index in &channel_options {
+                        let channel_name =
+                            self.fft_channel_name(self.fft_dataset_index, *channel_index);
+                        let channel_short =
+                            Self::compact_label(&channel_name, ANALYSIS_CHANNEL_LABEL_CHARS + 8);
+                        if ui
+                            .selectable_value(&mut self.fft_channel, *channel_index, channel_short)
+                            .on_hover_text(channel_name)
+                            .changed()
+                        {
+                            changed_channel = true;
+                        }
+                    }
+                });
+            response.response.on_hover_text(selected_name);
+        });
+        if changed_channel {
+            self.fft_channel_user_selected = true;
+            self.measurement_cache = None;
+            self.derived_measurement_cache = None;
+            self.fft_results.clear();
+            self.needs_fft_reload = true;
+            if let Some(channels) =
+                self.related_three_phase_channels_from_anchor(self.fft_channel, &channel_options)
+            {
+                self.sequence_channels = channels;
+                self.sequence_channels_user_selected = false;
+                self.dq_source_channels = channels;
+                self.dq_source_channels_user_selected = false;
+                self.derived_curve_cache = None;
+                self.prepared_derived_curve_cache = PreparedPlotSeries::default();
+                self.needs_derived_reload = true;
+            }
+        }
     }
 
     fn poll_measurement_worker(&mut self, expected_key: &MeasurementJobKey) {
-        let Some(worker) = self
-            .measurement_worker
-            .take_if(|worker| worker.is_finished())
+        let Some(joined) =
+            Self::take_finished_job(&mut self.measurement_worker, "Measurement worker panicked.")
         else {
             return;
         };
         self.measurement_worker_key = None;
-        let Ok(result) = worker.join() else {
+        let Ok(result) = joined else {
             self.last_error = Some("Measurement worker panicked.".to_owned());
             return;
         };
@@ -6510,38 +13345,40 @@ impl ScopeApp {
             .map(|channel| (*channel, self.channel_scale(*channel)))
             .collect::<Vec<_>>();
         self.measurement_worker_key = Some(key.clone());
-        self.measurement_worker = Some(thread::spawn(move || {
-            let result = if read_end <= read_start {
-                Ok(Vec::new())
-            } else {
-                source
-                    .read_range(read_start, read_end, &channels, MAX_AUTO_MEASURE_POINTS)
-                    .map_err(|error| error.to_string())
-                    .map(|block| {
-                        let mut rows = Vec::new();
-                        if !block.times.is_empty() {
-                            for (out_index, (channel_index, scale)) in
-                                channel_scales.iter().enumerate()
-                            {
-                                let Some(values) = block.channels.get(out_index) else {
-                                    continue;
-                                };
-                                let scaled_values =
-                                    if (*scale - DEFAULT_CHANNEL_SCALE).abs() <= f32::EPSILON {
-                                        values.clone()
-                                    } else {
-                                        values.iter().map(|value| *value * *scale).collect()
-                                    };
-                                if let Some(measurement) =
-                                    Self::auto_measure(&block.times, &scaled_values)
+        Self::spawn_job(&mut self.measurement_worker, move || {
+            let result = Self::worker_result("Measurement worker panicked.", || {
+                if read_end <= read_start {
+                    Ok(Vec::new())
+                } else {
+                    source
+                        .read_range(read_start, read_end, &channels, MAX_AUTO_MEASURE_POINTS)
+                        .map_err(|error| error.to_string())
+                        .map(|block| {
+                            let mut rows = Vec::new();
+                            if !block.times.is_empty() {
+                                for (out_index, (channel_index, scale)) in
+                                    channel_scales.iter().enumerate()
                                 {
-                                    rows.push((*channel_index, measurement));
+                                    let Some(values) = block.channels.get(out_index) else {
+                                        continue;
+                                    };
+                                    let scaled_values =
+                                        if (*scale - DEFAULT_CHANNEL_SCALE).abs() <= f32::EPSILON {
+                                            values.clone()
+                                        } else {
+                                            values.iter().map(|value| *value * *scale).collect()
+                                        };
+                                    if let Some(measurement) =
+                                        Self::auto_measure(&block.times, &scaled_values)
+                                    {
+                                        rows.push((*channel_index, measurement));
+                                    }
                                 }
                             }
-                        }
-                        rows
-                    })
-            };
+                            rows
+                        })
+                }
+            });
             MeasurementJobResult {
                 generation: key.generation,
                 dataset_index: key.dataset_index,
@@ -6550,18 +13387,18 @@ impl ScopeApp {
                 channels: key.channels,
                 result,
             }
-        }));
+        });
     }
 
     fn poll_derived_measurement_worker(&mut self, expected_key: &DerivedJobKey) {
-        let Some(worker) = self
-            .derived_measurement_worker
-            .take_if(|worker| worker.is_finished())
-        else {
+        let Some(joined) = Self::take_finished_job(
+            &mut self.derived_measurement_worker,
+            "PLL/dq0 measurement worker panicked.",
+        ) else {
             return;
         };
         self.derived_measurement_worker_key = None;
-        let Ok(result) = worker.join() else {
+        let Ok(result) = joined else {
             self.last_error = Some("PLL/dq0 measurement worker panicked.".to_owned());
             return;
         };
@@ -6611,31 +13448,33 @@ impl ScopeApp {
             self.dataset_kind_by_index(key.dataset_index) != Some(SourceKind::Cloud);
         let generation = key.generation;
         self.derived_measurement_worker_key = Some(key.clone());
-        self.derived_measurement_worker = Some(thread::spawn(move || {
-            let result = Self::load_derived_data(
-                source,
-                read_start,
-                read_end,
-                key.pll_channels,
-                key.dq_channels,
-                pll_scales,
-                dq_scales,
-                sample_rate_hz,
-                harmonic_base_hz,
-                skip_digital_by_samples,
-                MAX_AUTO_MEASURE_POINTS,
-            )
-            .map(|block| {
-                let mut rows = Vec::new();
-                for derived_index in &channels {
-                    let Some(values) = block.channels.get(*derived_index) else {
-                        continue;
-                    };
-                    if let Some(measurement) = Self::auto_measure(&block.times, values) {
-                        rows.push((*derived_index, measurement));
+        Self::spawn_job(&mut self.derived_measurement_worker, move || {
+            let result = Self::worker_result("PLL/dq0 measurement worker panicked.", || {
+                Self::load_derived_data(
+                    source,
+                    read_start,
+                    read_end,
+                    key.pll_channels,
+                    key.dq_channels,
+                    pll_scales,
+                    dq_scales,
+                    sample_rate_hz,
+                    harmonic_base_hz,
+                    skip_digital_by_samples,
+                    MAX_AUTO_MEASURE_POINTS,
+                )
+                .map(|block| {
+                    let mut rows = Vec::new();
+                    for derived_index in &channels {
+                        let Some(values) = block.channels.get(*derived_index) else {
+                            continue;
+                        };
+                        if let Some(measurement) = Self::auto_measure(&block.times, values) {
+                            rows.push((*derived_index, measurement));
+                        }
                     }
-                }
-                rows
+                    rows
+                })
             });
             DerivedMeasurementJobResult {
                 generation,
@@ -6647,15 +13486,17 @@ impl ScopeApp {
                 channels,
                 result,
             }
-        }));
+        });
     }
 
     fn poll_sequence_worker(&mut self, expected_key: &SequenceJobKey) {
-        let Some(worker) = self.sequence_worker.take_if(|worker| worker.is_finished()) else {
+        let Some(joined) =
+            Self::take_finished_job(&mut self.sequence_worker, "Sequence worker panicked.")
+        else {
             return;
         };
         self.sequence_worker_key = None;
-        let Ok(result) = worker.join() else {
+        let Ok(result) = joined else {
             self.sequence_cache = Some(SequenceCache {
                 dataset_index: expected_key.dataset_index,
                 start: expected_key.start,
@@ -6701,51 +13542,56 @@ impl ScopeApp {
         let skip_digital_by_samples =
             self.dataset_kind_by_index(key.dataset_index) != Some(SourceKind::Cloud);
         self.sequence_worker_key = Some(key.clone());
-        self.sequence_worker = Some(thread::spawn(move || {
-            let result = if read_end <= read_start {
-                Err("Sequence analysis needs at least 16 samples in the cursor range.".to_owned())
-            } else {
-                source
-                    .read_range(read_start, read_end, &channels, MAX_FFT_POINTS)
-                    .map_err(|error| error.to_string())
-                    .and_then(|block| {
-                        if block.channels.len() < 3 {
-                            return Err("Sequence analysis needs three channels.".to_owned());
-                        }
-                        let samples = (0..3)
-                            .map(|out_index| {
-                                let values =
-                                    block.channels.get(out_index).cloned().unwrap_or_default();
-                                let scale = channel_scales[out_index];
-                                if (scale - DEFAULT_CHANNEL_SCALE).abs() <= f32::EPSILON {
-                                    values
-                                } else {
-                                    values.iter().map(|value| *value * scale).collect()
-                                }
+        Self::spawn_job(&mut self.sequence_worker, move || {
+            let result = Self::worker_result("Sequence worker panicked.", || {
+                if read_end <= read_start {
+                    Err(
+                        "Sequence analysis needs at least 16 samples in the cursor range."
+                            .to_owned(),
+                    )
+                } else {
+                    source
+                        .read_range(read_start, read_end, &channels, MAX_FFT_POINTS)
+                        .map_err(|error| error.to_string())
+                        .and_then(|block| {
+                            if block.channels.len() < 3 {
+                                return Err("Sequence analysis needs three channels.".to_owned());
+                            }
+                            let samples = (0..3)
+                                .map(|out_index| {
+                                    let values =
+                                        block.channels.get(out_index).cloned().unwrap_or_default();
+                                    let scale = channel_scales[out_index];
+                                    if (scale - DEFAULT_CHANNEL_SCALE).abs() <= f32::EPSILON {
+                                        values
+                                    } else {
+                                        values.iter().map(|value| *value * scale).collect()
+                                    }
+                                })
+                                .collect::<Vec<_>>();
+                            if skip_digital_by_samples
+                                && samples
+                                    .iter()
+                                    .any(|values| Self::samples_look_digital(values))
+                            {
+                                return Err(
+                                    "Sequence analysis only supports analog channels.".to_owned()
+                                );
+                            }
+                            fft::sequence_components(
+                                &samples[0],
+                                &samples[1],
+                                &samples[2],
+                                sample_rate_hz,
+                                harmonic_base_hz,
+                            )
+                            .ok_or_else(|| {
+                                "Sequence analysis needs at least 16 samples in the cursor range."
+                                    .to_owned()
                             })
-                            .collect::<Vec<_>>();
-                        if skip_digital_by_samples
-                            && samples
-                                .iter()
-                                .any(|values| Self::samples_look_digital(values))
-                        {
-                            return Err(
-                                "Sequence analysis only supports analog channels.".to_owned()
-                            );
-                        }
-                        fft::sequence_components(
-                            &samples[0],
-                            &samples[1],
-                            &samples[2],
-                            sample_rate_hz,
-                            harmonic_base_hz,
-                        )
-                        .ok_or_else(|| {
-                            "Sequence analysis needs at least 16 samples in the cursor range."
-                                .to_owned()
                         })
-                    })
-            };
+                }
+            });
             SequenceJobResult {
                 generation: key.generation,
                 dataset_index: key.dataset_index,
@@ -6754,16 +13600,16 @@ impl ScopeApp {
                 channels: key.channels,
                 result,
             }
-        }));
+        });
     }
 
     fn measurements_panel(&mut self, ui: &mut egui::Ui) {
-        let hidden_label = self.tr("（隐藏）", " (hidden)");
+        let hidden_label = self.t(UiText::Hidden);
         let dt = (self.cursor_b - self.cursor_a).abs();
         let dataset_index = self.selected_fft_dataset_index();
         self.fft_dataset_index = dataset_index;
 
-        ui.heading(self.tr("测量", "Measurements"));
+        ui.heading(self.t(UiText::Measurements));
         ui.horizontal_wrapped(|ui| {
             ui.label(format!(
                 "{}: {:.5}s{}",
@@ -6793,17 +13639,15 @@ impl ScopeApp {
         if self.source.is_none() {
             return;
         }
-        let channels = if dataset_index == 0 {
-            self.selected_channels()
-        } else {
-            self.selected_imported_channels(dataset_index - 1)
-        };
+        let channel_options = self.fft_channel_options();
+        let channels = channel_options
+            .contains(&self.fft_channel)
+            .then_some(self.fft_channel)
+            .into_iter()
+            .collect::<Vec<_>>();
         let derived_channels = self.selected_derived_channels();
         if channels.is_empty() && derived_channels.is_empty() {
-            ui.label(self.tr(
-                "当前数据组没有选中通道。",
-                "No channels selected in this dataset.",
-            ));
+            ui.label(self.t(UiText::NoChannelsSelected));
             return;
         }
         let measurement_channels = channels.iter().copied().take(12).collect::<Vec<_>>();
@@ -6855,7 +13699,7 @@ impl ScopeApp {
         };
         if !cache_matches {
             self.start_measurement_worker(measurement_key);
-            ui.label(self.tr("计算测量中...", "Calculating measurements..."));
+            ui.label(self.t(UiText::CalculatingMeasurements));
             ui.ctx().request_repaint();
             return;
         }
@@ -6867,28 +13711,50 @@ impl ScopeApp {
             egui::Grid::new("measurement_table")
                 .striped(true)
                 .num_columns(6)
-                .spacing([8.0, 4.0])
+                .spacing([10.0, 4.0])
                 .show(ui, |ui| {
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(
-                            MEASUREMENT_CHANNEL_COLUMN_WIDTH,
-                            ui.spacing().interact_size.y,
-                        ),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(self.tr("通道", "Channel")).strong(),
-                                )
-                                .truncate(true),
-                            );
-                        },
+                    Self::fixed_grid_label(
+                        ui,
+                        MEASUREMENT_CHANNEL_COLUMN_WIDTH,
+                        RichText::new(self.t(UiText::Channel)).strong(),
+                        false,
+                        true,
                     );
-                    ui.strong("Y1");
-                    ui.strong("Y2");
-                    ui.strong("dY");
-                    ui.strong(self.tr("最小", "Min"));
-                    ui.strong(self.tr("最大", "Max"));
+                    Self::fixed_grid_label(
+                        ui,
+                        MEASUREMENT_VALUE_COLUMN_WIDTH,
+                        RichText::new("Y1").strong(),
+                        true,
+                        false,
+                    );
+                    Self::fixed_grid_label(
+                        ui,
+                        MEASUREMENT_VALUE_COLUMN_WIDTH,
+                        RichText::new("Y2").strong(),
+                        true,
+                        false,
+                    );
+                    Self::fixed_grid_label(
+                        ui,
+                        MEASUREMENT_VALUE_COLUMN_WIDTH,
+                        RichText::new("dY").strong(),
+                        true,
+                        false,
+                    );
+                    Self::fixed_grid_label(
+                        ui,
+                        MEASUREMENT_VALUE_COLUMN_WIDTH,
+                        RichText::new(self.t(UiText::Min)).strong(),
+                        true,
+                        false,
+                    );
+                    Self::fixed_grid_label(
+                        ui,
+                        MEASUREMENT_VALUE_COLUMN_WIDTH,
+                        RichText::new(self.t(UiText::Max)).strong(),
+                        true,
+                        false,
+                    );
                     ui.end_row();
 
                     for (channel_index, measurement) in &cache.rows {
@@ -6911,23 +13777,49 @@ impl ScopeApp {
                             }
                         };
                         let channel_name = self.fft_channel_name(dataset_index, *channel_index);
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(
-                                MEASUREMENT_CHANNEL_COLUMN_WIDTH,
-                                ui.spacing().interact_size.y,
-                            ),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.add(egui::Label::new(text(channel_name.clone())).truncate(true))
-                            },
+                        Self::fixed_grid_label(
+                            ui,
+                            MEASUREMENT_CHANNEL_COLUMN_WIDTH,
+                            text(channel_name.clone()),
+                            false,
+                            true,
                         )
-                        .inner
                         .on_hover_text(channel_name);
-                        ui.label(text(format!("{:.2}", measurement.first)));
-                        ui.label(text(format!("{:.2}", measurement.last)));
-                        ui.label(text(format!("{:.2}", measurement.last - measurement.first)));
-                        ui.label(text(format!("{:.2}", measurement.min)));
-                        ui.label(text(format!("{:.2}", measurement.max)));
+                        Self::fixed_grid_label(
+                            ui,
+                            MEASUREMENT_VALUE_COLUMN_WIDTH,
+                            text(format!("{:.2}", measurement.first)),
+                            true,
+                            false,
+                        );
+                        Self::fixed_grid_label(
+                            ui,
+                            MEASUREMENT_VALUE_COLUMN_WIDTH,
+                            text(format!("{:.2}", measurement.last)),
+                            true,
+                            false,
+                        );
+                        Self::fixed_grid_label(
+                            ui,
+                            MEASUREMENT_VALUE_COLUMN_WIDTH,
+                            text(format!("{:.2}", measurement.last - measurement.first)),
+                            true,
+                            false,
+                        );
+                        Self::fixed_grid_label(
+                            ui,
+                            MEASUREMENT_VALUE_COLUMN_WIDTH,
+                            text(format!("{:.2}", measurement.min)),
+                            true,
+                            false,
+                        );
+                        Self::fixed_grid_label(
+                            ui,
+                            MEASUREMENT_VALUE_COLUMN_WIDTH,
+                            text(format!("{:.2}", measurement.max)),
+                            true,
+                            false,
+                        );
                         ui.end_row();
                     }
                     if let Some(cache) = &self.derived_measurement_cache {
@@ -6935,26 +13827,49 @@ impl ScopeApp {
                             let color = self.derived_channel_color(*derived_index);
                             let text = |value: String| RichText::new(value).color(color);
                             let channel_name = Self::derived_channel_name(*derived_index);
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(
-                                    MEASUREMENT_CHANNEL_COLUMN_WIDTH,
-                                    ui.spacing().interact_size.y,
-                                ),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.add(
-                                        egui::Label::new(text(channel_name.to_owned()))
-                                            .truncate(true),
-                                    )
-                                },
+                            Self::fixed_grid_label(
+                                ui,
+                                MEASUREMENT_CHANNEL_COLUMN_WIDTH,
+                                text(channel_name.to_owned()),
+                                false,
+                                true,
                             )
-                            .inner
                             .on_hover_text(channel_name);
-                            ui.label(text(format!("{:.2}", measurement.first)));
-                            ui.label(text(format!("{:.2}", measurement.last)));
-                            ui.label(text(format!("{:.2}", measurement.last - measurement.first)));
-                            ui.label(text(format!("{:.2}", measurement.min)));
-                            ui.label(text(format!("{:.2}", measurement.max)));
+                            Self::fixed_grid_label(
+                                ui,
+                                MEASUREMENT_VALUE_COLUMN_WIDTH,
+                                text(format!("{:.2}", measurement.first)),
+                                true,
+                                false,
+                            );
+                            Self::fixed_grid_label(
+                                ui,
+                                MEASUREMENT_VALUE_COLUMN_WIDTH,
+                                text(format!("{:.2}", measurement.last)),
+                                true,
+                                false,
+                            );
+                            Self::fixed_grid_label(
+                                ui,
+                                MEASUREMENT_VALUE_COLUMN_WIDTH,
+                                text(format!("{:.2}", measurement.last - measurement.first)),
+                                true,
+                                false,
+                            );
+                            Self::fixed_grid_label(
+                                ui,
+                                MEASUREMENT_VALUE_COLUMN_WIDTH,
+                                text(format!("{:.2}", measurement.min)),
+                                true,
+                                false,
+                            );
+                            Self::fixed_grid_label(
+                                ui,
+                                MEASUREMENT_VALUE_COLUMN_WIDTH,
+                                text(format!("{:.2}", measurement.max)),
+                                true,
+                                false,
+                            );
                             ui.end_row();
                         }
                     }
@@ -6964,7 +13879,7 @@ impl ScopeApp {
 
     fn sequence_panel(&mut self, ui: &mut egui::Ui, channel_options: &[usize]) {
         ui.separator();
-        ui.heading(self.tr("正负序", "Sequence"));
+        ui.heading(self.t(UiText::Sequence));
         if channel_options.len() < 3 {
             ui.label(self.tr(
                 "正负序分析至少需要三个模拟量通道。",
@@ -6994,22 +13909,28 @@ impl ScopeApp {
                 ui.label(*phase_label);
                 let selected_name = self
                     .fft_channel_name(self.fft_dataset_index, self.sequence_channels[phase_index]);
-                egui::ComboBox::from_id_source((
+                let selected_short =
+                    Self::compact_label(&selected_name, ANALYSIS_CHANNEL_LABEL_CHARS);
+                let response = egui::ComboBox::from_id_source((
                     "sequence_channel",
                     self.fft_dataset_index,
                     phase_index,
                 ))
-                .selected_text(selected_name)
+                .width(ANALYSIS_CHANNEL_COMBO_WIDTH)
+                .selected_text(selected_short)
                 .show_ui(ui, |ui| {
                     for channel_index in channel_options {
                         let channel_name =
                             self.fft_channel_name(self.fft_dataset_index, *channel_index);
+                        let channel_short =
+                            Self::compact_label(&channel_name, ANALYSIS_CHANNEL_LABEL_CHARS + 8);
                         if ui
                             .selectable_value(
                                 &mut self.sequence_channels[phase_index],
                                 *channel_index,
-                                channel_name,
+                                channel_short,
                             )
+                            .on_hover_text(channel_name)
                             .changed()
                         {
                             self.sequence_channels_user_selected = true;
@@ -7026,6 +13947,7 @@ impl ScopeApp {
                         }
                     }
                 });
+                response.response.on_hover_text(selected_name);
             }
         });
 
@@ -7047,7 +13969,7 @@ impl ScopeApp {
         });
         if !cache_matches {
             self.start_sequence_worker(sequence_key);
-            ui.label(self.tr("计算正负序中...", "Calculating sequence..."));
+            ui.label(self.t(UiText::CalculatingSequence));
             ui.ctx().request_repaint();
             return;
         }
@@ -7067,22 +13989,71 @@ impl ScopeApp {
                 egui::Grid::new("sequence_table")
                     .striped(true)
                     .num_columns(4)
+                    .spacing([10.0, 4.0])
                     .show(ui, |ui| {
-                        ui.strong(self.tr("分量", "Component"));
-                        ui.strong(self.tr("幅值", "Amplitude"));
-                        ui.strong(self.tr("相位", "Phase"));
-                        ui.strong(self.tr("相对正序比例", "% Positive"));
+                        Self::fixed_grid_label(
+                            ui,
+                            ANALYSIS_LABEL_COLUMN_WIDTH,
+                            RichText::new(self.t(UiText::Component)).strong(),
+                            false,
+                            false,
+                        );
+                        Self::fixed_grid_label(
+                            ui,
+                            ANALYSIS_VALUE_COLUMN_WIDTH,
+                            RichText::new(self.t(UiText::Amplitude)).strong(),
+                            true,
+                            false,
+                        );
+                        Self::fixed_grid_label(
+                            ui,
+                            ANALYSIS_VALUE_COLUMN_WIDTH,
+                            RichText::new(self.t(UiText::Phase)).strong(),
+                            true,
+                            false,
+                        );
+                        Self::fixed_grid_label(
+                            ui,
+                            ANALYSIS_VALUE_COLUMN_WIDTH + 24.0,
+                            RichText::new(self.t(UiText::PositiveRatio)).strong(),
+                            true,
+                            false,
+                        );
                         ui.end_row();
                         let rows = [
-                            (self.tr("零序", "Zero"), result.zero),
-                            (self.tr("正序", "Positive"), result.positive),
-                            (self.tr("负序", "Negative"), result.negative),
+                            (self.t(UiText::ZeroSequence), result.zero),
+                            (self.t(UiText::PositiveSequence), result.positive),
+                            (self.t(UiText::NegativeSequence), result.negative),
                         ];
                         for (label, component) in rows {
-                            ui.label(label);
-                            ui.label(format!("{:.6}", component.amplitude));
-                            ui.label(format!("{:.2}", component.phase_deg));
-                            ui.label(format!("{:.2}%", component.relative_percent));
+                            Self::fixed_grid_label(
+                                ui,
+                                ANALYSIS_LABEL_COLUMN_WIDTH,
+                                label,
+                                false,
+                                false,
+                            );
+                            Self::fixed_grid_label(
+                                ui,
+                                ANALYSIS_VALUE_COLUMN_WIDTH,
+                                format!("{:.6}", component.amplitude),
+                                true,
+                                false,
+                            );
+                            Self::fixed_grid_label(
+                                ui,
+                                ANALYSIS_VALUE_COLUMN_WIDTH,
+                                format!("{:.2}", component.phase_deg),
+                                true,
+                                false,
+                            );
+                            Self::fixed_grid_label(
+                                ui,
+                                ANALYSIS_VALUE_COLUMN_WIDTH + 24.0,
+                                format!("{:.2}%", component.relative_percent),
+                                true,
+                                false,
+                            );
                             ui.end_row();
                         }
                     });
@@ -7100,6 +14071,59 @@ impl ScopeApp {
             && !Self::triplet_has_duplicates(channels)
     }
 
+    fn three_phase_channel_selectors_ui(
+        ui: &mut egui::Ui,
+        id_prefix: &'static str,
+        dataset_index: usize,
+        channel_options: &[(usize, String, Option<[usize; 3]>)],
+        channels: &mut [usize; 3],
+    ) -> bool {
+        let phase_labels = ["A", "B", "C"];
+        let mut changed = false;
+        ui.horizontal_wrapped(|ui| {
+            for (phase_index, phase_label) in phase_labels.iter().enumerate() {
+                ui.label(*phase_label);
+                let selected_name = channel_options
+                    .iter()
+                    .find(|(channel_index, _, _)| *channel_index == channels[phase_index])
+                    .map(|(_, name, _)| name.as_str())
+                    .unwrap_or("");
+                let selected_short =
+                    Self::compact_label(selected_name, ANALYSIS_CHANNEL_LABEL_CHARS);
+                let response =
+                    egui::ComboBox::from_id_source((id_prefix, dataset_index, phase_index))
+                        .width(ANALYSIS_CHANNEL_COMBO_WIDTH)
+                        .selected_text(selected_short)
+                        .show_ui(ui, |ui| {
+                            for (channel_index, channel_name, related_channels) in channel_options {
+                                let channel_short = Self::compact_label(
+                                    channel_name,
+                                    ANALYSIS_CHANNEL_LABEL_CHARS + 8,
+                                );
+                                if ui
+                                    .selectable_value(
+                                        &mut channels[phase_index],
+                                        *channel_index,
+                                        channel_short,
+                                    )
+                                    .on_hover_text(channel_name)
+                                    .changed()
+                                {
+                                    if phase_index == 0 {
+                                        if let Some(related) = related_channels {
+                                            *channels = *related;
+                                        }
+                                    }
+                                    changed = true;
+                                }
+                            }
+                        });
+                response.response.on_hover_text(selected_name);
+            }
+        });
+        changed
+    }
+
     fn pll_dq_panel(&mut self, ui: &mut egui::Ui, channel_options: &[usize]) {
         ui.separator();
         ui.heading("PLL / dq0");
@@ -7112,11 +14136,11 @@ impl ScopeApp {
             return;
         }
 
-        let next_pll_source = self
-            .preferred_pll_source_channels(channel_options)
-            .unwrap_or([0, 1, 2]);
-        if self.pll_source_channels != next_pll_source {
-            self.pll_source_channels = next_pll_source;
+        if !Self::valid_three_phase_selection(self.pll_source_channels, channel_options) {
+            self.pll_source_channels = self
+                .preferred_pll_source_channels(channel_options)
+                .or_else(|| Self::default_sequence_channels_from_options(channel_options))
+                .unwrap_or([0, 1, 2]);
             self.needs_derived_reload = true;
         }
         let preferred = self.preferred_three_phase_channels(channel_options, true);
@@ -7136,57 +14160,31 @@ impl ScopeApp {
                 (
                     *channel,
                     self.fft_channel_name(self.fft_dataset_index, *channel),
+                    self.related_three_phase_channels_from_anchor(*channel, channel_options),
                 )
             })
             .collect::<Vec<_>>();
         let mut changed = false;
-        let phase_labels = ["A", "B", "C"];
-        let pll_names = self
-            .pll_source_channels
-            .iter()
-            .map(|channel| self.fft_channel_name(self.fft_dataset_index, *channel))
-            .collect::<Vec<_>>()
-            .join(" / ");
-        ui.label(format!(
-            "{}: {} ({pll_names})",
-            self.tr("锁相环同步源", "PLL sync source"),
-            self.pll_sync_source.label(self.language)
-        ));
-        ui.label(self.tr("dq0 输入", "dq0 input"));
-        ui.horizontal_wrapped(|ui| {
-            for (phase_index, phase_label) in phase_labels.iter().enumerate() {
-                ui.label(*phase_label);
-                let selected_name = self
-                    .fft_channel_name(self.fft_dataset_index, self.dq_source_channels[phase_index]);
-                egui::ComboBox::from_id_source(("dq_source_channel", phase_index))
-                    .selected_text(selected_name)
-                    .show_ui(ui, |ui| {
-                        for (channel_index, channel_name) in &options {
-                            if ui
-                                .selectable_value(
-                                    &mut self.dq_source_channels[phase_index],
-                                    *channel_index,
-                                    channel_name,
-                                )
-                                .changed()
-                            {
-                                self.dq_source_channels_user_selected = true;
-                                if phase_index == 0 {
-                                    if let Some(channels) = self
-                                        .related_three_phase_channels_from_anchor(
-                                            *channel_index,
-                                            channel_options,
-                                        )
-                                    {
-                                        self.dq_source_channels = channels;
-                                    }
-                                }
-                                changed = true;
-                            }
-                        }
-                    });
-            }
-        });
+        ui.label(self.t(UiText::PllSyncSource));
+        changed |= Self::three_phase_channel_selectors_ui(
+            ui,
+            "pll_source_channel",
+            self.fft_dataset_index,
+            &options,
+            &mut self.pll_source_channels,
+        );
+        ui.label(self.t(UiText::Dq0Input));
+        let dq_changed = Self::three_phase_channel_selectors_ui(
+            ui,
+            "dq_source_channel",
+            self.fft_dataset_index,
+            &options,
+            &mut self.dq_source_channels,
+        );
+        if dq_changed {
+            self.dq_source_channels_user_selected = true;
+            changed = true;
+        }
 
         if changed {
             self.derived_curve_cache = None;
@@ -7197,24 +14195,15 @@ impl ScopeApp {
         if Self::triplet_has_duplicates(self.pll_source_channels)
             || Self::triplet_has_duplicates(self.dq_source_channels)
         {
-            ui.label(
-                RichText::new(self.tr("A/B/C 通道不能重复。", "A/B/C channels must be distinct."))
-                    .color(Color32::LIGHT_RED),
-            );
+            ui.label(RichText::new(self.t(UiText::PllDistinctChannels)).color(Color32::LIGHT_RED));
         } else {
             let selected_count = self.selected_derived_channels().len();
             ui.label(if selected_count == 0 {
-                self.tr(
-                    "在左侧派生量分组勾选派生曲线。",
-                    "Select derived curves below.",
-                )
+                self.t(UiText::SelectDerivedCurves)
             } else if self.derived_curve_worker.is_some() {
-                self.tr("PLL/dq0 计算中...", "Calculating PLL/dq0...")
+                self.t(UiText::CalculatingPllDq0)
             } else {
-                self.tr(
-                    "PLL/dq0 派生曲线已启用。",
-                    "PLL/dq0 uses the Analysis Dataset selected above.",
-                )
+                self.t(UiText::PllDq0Enabled)
             });
         }
         self.derived_channels_panel_ui(ui);
@@ -7223,7 +14212,7 @@ impl ScopeApp {
     fn fft_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("FFT");
         if self.meta().is_none() {
-            ui.label(self.tr("未加载数据。", "No data loaded."));
+            ui.label(self.t(UiText::NoDataLoaded));
             return;
         }
 
@@ -7233,40 +14222,14 @@ impl ScopeApp {
         if fft_channels.is_empty() {
             self.fft_results.clear();
             self.needs_fft_reload = false;
-            ui.label(self.tr(
-                "没有可用于 FFT 的模拟量通道。",
-                "No analog channels are available for FFT.",
-            ));
+            ui.label(self.t(UiText::NoAnalogFftChannels));
             return;
         }
-        let preferred_fft_channel = self.preferred_fft_channel(&fft_channels);
-        let should_use_preferred = !fft_channels.contains(&self.fft_channel)
-            || (!self.fft_channel_user_selected && Some(self.fft_channel) != preferred_fft_channel);
-        if should_use_preferred {
-            self.fft_channel = preferred_fft_channel.unwrap_or(fft_channels[0]);
-            self.fft_results.clear();
-            self.needs_fft_reload = true;
-        }
-        let mut fft_channel_changed = false;
-        ui.horizontal_wrapped(|ui| {
-            ui.label(self.tr("通道", "Channel"));
-            egui::ComboBox::from_id_source("fft_channel_select")
-                .selected_text(self.fft_channel_name(self.fft_dataset_index, self.fft_channel))
-                .show_ui(ui, |ui| {
-                    for channel_index in &fft_channels {
-                        let channel_name =
-                            self.fft_channel_name(self.fft_dataset_index, *channel_index);
-                        if ui
-                            .selectable_value(&mut self.fft_channel, *channel_index, channel_name)
-                            .changed()
-                        {
-                            fft_channel_changed = true;
-                        }
-                    }
-                });
-        });
-        if fft_channel_changed {
-            self.fft_channel_user_selected = true;
+        if !fft_channels.contains(&self.fft_channel) {
+            self.fft_channel = self
+                .preferred_fft_channel(&fft_channels)
+                .unwrap_or(fft_channels[0]);
+            self.fft_channel_user_selected = false;
             self.fft_results.clear();
             self.needs_fft_reload = true;
         }
@@ -7276,7 +14239,7 @@ impl ScopeApp {
             self.run_fft();
         }
         if self.fft_worker.is_some() {
-            ui.label(self.tr("FFT 计算中...", "Calculating FFT..."));
+            ui.label(self.t(UiText::CalculatingFft));
             ui.ctx().request_repaint();
         }
 
@@ -7296,11 +14259,36 @@ impl ScopeApp {
             egui::Grid::new(("harmonics", *channel_index))
                 .striped(true)
                 .num_columns(4)
+                .spacing([10.0, 4.0])
                 .show(ui, |ui| {
-                    ui.strong(self.tr("次数", "Order"));
-                    ui.strong(self.tr("幅值", "Amplitude"));
-                    ui.strong(self.tr("相位", "Phase"));
-                    ui.strong(self.tr("相对基波比例", "% Fundamental"));
+                    Self::fixed_grid_label(
+                        ui,
+                        ANALYSIS_LABEL_COLUMN_WIDTH,
+                        RichText::new(self.t(UiText::Order)).strong(),
+                        false,
+                        false,
+                    );
+                    Self::fixed_grid_label(
+                        ui,
+                        ANALYSIS_VALUE_COLUMN_WIDTH,
+                        RichText::new(self.t(UiText::Amplitude)).strong(),
+                        true,
+                        false,
+                    );
+                    Self::fixed_grid_label(
+                        ui,
+                        ANALYSIS_VALUE_COLUMN_WIDTH,
+                        RichText::new(self.t(UiText::Phase)).strong(),
+                        true,
+                        false,
+                    );
+                    Self::fixed_grid_label(
+                        ui,
+                        ANALYSIS_VALUE_COLUMN_WIDTH + 28.0,
+                        RichText::new(self.t(UiText::FundamentalRatio)).strong(),
+                        true,
+                        false,
+                    );
                     ui.end_row();
                     for row in &result.harmonics {
                         let order_text = if self.language == Language::Zh {
@@ -7314,24 +14302,69 @@ impl ScopeApp {
                             format!("{:.2}", row.phase_deg)
                         };
                         if row.order == 1 {
-                            ui.strong(order_text);
-                            ui.strong(format!("{:.6}", row.amplitude));
-                            ui.strong(phase_text);
-                            ui.strong(format!("{:.2}%", row.relative_percent));
+                            Self::fixed_grid_label(
+                                ui,
+                                ANALYSIS_LABEL_COLUMN_WIDTH,
+                                RichText::new(order_text).strong(),
+                                false,
+                                false,
+                            );
+                            Self::fixed_grid_label(
+                                ui,
+                                ANALYSIS_VALUE_COLUMN_WIDTH,
+                                RichText::new(format!("{:.6}", row.amplitude)).strong(),
+                                true,
+                                false,
+                            );
+                            Self::fixed_grid_label(
+                                ui,
+                                ANALYSIS_VALUE_COLUMN_WIDTH,
+                                RichText::new(phase_text).strong(),
+                                true,
+                                false,
+                            );
+                            Self::fixed_grid_label(
+                                ui,
+                                ANALYSIS_VALUE_COLUMN_WIDTH + 28.0,
+                                RichText::new(format!("{:.2}%", row.relative_percent)).strong(),
+                                true,
+                                false,
+                            );
                         } else {
-                            ui.label(order_text);
-                            ui.label(format!("{:.6}", row.amplitude));
-                            ui.label(phase_text);
-                            ui.label(format!("{:.2}%", row.relative_percent));
+                            Self::fixed_grid_label(
+                                ui,
+                                ANALYSIS_LABEL_COLUMN_WIDTH,
+                                order_text,
+                                false,
+                                false,
+                            );
+                            Self::fixed_grid_label(
+                                ui,
+                                ANALYSIS_VALUE_COLUMN_WIDTH,
+                                format!("{:.6}", row.amplitude),
+                                true,
+                                false,
+                            );
+                            Self::fixed_grid_label(
+                                ui,
+                                ANALYSIS_VALUE_COLUMN_WIDTH,
+                                phase_text,
+                                true,
+                                false,
+                            );
+                            Self::fixed_grid_label(
+                                ui,
+                                ANALYSIS_VALUE_COLUMN_WIDTH + 28.0,
+                                format!("{:.2}%", row.relative_percent),
+                                true,
+                                false,
+                            );
                         }
                         ui.end_row();
                     }
                 });
         } else {
-            ui.label(self.tr(
-                "FFT 需要光标区间内至少 16 个采样点。",
-                "FFT needs at least 16 samples in the cursor range.",
-            ));
+            ui.label(self.t(UiText::FftNeedsCursorSamples));
         }
         self.sequence_panel(ui, &fft_channels);
         self.pll_dq_panel(ui, &fft_channels);
@@ -7340,22 +14373,20 @@ impl ScopeApp {
     fn plot_panel(&mut self, ui: &mut egui::Ui) {
         self.poll_plot_worker();
         self.poll_compare_plot_worker();
-        self.reload_derived_curve_cache();
         let reload_ready = self.plot_reload_debounce_ready(ui.ctx());
-        if reload_ready && self.needs_plot_reload {
-            self.reload_plot_cache();
+        if reload_ready {
+            self.reload_derived_curve_cache();
         }
-        if reload_ready && self.needs_compare_plot_reload {
-            self.reload_compare_plot_cache();
-        }
-        if self.plot_worker.is_some()
-            || self.compare_plot_worker.is_some()
-            || self.derived_curve_worker.is_some()
-        {
+        if self.any_background_job_running() {
             ui.ctx().request_repaint();
         }
+        let lightweight_plot =
+            self.layout_resize_active() || self.plot_interaction_debounce_active();
+        if lightweight_plot {
+            ui.ctx().request_repaint_after(LAYOUT_RESIZE_ACTIVE_GRACE);
+        }
 
-        let selected = self.selected_channels();
+        let selections = self.current_plot_selections();
         let rows = self.scope_layout_rows.clamp(1, MAX_SCOPE_LAYOUT_ROWS);
         let cols = self.scope_layout_cols.clamp(1, MAX_SCOPE_LAYOUT_COLS);
         let pane_count = rows * cols;
@@ -7371,9 +14402,26 @@ impl ScopeApp {
             ((available.y.max(320.0) - spacing.y * (rows.saturating_sub(1) as f32)) / rows as f32)
                 .max(140.0)
         };
+        if reload_ready && self.needs_plot_reload {
+            self.reload_plot_cache(pane_width);
+        }
+        if reload_ready && self.needs_compare_plot_reload {
+            self.reload_compare_plot_cache(pane_width);
+        }
+        let pane_selections = self.pane_plot_selections(&selections, pane_count);
+        let y_bounds = self.current_y_bounds_for_panes(&pane_selections, pane_count);
 
         if pane_count <= 1 {
-            self.draw_scope_pane(ui, 0, 1, &selected, pane_width, pane_height);
+            self.draw_scope_pane(
+                ui,
+                0,
+                1,
+                &pane_selections[0],
+                y_bounds[0],
+                pane_width,
+                pane_height,
+                lightweight_plot,
+            );
             return;
         }
 
@@ -7387,9 +14435,11 @@ impl ScopeApp {
                                 ui,
                                 pane_index,
                                 pane_count,
-                                &selected,
+                                &pane_selections[pane_index],
+                                y_bounds[pane_index],
                                 pane_width,
                                 pane_height,
+                                lightweight_plot,
                             );
                         });
                     }
@@ -7403,134 +14453,126 @@ impl ScopeApp {
         ui: &mut egui::Ui,
         pane_index: usize,
         pane_count: usize,
-        selected: &[usize],
+        selections: &PanePlotSelections,
+        y_bounds: (f64, f64),
         pane_width: f32,
         pane_height: f32,
+        lightweight_plot: bool,
     ) {
-        let (plot_y_min, plot_y_max) = self.current_y_bounds_for(selected, pane_index, pane_count);
-        let show_dataset_legend = pane_count > 1;
+        let (plot_y_min, plot_y_max) = y_bounds;
+        let show_dataset_prefix =
+            self.pane_has_dataset_comparison(selections, pane_index, pane_count);
+        let show_legend = pane_count > 1 || show_dataset_prefix;
         let mut plot = Plot::new(format!("scope_plot_{pane_index}"))
             .width(pane_width)
             .height(pane_height)
             .allow_drag(false)
             .allow_scroll(false)
             .allow_zoom(false);
-        if show_dataset_legend {
+        if show_legend {
             plot = plot.legend(Legend::default());
         }
-        let primary_legend_prefix = if show_dataset_legend {
-            Some(format!("数据{}", Self::dataset_letter(0)))
-        } else {
-            None
-        };
         let response = plot.show(ui, |plot_ui| {
             plot_ui.set_plot_bounds(PlotBounds::from_min_max(
                 [self.view_start, plot_y_min],
                 [self.view_end, plot_y_max],
             ));
-            let preview_cursor_x = self
-                .cursor_place_mode
-                .and_then(|_| plot_ui.pointer_coordinate())
-                .map(|point| point.x);
+            let preview_cursor_x = (!lightweight_plot)
+                .then(|| {
+                    self.cursor_place_mode
+                        .and_then(|_| plot_ui.pointer_coordinate())
+                        .map(|point| point.x)
+                })
+                .flatten();
             let mut preview_intersections = Vec::new();
 
-            for (out_index, channel_index) in selected.iter().enumerate() {
-                if !self.channel_in_scope_pane(*channel_index, pane_index, pane_count)
-                    || out_index >= self.prepared_plot_cache.points.len()
-                {
+            for (out_index, channel_index) in &selections.primary {
+                if *out_index >= self.prepared_plot_cache.points.len() {
                     continue;
                 }
-                let Some(points) = self.prepared_plot_cache.points.get(out_index) else {
+                let Some(points) = self.prepared_plot_cache.points.get(*out_index) else {
                     continue;
                 };
                 let channel_name = self.channel_name(*channel_index);
-                let legend_name = if show_dataset_legend {
-                    format!(
-                        "{}: {channel_name}",
-                        primary_legend_prefix.as_deref().unwrap_or("")
-                    )
-                } else {
-                    channel_name
-                };
+                let legend_name =
+                    self.plot_legend_name(0, &channel_name, show_dataset_prefix, None);
                 let line_color = self.plot_channel_color(*channel_index, 0, pane_index, pane_count);
                 if let Some(y) = preview_cursor_x.and_then(|x| Self::interpolated_y(points, x)) {
                     preview_intersections.push((y, line_color));
                 }
                 plot_ui.line(
-                    Line::new(PlotPoints::from(points.clone()))
-                        .name(legend_name)
-                        .color(line_color)
-                        .style(self.channel_line_pattern(*channel_index).plot_style())
-                        .width(self.visible_line_width(*channel_index)),
+                    Line::new(Self::frame_plot_points(
+                        points,
+                        self.prepared_plot_cache.lightweight_points.get(*out_index),
+                        lightweight_plot,
+                    ))
+                    .name(legend_name)
+                    .color(line_color)
+                    .style(self.channel_line_pattern(*channel_index).plot_style())
+                    .width(self.visible_line_width(*channel_index)),
                 );
             }
 
             if let (Some(summary), Some(prepared_summary)) =
                 (&self.plot_summary, &self.prepared_plot_summary)
             {
-                for (out_index, channel_index) in selected.iter().enumerate() {
-                    if !self.channel_in_scope_pane(*channel_index, pane_index, pane_count)
-                        || out_index >= prepared_summary.points.len()
-                    {
+                for (out_index, channel_index) in &selections.primary {
+                    if *out_index >= prepared_summary.points.len() {
                         continue;
                     }
-                    let Some(envelope) = prepared_summary.points.get(out_index) else {
+                    let Some(envelope) = prepared_summary.points.get(*out_index) else {
                         continue;
                     };
                     let channel_name = self.channel_name(*channel_index);
-                    let legend_name = if show_dataset_legend {
-                        format!(
-                            "{}: {channel_name} min/max",
-                            primary_legend_prefix.as_deref().unwrap_or("")
-                        )
-                    } else {
-                        format!("{channel_name} min/max")
-                    };
+                    let legend_name = self.plot_legend_name(
+                        0,
+                        &channel_name,
+                        show_dataset_prefix,
+                        Some("min/max"),
+                    );
                     let line_color =
                         self.plot_channel_color(*channel_index, 0, pane_index, pane_count);
                     if let Some(y) = preview_cursor_x.and_then(|x| {
-                        self.summary_cursor_y(summary, out_index, *channel_index, x, 0.0)
+                        self.summary_cursor_y(summary, *out_index, *channel_index, x, 0.0)
                     }) {
                         preview_intersections.push((y, line_color));
                     }
                     plot_ui.line(
-                        Line::new(PlotPoints::from(envelope.clone()))
-                            .name(legend_name)
-                            .color(line_color)
-                            .style(self.channel_line_pattern(*channel_index).plot_style())
-                            .width(self.visible_line_width(*channel_index)),
+                        Line::new(Self::frame_plot_points(
+                            envelope,
+                            prepared_summary.lightweight_points.get(*out_index),
+                            lightweight_plot,
+                        ))
+                        .name(legend_name)
+                        .color(line_color)
+                        .style(self.channel_line_pattern(*channel_index).plot_style())
+                        .width(self.visible_line_width(*channel_index)),
                     );
                 }
             }
 
             for (dataset_index, dataset) in self.imported_datasets.iter().enumerate() {
-                let compare_selected = self.selected_imported_channels(dataset_index);
-                let dataset_label = dataset.display_name.clone();
-                let dataset_legend_prefix = if show_dataset_legend {
-                    Some(format!("数据{}", Self::dataset_letter(dataset_index + 1)))
-                } else {
-                    None
-                };
+                let compare_selected = selections
+                    .imported
+                    .get(dataset_index)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
                 let dataset_line_style = dataset.line_pattern.plot_style();
                 let time_offset = self.dataset_time_offset(dataset_index + 1);
-                for (out_index, channel_index) in compare_selected.iter().enumerate() {
-                    if !self.channel_in_scope_pane(*channel_index, pane_index, pane_count)
-                        || out_index >= dataset.prepared_plot_cache.points.len()
-                    {
+                for (out_index, channel_index) in compare_selected {
+                    if *out_index >= dataset.prepared_plot_cache.points.len() {
                         continue;
                     }
-                    let Some(points) = dataset.prepared_plot_cache.points.get(out_index) else {
+                    let Some(points) = dataset.prepared_plot_cache.points.get(*out_index) else {
                         continue;
                     };
                     let channel_name = self.channel_name(*channel_index);
-                    let legend_name = if show_dataset_legend {
-                        format!(
-                            "{}: {channel_name}",
-                            dataset_legend_prefix.as_deref().unwrap_or("")
-                        )
-                    } else {
-                        format!("{dataset_label}: {channel_name}")
-                    };
+                    let legend_name = self.plot_legend_name(
+                        dataset_index + 1,
+                        &channel_name,
+                        show_dataset_prefix,
+                        None,
+                    );
                     let line_color = self.plot_channel_color(
                         *channel_index,
                         dataset_index + 1,
@@ -7542,35 +14584,38 @@ impl ScopeApp {
                         preview_intersections.push((y, line_color));
                     }
                     plot_ui.line(
-                        Line::new(PlotPoints::from(points.clone()))
-                            .name(legend_name)
-                            .color(line_color)
-                            .style(dataset_line_style)
-                            .width(self.compare_line_width(*channel_index)),
+                        Line::new(Self::frame_plot_points(
+                            points,
+                            dataset
+                                .prepared_plot_cache
+                                .lightweight_points
+                                .get(*out_index),
+                            lightweight_plot,
+                        ))
+                        .name(legend_name)
+                        .color(line_color)
+                        .style(dataset_line_style)
+                        .width(self.compare_line_width(*channel_index)),
                     );
                 }
 
                 if let (Some(summary), Some(prepared_summary)) =
                     (&dataset.plot_summary, &dataset.prepared_plot_summary)
                 {
-                    for (out_index, channel_index) in compare_selected.iter().enumerate() {
-                        if !self.channel_in_scope_pane(*channel_index, pane_index, pane_count)
-                            || out_index >= prepared_summary.points.len()
-                        {
+                    for (out_index, channel_index) in compare_selected {
+                        if *out_index >= prepared_summary.points.len() {
                             continue;
                         }
-                        let Some(envelope) = prepared_summary.points.get(out_index) else {
+                        let Some(envelope) = prepared_summary.points.get(*out_index) else {
                             continue;
                         };
                         let channel_name = self.channel_name(*channel_index);
-                        let legend_name = if show_dataset_legend {
-                            format!(
-                                "{}: {channel_name} min/max",
-                                dataset_legend_prefix.as_deref().unwrap_or("")
-                            )
-                        } else {
-                            format!("{dataset_label}: {channel_name} min/max")
-                        };
+                        let legend_name = self.plot_legend_name(
+                            dataset_index + 1,
+                            &channel_name,
+                            show_dataset_prefix,
+                            Some("min/max"),
+                        );
                         let line_color = self.plot_channel_color(
                             *channel_index,
                             dataset_index + 1,
@@ -7580,7 +14625,7 @@ impl ScopeApp {
                         if let Some(y) = preview_cursor_x.and_then(|x| {
                             self.summary_cursor_y(
                                 summary,
-                                out_index,
+                                *out_index,
                                 *channel_index,
                                 x,
                                 time_offset,
@@ -7589,23 +14634,25 @@ impl ScopeApp {
                             preview_intersections.push((y, line_color));
                         }
                         plot_ui.line(
-                            Line::new(PlotPoints::from(envelope.clone()))
-                                .name(legend_name)
-                                .color(line_color)
-                                .style(dataset_line_style)
-                                .width(self.compare_line_width(*channel_index)),
+                            Line::new(Self::frame_plot_points(
+                                envelope,
+                                prepared_summary.lightweight_points.get(*out_index),
+                                lightweight_plot,
+                            ))
+                            .name(legend_name)
+                            .color(line_color)
+                            .style(dataset_line_style)
+                            .width(self.compare_line_width(*channel_index)),
                         );
                     }
                 }
             }
 
-            for (out_index, derived_index) in self.selected_derived_channels().iter().enumerate() {
-                if !self.derived_in_scope_pane(*derived_index, pane_index, pane_count)
-                    || out_index >= self.prepared_derived_curve_cache.points.len()
-                {
+            for (out_index, derived_index) in &selections.derived {
+                if *out_index >= self.prepared_derived_curve_cache.points.len() {
                     continue;
                 }
-                let Some(points) = self.prepared_derived_curve_cache.points.get(out_index) else {
+                let Some(points) = self.prepared_derived_curve_cache.points.get(*out_index) else {
                     continue;
                 };
                 let line_color = self.derived_channel_color(*derived_index);
@@ -7613,11 +14660,17 @@ impl ScopeApp {
                     preview_intersections.push((y, line_color));
                 }
                 plot_ui.line(
-                    Line::new(PlotPoints::from(points.clone()))
-                        .name(Self::derived_channel_name(*derived_index))
-                        .color(line_color)
-                        .style(self.derived_line_pattern(*derived_index).plot_style())
-                        .width(DEFAULT_CHANNEL_LINE_WIDTH + 0.2),
+                    Line::new(Self::frame_plot_points(
+                        points,
+                        self.prepared_derived_curve_cache
+                            .lightweight_points
+                            .get(*out_index),
+                        lightweight_plot,
+                    ))
+                    .name(Self::derived_channel_name(*derived_index))
+                    .color(line_color)
+                    .style(self.derived_line_pattern(*derived_index).plot_style())
+                    .width(DEFAULT_CHANNEL_LINE_WIDTH + 0.2),
                 );
             }
 
@@ -7686,89 +14739,95 @@ impl ScopeApp {
             .map(|pos| response.transform.value_from_position(pos).x);
 
         response.response.context_menu(|ui| {
-            if ui
-                .button(self.tr("放置光标 X1", "Place Cursor X1"))
-                .clicked()
-            {
+            if ui.button(self.t(UiText::PlaceCursorX1)).clicked() {
                 self.cursor_place_mode = Some(CursorId::A);
                 self.zoom_box_start = None;
                 self.zoom_box_current = None;
                 ui.close_menu();
             }
-            if ui
-                .button(self.tr("放置光标 X2", "Place Cursor X2"))
-                .clicked()
-            {
+            if ui.button(self.t(UiText::PlaceCursorX2)).clicked() {
                 self.cursor_place_mode = Some(CursorId::B);
                 self.zoom_box_start = None;
                 self.zoom_box_current = None;
                 ui.close_menu();
             }
             if self.cursor_place_mode.is_some()
-                && ui.button(self.tr("取消放置", "Cancel Placement")).clicked()
+                && ui.button(self.t(UiText::CancelPlacement)).clicked()
             {
                 self.cursor_place_mode = None;
                 ui.close_menu();
             }
             ui.separator();
             if self.show_cursor_a {
-                if ui
-                    .button(self.tr("隐藏光标 X1", "Hide Cursor X1"))
-                    .clicked()
-                {
+                if ui.button(self.t(UiText::HideCursorX1)).clicked() {
                     self.show_cursor_a = false;
                     ui.close_menu();
                 }
-            } else if ui
-                .button(self.tr("显示光标 X1", "Show Cursor X1"))
-                .clicked()
-            {
+            } else if ui.button(self.t(UiText::ShowCursorX1)).clicked() {
                 self.show_cursor_a = true;
                 ui.close_menu();
             }
             if self.show_cursor_b {
-                if ui
-                    .button(self.tr("隐藏光标 X2", "Hide Cursor X2"))
-                    .clicked()
-                {
+                if ui.button(self.t(UiText::HideCursorX2)).clicked() {
                     self.show_cursor_b = false;
                     ui.close_menu();
                 }
-            } else if ui
-                .button(self.tr("显示光标 X2", "Show Cursor X2"))
-                .clicked()
-            {
+            } else if ui.button(self.t(UiText::ShowCursorX2)).clicked() {
                 self.show_cursor_b = true;
                 ui.close_menu();
             }
-            if self.hover_in_cursor_range(hover_time) {
-                let dataset_items = (0..=self.imported_datasets.len())
-                    .filter_map(|dataset_index| {
-                        self.cursor_export_range_for_dataset(dataset_index)
-                            .map(|_| (dataset_index, self.dataset_label(dataset_index)))
-                    })
-                    .collect::<Vec<_>>();
-                if !dataset_items.is_empty() {
-                    ui.separator();
-                    ui.menu_button(
-                        self.tr("拆分导出光标区间", "Export Cursor Range"),
-                        |ui| {
-                            for (dataset_index, label) in &dataset_items {
-                                ui.menu_button(label, |ui| {
-                                    for format in DatasetExportFormat::ALL {
-                                        if ui.button(format.label(self.language)).clicked() {
-                                            self.export_cursor_range_dataset(
-                                                *dataset_index,
-                                                format,
-                                            );
-                                            ui.close_menu();
-                                        }
-                                    }
-                                });
-                            }
-                        },
-                    );
-                }
+            let dataset_items = (0..=self.imported_datasets.len())
+                .filter_map(|dataset_index| {
+                    self.cursor_export_range_for_dataset(dataset_index)
+                        .map(|_| (dataset_index, self.dataset_label(dataset_index)))
+                })
+                .collect::<Vec<_>>();
+            if !dataset_items.is_empty() {
+                ui.separator();
+                ui.menu_button(self.t(UiText::ExportCursorRangeData), |ui| {
+                    if self.hover_in_cursor_range(hover_time) {
+                        let all_indices = dataset_items
+                            .iter()
+                            .map(|(dataset_index, _)| *dataset_index)
+                            .collect::<Vec<_>>();
+                        ui.menu_button(self.tr("所有数据组", "All Datasets"), |ui| {
+                            self.cursor_export_batch_menu(ui, &all_indices, true);
+                            ui.separator();
+                            self.cursor_export_batch_menu(ui, &all_indices, false);
+                        });
+                        ui.separator();
+                        for (dataset_index, label) in &dataset_items {
+                            ui.menu_button(label, |ui| {
+                                self.cursor_export_dataset_menu(ui, *dataset_index, true);
+                                ui.separator();
+                                self.cursor_export_dataset_menu(ui, *dataset_index, false);
+                            });
+                        }
+                    } else {
+                        ui.label(self.tr(
+                            "导出 X1-X2 光标区间数据。",
+                            "Export data between X1 and X2.",
+                        ));
+                        ui.separator();
+                        let all_indices = dataset_items
+                            .iter()
+                            .map(|(dataset_index, _)| *dataset_index)
+                            .collect::<Vec<_>>();
+                        ui.menu_button(self.tr("所有数据组", "All Datasets"), |ui| {
+                            self.cursor_export_batch_menu(ui, &all_indices, true);
+                            ui.separator();
+                            self.cursor_export_batch_menu(ui, &all_indices, false);
+                        });
+                        ui.separator();
+                        for (dataset_index, label) in &dataset_items {
+                            ui.menu_button(label, |ui| {
+                                self.cursor_export_dataset_menu(ui, *dataset_index, true);
+                                ui.separator();
+                                self.cursor_export_dataset_menu(ui, *dataset_index, false);
+                            });
+                        }
+                    }
+                });
             }
         });
 
@@ -7890,7 +14949,7 @@ impl ScopeApp {
 
     fn update_inner(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_import_worker();
-        if self.import_worker.is_some() {
+        if self.any_background_job_running() {
             ctx.request_repaint();
         }
         self.sync_channel_state_lengths();
@@ -7901,16 +14960,20 @@ impl ScopeApp {
         self.error_banner(ctx);
         self.help_window(ctx);
         self.options_window(ctx);
+        self.export_preview_window(ctx);
+        self.batch_export_window(ctx);
 
-        egui::SidePanel::left("channels")
+        let channel_panel_response = egui::SidePanel::left("channels")
             .resizable(true)
             .default_width(CHANNEL_PANEL_DEFAULT_WIDTH)
-            .width_range(180.0..=CHANNEL_PANEL_MAX_WIDTH)
+            .width_range(CHANNEL_PANEL_MIN_WIDTH..=CHANNEL_PANEL_MAX_WIDTH)
             .show(ctx, |ui| self.channel_panel(ui));
+        let channel_panel_width = channel_panel_response.response.rect.width();
 
-        egui::SidePanel::right("analysis")
+        let analysis_panel_response = egui::SidePanel::right("analysis")
             .resizable(true)
-            .default_width(330.0)
+            .default_width(ANALYSIS_PANEL_DEFAULT_WIDTH)
+            .width_range(ANALYSIS_PANEL_MIN_WIDTH..=ANALYSIS_PANEL_MAX_WIDTH)
             .show(ctx, |ui| {
                 self.analysis_dataset_selector(ui);
                 ui.separator();
@@ -7918,6 +14981,8 @@ impl ScopeApp {
                 ui.separator();
                 self.fft_panel(ui);
             });
+        let analysis_panel_width = analysis_panel_response.response.rect.width();
+        self.observe_layout_panel_widths(channel_panel_width, analysis_panel_width);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             self.plot_panel(ui);

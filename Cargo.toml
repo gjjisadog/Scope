@@ -6,9 +6,11 @@ description = "Windows offline oscilloscope-style waveform analyzer"
 license = "Proprietary"
 
 [dependencies]
+ab_glyph = "0.2"
 csv = "1.4"
 eframe = { version = "0.27", default-features = false, features = ["default_fonts", "glow", "wgpu"] }
 egui_plot = "0.27"
+encoding_rs = "0.8"
 rfd = "0.14"
 rustfft = "6.2"
 serde = { version = "1.0", features = ["derive"] }

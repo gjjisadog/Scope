@@ -1,13 +1,14 @@
 use std::{
     cmp::Ordering,
+    io::Cursor,
     path::{Path, PathBuf},
 };
 
-use csv::{Position, ReaderBuilder, StringRecord, Trim};
+use csv::{Position, StringRecord};
 
 use super::{
-    channel_names::VARIABLE_NAMES, ChannelMeta, DataError, DataResult, DataSource, DatasetMeta,
-    RangeSummary, SampleBlock,
+    channel_names::VARIABLE_NAMES, text_encoding::csv_reader_from_path_with_headers, ChannelMeta,
+    DataError, DataResult, DataSource, DatasetMeta, RangeSummary, SampleBlock,
 };
 
 const CHANNEL_COUNT: usize = 60;
@@ -34,11 +35,8 @@ pub struct CloudCsvDataSource {
 }
 
 impl CloudCsvDataSource {
-    fn reader_from_path(path: &Path) -> DataResult<csv::Reader<std::fs::File>> {
-        Ok(ReaderBuilder::new()
-            .flexible(true)
-            .trim(Trim::All)
-            .from_path(path)?)
+    fn reader_from_path(path: &Path) -> DataResult<csv::Reader<Cursor<Vec<u8>>>> {
+        csv_reader_from_path_with_headers(path, true)
     }
 
     fn content_from_record(record: &StringRecord, content_column: usize) -> DataResult<&str> {

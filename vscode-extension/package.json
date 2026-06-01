@@ -19,6 +19,16 @@
   ],
   "main": "./src/extension.js",
   "contributes": {
+    "configuration": {
+      "title": "Scope Analyzer",
+      "properties": {
+        "scopeAnalyzer.executablePath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path to the Scope Analyzer executable used as the Rust data and FFT bridge."
+        }
+      }
+    },
     "commands": [
       {
         "command": "scopeAnalyzer.openFile",

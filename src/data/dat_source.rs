@@ -5,11 +5,13 @@ use std::{
 };
 
 use super::{
-    ChannelMeta, DataError, DataResult, DataSource, DatasetMeta, RangeSummary, SampleBlock,
+    text_encoding::decode_label_bytes, ChannelMeta, DataError, DataResult, DataSource, DatasetMeta,
+    RangeSummary, SampleBlock,
 };
 
 const MAX_CHANNELS: usize = 128;
 const INDEX_BLOCK_SAMPLES: u64 = 4096;
+const MAX_EXACT_SUMMARY_SAMPLES: u64 = INDEX_BLOCK_SAMPLES * 4;
 const HEADER_FIXED_WORDS: usize = 4;
 const HEADER_WORD_BYTES: usize = 4;
 
@@ -47,11 +49,11 @@ impl DatDataSource {
         header[names_start..]
             .split(|byte| *byte == 0xff)
             .filter_map(|raw| {
-                let raw = raw.trim_ascii();
-                if raw.is_empty() {
+                let name = decode_label_bytes(raw);
+                if name.is_empty() {
                     None
                 } else {
-                    Some(String::from_utf8_lossy(raw).into_owned())
+                    Some(name)
                 }
             })
             .collect()
@@ -103,6 +105,202 @@ impl DatDataSource {
             return Err(DataError::BadChannel);
         }
         Ok(())
+    }
+
+    fn empty_summary(channels: &[usize]) -> RangeSummary {
+        RangeSummary {
+            bin_start: Vec::new(),
+            bin_end: Vec::new(),
+            min: vec![Vec::new(); channels.len()],
+            max: vec![Vec::new(); channels.len()],
+        }
+    }
+
+    fn block_sample_range(&self, block_index: usize) -> Option<(u64, u64)> {
+        let samples = self.blocks.get(block_index)?.samples;
+        if samples == 0 {
+            return None;
+        }
+        let start = block_index as u64 * INDEX_BLOCK_SAMPLES;
+        Some((start, start + samples - 1))
+    }
+
+    fn summarize_range_from_index(
+        &self,
+        first_sample: u64,
+        last_sample: u64,
+        channels: &[usize],
+        target_bins: usize,
+    ) -> DataResult<RangeSummary> {
+        let first_block = (first_sample / INDEX_BLOCK_SAMPLES) as usize;
+        let last_block =
+            ((last_sample / INDEX_BLOCK_SAMPLES) as usize).min(self.blocks.len().saturating_sub(1));
+        if first_block > last_block {
+            return Ok(Self::empty_summary(channels));
+        }
+
+        let target_bins = target_bins.max(1);
+        let block_count = last_block - first_block + 1;
+        let group = block_count.div_ceil(target_bins).max(1);
+        let capacity = target_bins.min(block_count).max(1);
+        let mut bin_start = Vec::with_capacity(capacity);
+        let mut bin_end = Vec::with_capacity(capacity);
+        let mut mins = (0..channels.len())
+            .map(|_| Vec::with_capacity(capacity))
+            .collect::<Vec<_>>();
+        let mut maxs = (0..channels.len())
+            .map(|_| Vec::with_capacity(capacity))
+            .collect::<Vec<_>>();
+
+        let mut block_index = first_block;
+        while block_index <= last_block {
+            let group_end = (block_index + group - 1).min(last_block);
+            let Some((group_first_sample, _)) = self.block_sample_range(block_index) else {
+                break;
+            };
+            let Some((_, group_last_sample)) = self.block_sample_range(group_end) else {
+                break;
+            };
+            let start_sample = group_first_sample.max(first_sample);
+            let end_sample = group_last_sample.min(last_sample);
+            if start_sample <= end_sample {
+                let mut group_min = vec![f32::INFINITY; channels.len()];
+                let mut group_max = vec![f32::NEG_INFINITY; channels.len()];
+                for (relative_index, block) in
+                    self.blocks[block_index..=group_end].iter().enumerate()
+                {
+                    let absolute_index = block_index + relative_index;
+                    let Some((block_start, block_end)) = self.block_sample_range(absolute_index)
+                    else {
+                        continue;
+                    };
+                    let selected_start = block_start.max(first_sample);
+                    let selected_end = block_end.min(last_sample);
+                    if selected_start > selected_end {
+                        continue;
+                    }
+                    if selected_start != block_start || selected_end != block_end {
+                        self.update_min_max_from_samples(
+                            selected_start,
+                            selected_end,
+                            channels,
+                            &mut group_min,
+                            &mut group_max,
+                        )?;
+                        continue;
+                    }
+                    for (out_index, &channel) in channels.iter().enumerate() {
+                        group_min[out_index] = group_min[out_index].min(block.min[channel]);
+                        group_max[out_index] = group_max[out_index].max(block.max[channel]);
+                    }
+                }
+
+                bin_start.push(start_sample as f64 / self.sample_rate_hz);
+                bin_end.push(end_sample as f64 / self.sample_rate_hz);
+                for out_index in 0..channels.len() {
+                    mins[out_index].push(group_min[out_index]);
+                    maxs[out_index].push(group_max[out_index]);
+                }
+            }
+
+            if group_end == usize::MAX {
+                break;
+            }
+            block_index = group_end + 1;
+        }
+
+        Ok(RangeSummary {
+            bin_start,
+            bin_end,
+            min: mins,
+            max: maxs,
+        })
+    }
+
+    fn update_min_max_from_samples(
+        &self,
+        first_sample: u64,
+        last_sample: u64,
+        channels: &[usize],
+        mins: &mut [f32],
+        maxs: &mut [f32],
+    ) -> DataResult<()> {
+        let mut file = File::open(&self.path)?;
+        file.seek(SeekFrom::Start(
+            self.header_len + first_sample * self.record_size,
+        ))?;
+        let mut record = vec![0_u8; self.record_size as usize];
+        for _ in first_sample..=last_sample {
+            file.read_exact(&mut record)?;
+            let values = Self::parse_selected_values(&record, self.meta.channels.len(), channels)?;
+            for (out_index, value) in values.iter().enumerate() {
+                mins[out_index] = mins[out_index].min(*value);
+                maxs[out_index] = maxs[out_index].max(*value);
+            }
+        }
+        Ok(())
+    }
+
+    fn summarize_range_exact(
+        &self,
+        start_time: f64,
+        end_time: f64,
+        first_sample: u64,
+        last_sample: u64,
+        channels: &[usize],
+        target_bins: usize,
+    ) -> DataResult<RangeSummary> {
+        let sample_span = (last_sample - first_sample + 1) as usize;
+        let bin_count = target_bins.max(1).min(sample_span).max(1);
+        let time_span = (end_time - start_time).max(1.0 / self.sample_rate_hz);
+        let mut counts = vec![0_u32; bin_count];
+        let mut mins = vec![vec![f32::INFINITY; bin_count]; channels.len()];
+        let mut maxs = vec![vec![f32::NEG_INFINITY; bin_count]; channels.len()];
+        let mut file = File::open(&self.path)?;
+        file.seek(SeekFrom::Start(
+            self.header_len + first_sample * self.record_size,
+        ))?;
+        let mut record = vec![0_u8; self.record_size as usize];
+
+        for sample_index in first_sample..=last_sample {
+            file.read_exact(&mut record)?;
+            let time = sample_index as f64 / self.sample_rate_hz;
+            if time < start_time || time > end_time {
+                continue;
+            }
+            let relative = ((time - start_time) / time_span).clamp(0.0, 1.0);
+            let bin = ((relative * bin_count as f64).floor() as usize).min(bin_count - 1);
+            let values = Self::parse_selected_values(&record, self.meta.channels.len(), channels)?;
+            counts[bin] += 1;
+            for (out_index, value) in values.iter().enumerate() {
+                mins[out_index][bin] = mins[out_index][bin].min(*value);
+                maxs[out_index][bin] = maxs[out_index][bin].max(*value);
+            }
+        }
+
+        let mut bin_start = Vec::with_capacity(bin_count);
+        let mut bin_end = Vec::with_capacity(bin_count);
+        let mut compact_mins = (0..channels.len()).map(|_| Vec::new()).collect::<Vec<_>>();
+        let mut compact_maxs = (0..channels.len()).map(|_| Vec::new()).collect::<Vec<_>>();
+
+        for (bin, count) in counts.iter().enumerate() {
+            if *count == 0 {
+                continue;
+            }
+            bin_start.push(start_time + time_span * bin as f64 / bin_count as f64);
+            bin_end.push(start_time + time_span * (bin + 1) as f64 / bin_count as f64);
+            for out_index in 0..channels.len() {
+                compact_mins[out_index].push(mins[out_index][bin]);
+                compact_maxs[out_index].push(maxs[out_index][bin]);
+            }
+        }
+
+        Ok(RangeSummary {
+            bin_start,
+            bin_end,
+            min: compact_mins,
+            max: compact_maxs,
+        })
     }
 }
 
@@ -289,12 +487,7 @@ impl DataSource for DatDataSource {
     ) -> DataResult<RangeSummary> {
         self.validate_channels(channels)?;
         if self.blocks.is_empty() || channels.is_empty() || end_time < start_time {
-            return Ok(RangeSummary {
-                bin_start: Vec::new(),
-                bin_end: Vec::new(),
-                min: vec![Vec::new(); channels.len()],
-                max: vec![Vec::new(); channels.len()],
-            });
+            return Ok(Self::empty_summary(channels));
         }
 
         let sample_count = self.meta.sample_count;
@@ -302,71 +495,29 @@ impl DataSource for DatDataSource {
         let last_sample = ((end_time.max(0.0) * self.sample_rate_hz).ceil() as u64)
             .min(sample_count.saturating_sub(1));
         if first_sample > last_sample {
-            return Ok(RangeSummary {
-                bin_start: Vec::new(),
-                bin_end: Vec::new(),
-                min: vec![Vec::new(); channels.len()],
-                max: vec![Vec::new(); channels.len()],
-            });
+            return Ok(Self::empty_summary(channels));
         }
 
-        let sample_span = (last_sample - first_sample + 1) as usize;
-        let bin_count = target_bins.max(1).min(sample_span).max(1);
-        let time_span = (end_time - start_time).max(1.0 / self.sample_rate_hz);
-        let mut counts = vec![0_u32; bin_count];
-        let mut mins = vec![vec![f32::INFINITY; bin_count]; channels.len()];
-        let mut maxs = vec![vec![f32::NEG_INFINITY; bin_count]; channels.len()];
-        let mut file = File::open(&self.path)?;
-        file.seek(SeekFrom::Start(
-            self.header_len + first_sample * self.record_size,
-        ))?;
-        let mut record = vec![0_u8; self.record_size as usize];
-
-        for sample_index in first_sample..=last_sample {
-            file.read_exact(&mut record)?;
-            let time = sample_index as f64 / self.sample_rate_hz;
-            if time < start_time || time > end_time {
-                continue;
-            }
-            let relative = ((time - start_time) / time_span).clamp(0.0, 1.0);
-            let bin = ((relative * bin_count as f64).floor() as usize).min(bin_count - 1);
-            let values = Self::parse_selected_values(&record, self.meta.channels.len(), channels)?;
-            counts[bin] += 1;
-            for (out_index, value) in values.iter().enumerate() {
-                mins[out_index][bin] = mins[out_index][bin].min(*value);
-                maxs[out_index][bin] = maxs[out_index][bin].max(*value);
-            }
+        let sample_span = last_sample - first_sample + 1;
+        if sample_span <= MAX_EXACT_SUMMARY_SAMPLES {
+            self.summarize_range_exact(
+                start_time,
+                end_time,
+                first_sample,
+                last_sample,
+                channels,
+                target_bins,
+            )
+        } else {
+            self.summarize_range_from_index(first_sample, last_sample, channels, target_bins)
         }
-
-        let mut bin_start = Vec::with_capacity(bin_count);
-        let mut bin_end = Vec::with_capacity(bin_count);
-        let mut compact_mins = (0..channels.len()).map(|_| Vec::new()).collect::<Vec<_>>();
-        let mut compact_maxs = (0..channels.len()).map(|_| Vec::new()).collect::<Vec<_>>();
-
-        for (bin, count) in counts.iter().enumerate() {
-            if *count == 0 {
-                continue;
-            }
-            bin_start.push(start_time + time_span * bin as f64 / bin_count as f64);
-            bin_end.push(start_time + time_span * (bin + 1) as f64 / bin_count as f64);
-            for out_index in 0..channels.len() {
-                compact_mins[out_index].push(mins[out_index][bin]);
-                compact_maxs[out_index].push(maxs[out_index][bin]);
-            }
-        }
-
-        Ok(RangeSummary {
-            bin_start,
-            bin_end,
-            min: compact_mins,
-            max: compact_maxs,
-        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use encoding_rs::GBK;
     use std::{fs::File, io::Write};
 
     #[test]
@@ -402,6 +553,80 @@ mod tests {
         assert_eq!(block.times.len(), 5);
         assert_eq!(block.channels[0], vec![2.0, 3.0, 4.0, 5.0, 6.0]);
         assert_eq!(block.channels[1], vec![-4.0, -6.0, -8.0, -10.0, -12.0]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn decodes_gbk_dat_channel_names() {
+        let path = std::env::temp_dir().join("scope_analyzer_gbk_name_test.dat");
+        let header_len = 64_u32;
+        let channel_count = 1_u32;
+        let mut header = Vec::new();
+        header.extend_from_slice(&header_len.to_le_bytes());
+        header.extend_from_slice(&0_u32.to_le_bytes());
+        header.extend_from_slice(&1000_u32.to_le_bytes());
+        header.extend_from_slice(&channel_count.to_le_bytes());
+        for value in [0_u32; 5] {
+            header.extend_from_slice(&value.to_le_bytes());
+        }
+        let (name, _, _) = GBK.encode("电网电压");
+        header.extend_from_slice(&name);
+        header.push(0xff);
+        header.resize(header_len as usize, 0xff);
+
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&header).unwrap();
+        file.write_all(&123_i16.to_le_bytes()).unwrap();
+        drop(file);
+
+        let source = DatDataSource::open(&path).unwrap();
+        assert_eq!(source.metadata().channels[0].name, "电网电压");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn summarizes_large_dat_range_from_block_index() {
+        let path = std::env::temp_dir().join("scope_analyzer_large_summary_test.dat");
+        let header_len = 64_u32;
+        let sample_rate_hz = 1000_u32;
+        let channel_count = 2_u32;
+        let sample_count = INDEX_BLOCK_SAMPLES * 5;
+        let mut header = Vec::new();
+        header.extend_from_slice(&header_len.to_le_bytes());
+        header.extend_from_slice(&0_u32.to_le_bytes());
+        header.extend_from_slice(&sample_rate_hz.to_le_bytes());
+        header.extend_from_slice(&channel_count.to_le_bytes());
+        for value in [0_u32; 10] {
+            header.extend_from_slice(&value.to_le_bytes());
+        }
+        header.extend_from_slice(b"A\xffB\xff");
+        header.resize(header_len as usize, 0xff);
+
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&header).unwrap();
+        for index in 0..sample_count as i16 {
+            file.write_all(&index.to_le_bytes()).unwrap();
+            file.write_all(&(-index).to_le_bytes()).unwrap();
+        }
+        drop(file);
+
+        let source = DatDataSource::open(&path).unwrap();
+        let summary = source
+            .summarize_range(
+                0.0,
+                (sample_count - 1) as f64 / sample_rate_hz as f64,
+                &[0, 1],
+                2,
+            )
+            .unwrap();
+
+        assert_eq!(summary.bin_start.len(), 2);
+        assert_eq!(summary.min[0], vec![0.0, 12288.0]);
+        assert_eq!(summary.max[0], vec![12287.0, 20479.0]);
+        assert_eq!(summary.min[1], vec![-12287.0, -20479.0]);
+        assert_eq!(summary.max[1], vec![0.0, -12288.0]);
 
         let _ = std::fs::remove_file(path);
     }

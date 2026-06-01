@@ -71,6 +71,7 @@ try {
         throw "cargo rustc --release failed with exit code $LASTEXITCODE"
     }
     Copy-Item "target\release\scope_analyzer.exe" (Join-Path $stage "ScopeAnalyzer.exe")
+    Copy-Item "resources\ScopeAnalyzer.ico" (Join-Path $stage "ScopeAnalyzer.ico")
     Copy-Item "README.md" (Join-Path $stage "README.txt")
 Set-Content -Path (Join-Path $stage "Start-ScopeAnalyzer.bat") -Encoding ASCII -Value @(
     "@echo off",
@@ -120,7 +121,7 @@ if ($candle -and $light) {
         throw "candle failed with exit code $LASTEXITCODE"
     }
 
-    & $light -out $msi $wixobj
+    & $light -spdb -sval -out $msi $wixobj
     if ($LASTEXITCODE -ne 0) {
         throw "light failed with exit code $LASTEXITCODE"
     }

@@ -1,7 +1,13 @@
 mod app;
 mod data;
 mod fft;
+mod png_export;
+mod svg_export;
 mod transforms;
+mod vscode_bridge;
+
+#[cfg(test)]
+mod perf_tests;
 
 use std::{
     fs::OpenOptions,
@@ -77,6 +83,10 @@ impl RendererMode {
 }
 
 fn main() -> eframe::Result<()> {
+    if let Some(exit_code) = vscode_bridge::run_from_args(std::env::args_os().skip(1)) {
+        std::process::exit(exit_code);
+    }
+
     configure_graphics_runtime();
 
     tracing_subscriber::fmt()
@@ -191,11 +201,16 @@ fn run_app(mode: RendererMode) -> eframe::Result<()> {
     wgpu_options.power_preference = eframe::wgpu::PowerPreference::LowPower;
     wgpu_options.force_fallback_adapter = mode.force_wgpu_fallback_adapter();
 
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_title("Scope Analyzer")
+        .with_inner_size([1440.0, 900.0])
+        .with_min_inner_size([980.0, 640.0]);
+    if let Some(icon) = scope_window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let native_options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("Scope Analyzer")
-            .with_inner_size([1440.0, 900.0])
-            .with_min_inner_size([980.0, 640.0]),
+        viewport,
         renderer: mode.renderer(),
         hardware_acceleration: mode.hardware_acceleration(),
         wgpu_options,
@@ -210,6 +225,10 @@ fn run_app(mode: RendererMode) -> eframe::Result<()> {
         native_options,
         Box::new(|cc| Box::new(app::ScopeApp::new(cc))),
     )
+}
+
+fn scope_window_icon() -> Option<eframe::egui::IconData> {
+    eframe::icon_data::from_png_bytes(include_bytes!("../resources/ScopeAnalyzer.png")).ok()
 }
 
 fn configure_graphics_runtime() {

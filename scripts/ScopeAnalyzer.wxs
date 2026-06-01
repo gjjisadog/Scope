@@ -12,6 +12,8 @@
       AllowSameVersionUpgrades="yes"
       DowngradeErrorMessage="A newer version of Scope Analyzer is already installed." />
     <MediaTemplate EmbedCab="yes" />
+    <Icon Id="ScopeAnalyzerIcon" SourceFile="$(var.StageDir)\ScopeAnalyzer.ico" />
+    <Property Id="ARPPRODUCTICON" Value="ScopeAnalyzerIcon" />
 
     <Feature Id="ProductFeature" Title="Scope Analyzer" Level="1">
       <ComponentGroupRef Id="ProductComponents" />
@@ -38,6 +40,8 @@
             Directory="ApplicationProgramsFolder"
             Name="Scope Analyzer"
             WorkingDirectory="INSTALLFOLDER"
+            Icon="ScopeAnalyzerIcon"
+            IconIndex="0"
             Advertise="yes" />
         </File>
       </Component>

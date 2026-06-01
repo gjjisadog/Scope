@@ -1,10 +1,13 @@
 const fs = require("fs/promises");
 const path = require("path");
+const { execFile } = require("child_process");
 const vscode = require("vscode");
 
 const MAX_STANDARD_ROWS = 250000;
 const MAX_CLOUD_RECORDS = 125000;
 const MAX_DAT_SAMPLES = 250000;
+const BRIDGE_MAX_BUFFER = 512 * 1024 * 1024;
+const BRIDGE_TIMEOUT_MS = 30000;
 const MAX_DAT_CHANNELS = 128;
 const DAT_HEADER_FIXED_WORDS = 4;
 const DAT_HEADER_WORD_BYTES = 4;
@@ -132,6 +135,9 @@ async function openAnalyzer(context, fileUri) {
       if (message.type === "reload") {
         await loadAndPostDataset(panel, fileUri, message.options || {});
       }
+      if (message.type === "fft") {
+        await analyzeFftAndPost(panel, fileUri, message);
+      }
       if (message.type === "export") {
         await exportWaveformFile(fileUri, message.format, message.options || {});
       }
@@ -144,7 +150,7 @@ async function openAnalyzer(context, fileUri) {
 async function loadAndPostDataset(panel, fileUri, options) {
   try {
     panel.webview.postMessage({ type: "loading", path: fileUri.fsPath });
-    const dataset = await parseWaveformFile(fileUri.fsPath, options);
+    const dataset = await parseWaveformFileShared(fileUri.fsPath, options);
     panel.webview.postMessage({ type: "dataset", dataset });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -154,7 +160,7 @@ async function loadAndPostDataset(panel, fileUri, options) {
 }
 
 async function exportWaveformFile(fileUri, format, options) {
-  const dataset = await parseWaveformFile(fileUri.fsPath, options);
+  const dataset = await parseWaveformFileShared(fileUri.fsPath, options);
   const info = exportFormatInfo(format);
   const target = await vscode.window.showSaveDialog({
     defaultUri: vscode.Uri.file(path.join(path.dirname(fileUri.fsPath), exportFileName(fileUri.fsPath, info))),
@@ -169,6 +175,137 @@ async function exportWaveformFile(fileUri, format, options) {
   const text = serializeDataset(dataset, info.kind);
   await vscode.workspace.fs.writeFile(target, Buffer.from(text, "utf8"));
   vscode.window.showInformationMessage(`Exported ${info.label}: ${target.fsPath}`);
+}
+
+async function analyzeFftAndPost(panel, fileUri, message) {
+  try {
+    const result = await analyzeFftShared(fileUri.fsPath, message.options || {});
+    panel.webview.postMessage({ type: "fft", requestId: message.requestId, result });
+  } catch (error) {
+    panel.webview.postMessage({
+      type: "fft",
+      requestId: message.requestId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+async function parseWaveformFileShared(filePath, options) {
+  try {
+    const dataset = await parseWaveformFileWithRust(filePath, options);
+    dataset.bridgeAvailable = true;
+    return dataset;
+  } catch {
+    const dataset = await parseWaveformFile(filePath, options);
+    dataset.bridgeAvailable = false;
+    return dataset;
+  }
+}
+
+async function analyzeFftShared(filePath, options) {
+  return runBridgeJson(filePath, [
+    "--vscode-fft",
+    "--path",
+    filePath,
+    "--sample-rate",
+    String(Math.max(1, Number(options.sampleRateHz) || 1000)),
+    "--base",
+    String(Math.max(0.001, Number(options.harmonicBaseHz) || 50)),
+    "--channel",
+    String(Math.max(0, Number(options.channel) || 0)),
+    "--start",
+    String(Number.isFinite(options.start) ? options.start : 0),
+    "--end",
+    String(Number.isFinite(options.end) ? options.end : 0),
+  ]);
+}
+
+async function parseWaveformFileWithRust(filePath, options) {
+  return runBridgeJson(filePath, [
+    "--vscode-dataset",
+    "--path",
+    filePath,
+    "--sample-rate",
+    String(Math.max(1, Number(options.sampleRateHz) || 1000)),
+    "--max-points",
+    String(MAX_STANDARD_ROWS),
+  ]);
+}
+
+async function runBridgeJson(filePath, args) {
+  const executable = await findBridgeExecutable(filePath);
+  if (!executable) {
+    throw new Error("Scope Analyzer Rust bridge executable was not found.");
+  }
+  const stdout = await execFileText(executable, args);
+  return JSON.parse(stdout);
+}
+
+async function findBridgeExecutable(filePath) {
+  const configured = vscode.workspace
+    .getConfiguration("scopeAnalyzer")
+    .get("executablePath");
+  const candidates = [];
+  if (configured) {
+    candidates.push(configured);
+  }
+  if (process.env.SCOPE_ANALYZER_EXE) {
+    candidates.push(process.env.SCOPE_ANALYZER_EXE);
+  }
+  const workspaceFolder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(filePath));
+  if (workspaceFolder) {
+    candidates.push(
+      path.join(workspaceFolder.uri.fsPath, "target", "release", executableName()),
+      path.join(workspaceFolder.uri.fsPath, "target", "debug", executableName())
+    );
+  }
+  const extensionRoot = path.resolve(__dirname, "..", "..");
+  candidates.push(
+    path.join(extensionRoot, "..", "target", "release", executableName()),
+    path.join(extensionRoot, "..", "target", "debug", executableName()),
+    path.join(extensionRoot, executableName())
+  );
+
+  for (const candidate of candidates) {
+    if (candidate && await fileExists(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function executableName() {
+  return process.platform === "win32" ? "scope_analyzer.exe" : "scope_analyzer";
+}
+
+async function fileExists(filePath) {
+  try {
+    const stat = await fs.stat(filePath);
+    return stat.isFile();
+  } catch {
+    return false;
+  }
+}
+
+function execFileText(executable, args) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      executable,
+      args,
+      {
+        timeout: BRIDGE_TIMEOUT_MS,
+        maxBuffer: BRIDGE_MAX_BUFFER,
+        windowsHide: true,
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          reject(new Error((stderr || error.message).trim()));
+          return;
+        }
+        resolve(stdout);
+      }
+    );
+  });
 }
 
 function exportFormatInfo(format) {

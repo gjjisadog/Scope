@@ -1,12 +1,21 @@
 # Scope Analyzer
 
+## Configuration Files
+
+Configuration import/export is intentionally split so one file type cannot overwrite another:
+
+- `Names` imports/exports only variable display names (`scope-names.json`).
+- `Config > Display Settings` imports/exports colors, line widths, line styles, scale ratios, scope layout, sample-rate related display settings, language, theme, and analysis display settings (`scope-display.json`).
+- `Config > Shortcut Settings` imports/exports only keyboard shortcuts (`scope-shortcuts.json`).
+- `Config > Dataset Settings` imports/exports dataset group names, checked states, group line styles, time sync enablement, and time offsets (`scope-datasets.json`).
+
 Windows 离线波形分析工具。界面按软件示波器方式组织，支持多 CSV 数据组叠加、通道勾选与分栏显示、双光标测量、选区 FFT/THD、三相正负序分析、变量名导入导出、浅色/深色主题和中英文界面。
 
 完整交互说明也集成在软件顶部 `Help` 菜单中。
 
 ## 快速开始
 
-1. 使用顶部 `Import Data` 菜单选择一个或多个 CSV 文件。
+1. 使用顶部 `Add Data` 菜单选择一个或多个 CSV 文件。
 2. 第一个文件作为主数据，后续文件作为附加数据组按相同通道序号叠加显示。
 3. 软件读取第一行后自动识别云端 `Content` CSV 或本地数值 CSV。
 4. 导入成功的 CSV 会加入 `Recent Files`，列表保存为程序目录下的 `scope-recent-files.json`。
@@ -47,7 +56,7 @@ time,CH1,CH2,CH3
 
 ### 数据组与布局
 
-- `Import Data` 可一次选择多个波形文件，第一组为主数据，附加数据组以虚线叠加。
+- `Add Data` 可一次选择多个波形文件，第一组为主数据，附加数据组以虚线叠加。
 - 菜单中可勾选一个或多个数据组后删除。
 - 左侧变量栏按数据组、模拟量/数字量和变量名组织。
 - 右键数据组可全选/全不选该数据组变量，也可配置该组线型。

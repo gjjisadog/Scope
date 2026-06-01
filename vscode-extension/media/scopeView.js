@@ -8,6 +8,7 @@ const state = {
   viewEnd: 1,
   cursors: [null, null],
   nextCursor: 0,
+  fftRequestId: 0,
   dragging: false,
   dragX: 0,
   dragStart: 0,
@@ -67,6 +68,9 @@ window.addEventListener("message", (event) => {
   }
   if (message.type === "dataset") {
     setDataset(message.dataset);
+  }
+  if (message.type === "fft") {
+    renderFftResult(message);
   }
 });
 
@@ -569,6 +573,23 @@ function renderFft() {
   const [x1, x2] = orderedCursors();
   const start = x1 ?? state.viewStart;
   const end = x2 ?? state.viewEnd;
+  if (state.dataset.bridgeAvailable) {
+    const requestId = ++state.fftRequestId;
+    appendRow(els.fftReadout, "FFT", "Calculating...");
+    vscode.postMessage({
+      type: "fft",
+      requestId,
+      options: {
+        channel: channelIndex,
+        start,
+        end,
+        sampleRateHz: Number(els.sampleRate.value) || state.dataset.sampleRateHz,
+        harmonicBaseHz: Number(els.harmonicBase.value) || 50,
+      },
+    });
+    return;
+  }
+
   const startIndex = lowerBound(state.dataset.times, start);
   const endIndex = upperBound(state.dataset.times, end);
   const samples = state.dataset.channels[channelIndex].slice(startIndex, endIndex + 1);
@@ -577,6 +598,22 @@ function renderFft() {
     appendRow(els.fftReadout, "FFT", "Need at least 16 samples");
     return;
   }
+  appendFftRows(result);
+}
+
+function renderFftResult(message) {
+  if (message.requestId !== state.fftRequestId) {
+    return;
+  }
+  els.fftReadout.innerHTML = "";
+  if (message.error) {
+    appendRow(els.fftReadout, "FFT", message.error);
+    return;
+  }
+  appendFftRows(message.result);
+}
+
+function appendFftRows(result) {
   appendRow(els.fftReadout, "Samples", formatNumber(result.sampleCount));
   appendRow(els.fftReadout, "THD", `${formatNumber(result.thdPercent)}%`);
   for (const row of result.harmonics) {
