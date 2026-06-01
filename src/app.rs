@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     env,
     fs::{self, File, OpenOptions},
     io::{BufWriter, Write},
@@ -17,8 +18,8 @@ use crate::{
     data::{
         csv_reader_from_path_with_headers, BitfieldDigitalDataSource, ChannelMeta,
         CloudCsvDataSource, CombinedDataSource, CsvDataSource, DatDataSource, DataResult,
-        DataSource, DatasetMeta, RangeSummary, SampleBlock, CHANNEL_UNIT_ANALOG,
-        CHANNEL_UNIT_DIGITAL,
+        DataSource, DatasetMeta, MergedLeadingBitsDataSource, RangeSummary, RenamedDataSource,
+        SampleBlock, CHANNEL_UNIT_ANALOG, CHANNEL_UNIT_DIGITAL, VARIABLE_NAMES,
     },
     fft::{self, FftResult, SequenceResult},
     png_export::{Canvas, ClipRect, Rgba, StrokeStyle, TextStyle, WaveformCanvas},
@@ -55,6 +56,7 @@ const MIN_CHANNEL_SCALE: f32 = -1_000_000.0;
 const MAX_CHANNEL_SCALE: f32 = 1_000_000.0;
 const MAX_RECENT_FILES: usize = 12;
 const MAX_RECENT_CONFIGS: usize = 12;
+const LOCAL_CSV_PAIR_MTIME_WINDOW_MS: i128 = 10_000;
 const CHANNEL_PANEL_DEFAULT_WIDTH: f32 = 170.0;
 const CHANNEL_PANEL_MIN_WIDTH: f32 = 120.0;
 const CHANNEL_PANEL_MAX_WIDTH: f32 = 320.0;
@@ -1427,6 +1429,14 @@ enum SourceKind {
 enum LocalCsvRole {
     Analog,
     Digital,
+}
+
+#[derive(Clone, Debug)]
+struct LocalCsvPairInfo {
+    role: LocalCsvRole,
+    key: String,
+    filename_timestamp: Option<String>,
+    modified_millis: Option<i128>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -3082,23 +3092,27 @@ impl ScopeApp {
         paths: Vec<PathBuf>,
         sample_rate_hz: f64,
     ) -> (Vec<OpenedDataset>, Vec<String>) {
+        let paths = Self::expand_local_csv_counterparts(paths);
         let mut opened = Vec::new();
         let mut errors = Vec::new();
         let mut used = vec![false; paths.len()];
 
-        let local_csv_roles = paths
+        let local_csv_infos = paths
             .iter()
-            .map(|path| Self::local_csv_merge_role(path))
+            .map(|path| Self::local_csv_pair_info(path))
             .collect::<Vec<_>>();
 
         for index in 0..paths.len() {
             if used[index] {
                 continue;
             }
-            let Some((role, key)) = &local_csv_roles[index] else {
+            let Some(info) = &local_csv_infos[index] else {
                 continue;
             };
-            let wanted = match role {
+            let Some(timestamp) = &info.filename_timestamp else {
+                continue;
+            };
+            let wanted = match info.role {
                 LocalCsvRole::Analog => LocalCsvRole::Digital,
                 LocalCsvRole::Digital => LocalCsvRole::Analog,
             };
@@ -3106,46 +3120,115 @@ impl ScopeApp {
                 if other_index == index || used[other_index] {
                     return None;
                 }
-                let Some((other_role, other_key)) = &local_csv_roles[other_index] else {
+                let Some(other_info) = &local_csv_infos[other_index] else {
                     return None;
                 };
-                (*other_role == wanted && (other_key == key || paths.len() == 2))
-                    .then_some(other_index)
+                (other_info.role == wanted
+                    && other_info.filename_timestamp.as_ref() == Some(timestamp))
+                .then_some(other_index)
             });
             let Some(pair_index) = pair_index else {
                 continue;
             };
 
-            let analog_index = if *role == LocalCsvRole::Analog {
-                index
-            } else {
-                pair_index
-            };
-            let digital_index = if *role == LocalCsvRole::Digital {
-                index
-            } else {
-                pair_index
-            };
-            let display_path = format!(
-                "{} + {}",
-                paths[analog_index].display(),
-                paths[digital_index].display()
+            Self::open_local_csv_pair_by_indices(
+                &paths,
+                &mut used,
+                &mut opened,
+                &mut errors,
+                index,
+                pair_index,
+                info.role,
+                sample_rate_hz,
             );
-            let result = Self::worker_result("Import worker panicked.", || {
-                Self::open_local_csv_pair(
-                    &paths[analog_index],
-                    &paths[digital_index],
-                    sample_rate_hz,
-                )
-            });
-            match result {
-                Ok(dataset) => {
-                    used[index] = true;
-                    used[pair_index] = true;
-                    opened.push(dataset);
-                }
-                Err(error) => errors.push(format!("{display_path}: {error}")),
+        }
+
+        for index in 0..paths.len() {
+            if used[index] {
+                continue;
             }
+            let Some(info) = &local_csv_infos[index] else {
+                continue;
+            };
+            let wanted = match info.role {
+                LocalCsvRole::Analog => LocalCsvRole::Digital,
+                LocalCsvRole::Digital => LocalCsvRole::Analog,
+            };
+            let pair_index = paths.iter().enumerate().find_map(|(other_index, _)| {
+                if other_index == index || used[other_index] {
+                    return None;
+                }
+                let Some(other_info) = &local_csv_infos[other_index] else {
+                    return None;
+                };
+                (other_info.role == wanted
+                    && (other_info.key == info.key || paths.len() == 2)
+                    && !Self::filename_timestamps_conflict(info, other_info))
+                .then_some(other_index)
+            });
+            let Some(pair_index) = pair_index else {
+                continue;
+            };
+
+            Self::open_local_csv_pair_by_indices(
+                &paths,
+                &mut used,
+                &mut opened,
+                &mut errors,
+                index,
+                pair_index,
+                info.role,
+                sample_rate_hz,
+            );
+        }
+
+        for index in 0..paths.len() {
+            if used[index] {
+                continue;
+            }
+            let Some(info) = &local_csv_infos[index] else {
+                continue;
+            };
+            let Some(modified_millis) = info.modified_millis else {
+                continue;
+            };
+            let wanted = match info.role {
+                LocalCsvRole::Analog => LocalCsvRole::Digital,
+                LocalCsvRole::Digital => LocalCsvRole::Analog,
+            };
+            let pair_index = paths
+                .iter()
+                .enumerate()
+                .filter_map(|(other_index, _)| {
+                    if other_index == index || used[other_index] {
+                        return None;
+                    }
+                    let other_info = local_csv_infos[other_index].as_ref()?;
+                    let other_millis = other_info.modified_millis?;
+                    if other_info.role != wanted
+                        || Self::filename_timestamps_conflict(info, other_info)
+                    {
+                        return None;
+                    }
+                    let diff = (modified_millis - other_millis).abs();
+                    (diff <= LOCAL_CSV_PAIR_MTIME_WINDOW_MS).then_some((diff, other_index))
+                })
+                .min_by_key(|(diff, _)| *diff)
+                .map(|(_, other_index)| other_index);
+            let Some(pair_index) = pair_index else {
+                continue;
+            };
+
+            Self::open_local_csv_pair_by_indices(
+                &paths,
+                &mut used,
+                &mut opened,
+                &mut errors,
+                index,
+                pair_index,
+                info.role,
+                sample_rate_hz,
+            );
         }
 
         let remaining_local_csv = paths
@@ -3189,11 +3272,213 @@ impl ScopeApp {
         (opened, errors)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn open_local_csv_pair_by_indices(
+        paths: &[PathBuf],
+        used: &mut [bool],
+        opened: &mut Vec<OpenedDataset>,
+        errors: &mut Vec<String>,
+        index: usize,
+        pair_index: usize,
+        role: LocalCsvRole,
+        sample_rate_hz: f64,
+    ) {
+        let analog_index = if role == LocalCsvRole::Analog {
+            index
+        } else {
+            pair_index
+        };
+        let digital_index = if role == LocalCsvRole::Digital {
+            index
+        } else {
+            pair_index
+        };
+        let display_path = format!(
+            "{} + {}",
+            paths[analog_index].display(),
+            paths[digital_index].display()
+        );
+        let result = Self::worker_result("Import worker panicked.", || {
+            Self::open_local_csv_pair(&paths[analog_index], &paths[digital_index], sample_rate_hz)
+        });
+        match result {
+            Ok(dataset) => {
+                used[index] = true;
+                used[pair_index] = true;
+                opened.push(dataset);
+            }
+            Err(error) => errors.push(format!("{display_path}: {error}")),
+        }
+    }
+
+    fn expand_local_csv_counterparts(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+        let mut expanded = paths;
+        let initial_len = expanded.len();
+        let mut known_paths = expanded
+            .iter()
+            .map(|path| Self::local_path_key(path))
+            .collect::<HashSet<_>>();
+
+        for index in 0..initial_len {
+            let Some(info) = Self::local_csv_pair_info(&expanded[index]) else {
+                continue;
+            };
+            let Some(counterpart) =
+                Self::find_local_csv_counterpart(&expanded[index], &info, &known_paths)
+            else {
+                continue;
+            };
+            known_paths.insert(Self::local_path_key(&counterpart));
+            expanded.push(counterpart);
+        }
+
+        expanded
+    }
+
+    fn find_local_csv_counterpart(
+        path: &Path,
+        info: &LocalCsvPairInfo,
+        known_paths: &HashSet<String>,
+    ) -> Option<PathBuf> {
+        let parent = path.parent()?;
+        let wanted = match info.role {
+            LocalCsvRole::Analog => LocalCsvRole::Digital,
+            LocalCsvRole::Digital => LocalCsvRole::Analog,
+        };
+        let mut timestamp_matches = Vec::new();
+        let mut modified_matches = Vec::new();
+
+        for entry in fs::read_dir(parent).ok()?.flatten() {
+            let candidate = entry.path();
+            if candidate == path || known_paths.contains(&Self::local_path_key(&candidate)) {
+                continue;
+            }
+            let Some(candidate_info) = Self::local_csv_pair_info(&candidate) else {
+                continue;
+            };
+            if candidate_info.role != wanted {
+                continue;
+            }
+            if info.filename_timestamp.is_some()
+                && info.filename_timestamp == candidate_info.filename_timestamp
+            {
+                timestamp_matches.push(candidate);
+                continue;
+            }
+            let Some(left_millis) = info.modified_millis else {
+                continue;
+            };
+            let Some(right_millis) = candidate_info.modified_millis else {
+                continue;
+            };
+            if Self::filename_timestamps_conflict(info, &candidate_info) {
+                continue;
+            }
+            let diff = (left_millis - right_millis).abs();
+            if diff <= LOCAL_CSV_PAIR_MTIME_WINDOW_MS {
+                modified_matches.push((diff, candidate));
+            }
+        }
+
+        timestamp_matches.sort();
+        timestamp_matches.into_iter().next().or_else(|| {
+            modified_matches
+                .into_iter()
+                .min_by_key(|(diff, _)| *diff)
+                .map(|(_, path)| path)
+        })
+    }
+
+    fn local_csv_pair_info(path: &Path) -> Option<LocalCsvPairInfo> {
+        let (role, key) = Self::local_csv_merge_role(path)?;
+        Some(LocalCsvPairInfo {
+            role,
+            key,
+            filename_timestamp: Self::filename_timestamp_key(path),
+            modified_millis: Self::file_modified_millis(path),
+        })
+    }
+
+    fn filename_timestamps_conflict(left: &LocalCsvPairInfo, right: &LocalCsvPairInfo) -> bool {
+        matches!(
+            (&left.filename_timestamp, &right.filename_timestamp),
+            (Some(left), Some(right)) if left != right
+        )
+    }
+
+    fn filename_timestamp_key(path: &Path) -> Option<String> {
+        let stem = path.file_stem()?.to_string_lossy();
+        let mut run = String::new();
+        for ch in stem.chars().chain(std::iter::once('_')) {
+            if ch.is_ascii_digit() {
+                run.push(ch);
+                continue;
+            }
+            if run.len() >= 14 {
+                for start in 0..=run.len() - 14 {
+                    let candidate = &run[start..start + 14];
+                    if Self::looks_like_compact_timestamp(candidate) {
+                        return Some(candidate.to_owned());
+                    }
+                }
+            }
+            run.clear();
+        }
+        None
+    }
+
+    fn looks_like_compact_timestamp(raw: &str) -> bool {
+        if raw.len() != 14 || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+        let parse = |range: std::ops::Range<usize>| raw[range].parse::<u32>().ok();
+        let Some(year) = parse(0..4) else {
+            return false;
+        };
+        let Some(month) = parse(4..6) else {
+            return false;
+        };
+        let Some(day) = parse(6..8) else {
+            return false;
+        };
+        let Some(hour) = parse(8..10) else {
+            return false;
+        };
+        let Some(minute) = parse(10..12) else {
+            return false;
+        };
+        let Some(second) = parse(12..14) else {
+            return false;
+        };
+        (1970..=2099).contains(&year)
+            && (1..=12).contains(&month)
+            && (1..=31).contains(&day)
+            && hour <= 23
+            && minute <= 59
+            && second <= 59
+    }
+
+    fn file_modified_millis(path: &Path) -> Option<i128> {
+        let modified = fs::metadata(path).ok()?.modified().ok()?;
+        Some(modified.duration_since(UNIX_EPOCH).ok()?.as_millis() as i128)
+    }
+
+    fn local_path_key(path: &Path) -> String {
+        path.canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .to_ascii_lowercase()
+    }
+
     fn open_local_csv_pair(
         analog_path: &Path,
         digital_path: &Path,
         sample_rate_hz: f64,
     ) -> Result<OpenedDataset, String> {
+        if Self::looks_like_indexed_local_csv_pair(analog_path, digital_path) {
+            return Self::open_indexed_local_csv_pair(analog_path, digital_path, sample_rate_hz);
+        }
+
         let analog = CsvDataSource::open_with_sample_rate(analog_path, sample_rate_hz)
             .map_err(|error| error.to_string())?;
         let digital = CsvDataSource::open_with_sample_rate(digital_path, sample_rate_hz)
@@ -3206,6 +3491,18 @@ impl ScopeApp {
         second_path: &Path,
         sample_rate_hz: f64,
     ) -> Result<OpenedDataset, String> {
+        let first_indexed_role = Self::local_indexed_csv_role(first_path);
+        let second_indexed_role = Self::local_indexed_csv_role(second_path);
+        match (first_indexed_role, second_indexed_role) {
+            (Some(LocalCsvRole::Analog), Some(LocalCsvRole::Digital)) => {
+                return Self::open_indexed_local_csv_pair(first_path, second_path, sample_rate_hz);
+            }
+            (Some(LocalCsvRole::Digital), Some(LocalCsvRole::Analog)) => {
+                return Self::open_indexed_local_csv_pair(second_path, first_path, sample_rate_hz);
+            }
+            _ => {}
+        }
+
         let first = CsvDataSource::open_with_sample_rate(first_path, sample_rate_hz)
             .map_err(|error| error.to_string())?;
         let second = CsvDataSource::open_with_sample_rate(second_path, sample_rate_hz)
@@ -3221,6 +3518,53 @@ impl ScopeApp {
             }
             _ => Err("Could not distinguish analog and digital local CSV files.".to_owned()),
         }
+    }
+
+    fn open_indexed_local_csv_pair(
+        analog_path: &Path,
+        digital_path: &Path,
+        sample_rate_hz: f64,
+    ) -> Result<OpenedDataset, String> {
+        let analog =
+            CsvDataSource::open_skipping_first_column_with_sample_rate(analog_path, sample_rate_hz)
+                .map_err(|error| error.to_string())?;
+        let digital = CsvDataSource::open_skipping_first_column_with_sample_rate(
+            digital_path,
+            sample_rate_hz,
+        )
+        .map_err(|error| error.to_string())?;
+        let source_name = Self::merged_local_csv_name(analog_path, digital_path);
+        let digital_name = digital_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("DDATA.csv")
+            .to_owned();
+        let digital_source = MergedLeadingBitsDataSource::new(Arc::new(digital), digital_name)
+            .map_err(|error| error.to_string())?;
+        let source = CombinedDataSource::new(
+            source_name,
+            vec![
+                (Arc::new(analog) as Arc<dyn DataSource>, false),
+                (Arc::new(digital_source) as Arc<dyn DataSource>, true),
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        let source: Arc<dyn DataSource> =
+            if source.metadata().channels.len() == VARIABLE_NAMES.len() {
+                let source_name = source.metadata().source_name.clone();
+                Arc::new(
+                    RenamedDataSource::new(Arc::new(source), source_name, &VARIABLE_NAMES)
+                        .map_err(|error| error.to_string())?,
+                )
+            } else {
+                Arc::new(source)
+            };
+
+        Ok(OpenedDataset {
+            source,
+            path: analog_path.to_owned(),
+            kind: SourceKind::Local,
+        })
     }
 
     fn open_local_csv_pair_sources(
@@ -3357,10 +3701,70 @@ impl ScopeApp {
             || lowered.contains("logic")
         {
             LocalCsvRole::Digital
+        } else if let Some(role) = Self::local_indexed_csv_role(path) {
+            role
         } else {
             return None;
         };
         Some((role, Self::local_csv_merge_key(&stem)))
+    }
+
+    fn looks_like_indexed_local_csv_pair(analog_path: &Path, digital_path: &Path) -> bool {
+        Self::local_indexed_csv_role(analog_path) == Some(LocalCsvRole::Analog)
+            && Self::local_indexed_csv_role(digital_path) == Some(LocalCsvRole::Digital)
+    }
+
+    fn local_indexed_csv_role(path: &Path) -> Option<LocalCsvRole> {
+        let mut reader = csv_reader_from_path_with_headers(path, false).ok()?;
+        let mut header = csv::StringRecord::new();
+        if !reader.read_record(&mut header).ok()? {
+            return None;
+        }
+        let first = header.get(0)?;
+        if !Self::looks_like_sequence_column(first) {
+            return None;
+        }
+        let mut data_columns = 0_usize;
+        let mut analog_columns = 0_usize;
+        let mut digital_columns = 0_usize;
+        for name in header.iter().skip(1) {
+            let normalized = Self::normalized_local_header(name);
+            if normalized.is_empty() {
+                continue;
+            }
+            data_columns += 1;
+            if normalized.starts_with("ach") {
+                analog_columns += 1;
+            }
+            if normalized.starts_with("dch") {
+                digital_columns += 1;
+            }
+        }
+        if data_columns == 0 {
+            None
+        } else if analog_columns > 0 && analog_columns * 2 >= data_columns {
+            Some(LocalCsvRole::Analog)
+        } else if digital_columns > 0 && digital_columns * 2 >= data_columns {
+            Some(LocalCsvRole::Digital)
+        } else {
+            None
+        }
+    }
+
+    fn looks_like_sequence_column(name: &str) -> bool {
+        matches!(
+            Self::normalized_local_header(name).as_str(),
+            "num" | "number" | "no" | "index" | "sample" | "序号" | "列号"
+        )
+    }
+
+    fn normalized_local_header(name: &str) -> String {
+        name.trim()
+            .trim_start_matches('\u{feff}')
+            .chars()
+            .filter(|ch| !matches!(ch, ' ' | '_' | '-' | '(' | ')' | '[' | ']'))
+            .collect::<String>()
+            .to_ascii_lowercase()
     }
 
     fn local_csv_merge_key(stem: &str) -> String {
@@ -15005,6 +15409,190 @@ impl eframe::App for ScopeApp {
             self.zoom_box_current = None;
             self.cursor_place_mode = None;
             ctx.request_repaint();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs::File, io::Write};
+
+    #[test]
+    fn opens_indexed_adata_ddata_pair_without_sequence_column_and_merges_first_three_bits() {
+        let dir = unique_test_dir("indexed_pair");
+        let analog_path = dir.join("Tab1_ADATA.csv");
+        let digital_path = dir.join("Tab1_DDATA.csv");
+
+        let mut analog = File::create(&analog_path).unwrap();
+        writeln!(analog, "NUM,ACH1,ACH2,ACH3").unwrap();
+        writeln!(analog, "1,9747,4924,9527").unwrap();
+        writeln!(analog, "2,9747,4940,9527").unwrap();
+        drop(analog);
+
+        let mut digital = File::create(&digital_path).unwrap();
+        writeln!(digital, "Num,DCH1,DCH2,DCH3,DCH4,DCH5").unwrap();
+        writeln!(digital, "1,1,1,0,0,1").unwrap();
+        writeln!(digital, "2,0,1,1,1,0").unwrap();
+        drop(digital);
+
+        let opened = ScopeApp::open_local_csv_pair(&analog_path, &digital_path, 1000.0).unwrap();
+        let meta = opened.source.metadata();
+        assert_eq!(meta.channels.len(), 6);
+        assert_eq!(meta.channels[0].name, "ACH1");
+        assert_eq!(meta.channels[2].name, "ACH3");
+        assert_eq!(meta.channels[3].name, "DCH1_DCH3");
+        assert_eq!(meta.channels[4].name, "DCH4");
+        assert_eq!(meta.channels[5].name, "DCH5");
+
+        let block = opened
+            .source
+            .read_range(0.0, 0.001, &[0, 3, 4, 5], 10)
+            .unwrap();
+        assert_eq!(block.channels[0], vec![9747.0, 9747.0]);
+        assert_eq!(block.channels[1], vec![3.0, 6.0]);
+        assert_eq!(block.channels[2], vec![0.0, 1.0]);
+        assert_eq!(block.channels[3], vec![1.0, 0.0]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn indexed_local_csv_pair_uses_cloud_variable_names() {
+        let dir = unique_test_dir("cloud_names");
+        let analog_path = dir.join("Names_ADATA.csv");
+        let digital_path = dir.join("Names_DDATA.csv");
+
+        let mut analog = File::create(&analog_path).unwrap();
+        write!(analog, "NUM").unwrap();
+        for index in 1..=30 {
+            write!(analog, ",ACH{index}").unwrap();
+        }
+        writeln!(analog).unwrap();
+        write!(analog, "1").unwrap();
+        for index in 1..=30 {
+            write!(analog, ",{index}").unwrap();
+        }
+        writeln!(analog).unwrap();
+        drop(analog);
+
+        let mut digital = File::create(&digital_path).unwrap();
+        write!(digital, "Num").unwrap();
+        for index in 1..=32 {
+            write!(digital, ",DCH{index}").unwrap();
+        }
+        writeln!(digital).unwrap();
+        write!(digital, "1").unwrap();
+        for index in 1..=32 {
+            write!(digital, ",{}", index % 2).unwrap();
+        }
+        writeln!(digital).unwrap();
+        drop(digital);
+
+        let opened = ScopeApp::open_local_csv_pair(&analog_path, &digital_path, 1000.0).unwrap();
+        let meta = opened.source.metadata();
+        assert_eq!(meta.channels.len(), 60);
+        assert_eq!(meta.channels[0].name, "stVbus_0.iVal");
+        assert_eq!(meta.channels[29].name, "stPIIBuckboost_B.iRef");
+        assert_eq!(meta.channels[30].name, "LogicStsWord1.GPUOnOffSt");
+        assert_eq!(meta.channels[31].name, "LogicStsWord1.Fault");
+        assert_eq!(meta.channels[59].name, "unFaultFlag.GenFault");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn single_indexed_local_csv_discovers_counterpart_by_modified_time() {
+        let dir = unique_test_dir("single_pair");
+        let analog_path = dir.join("Single_Tab1_ADATA.csv");
+        let digital_path = dir.join("Single_Tab1_DDATA.csv");
+
+        write_indexed_analog_csv(&analog_path, &[111.0, 222.0]);
+        write_indexed_digital_csv(&digital_path, &[(1, 0, 1, 1), (0, 1, 1, 0)]);
+
+        let (opened, errors) = ScopeApp::open_waveform_files(vec![analog_path.clone()], 1000.0);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].source.metadata().channels.len(), 3);
+
+        let block = opened[0]
+            .source
+            .read_range(0.0, 0.001, &[0, 1, 2], 10)
+            .unwrap();
+        assert_eq!(block.channels[0], vec![111.0, 222.0]);
+        assert_eq!(block.channels[1], vec![5.0, 6.0]);
+        assert_eq!(block.channels[2], vec![1.0, 0.0]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn batch_indexed_local_csv_pairs_by_filename_timestamp_before_name_key() {
+        let dir = unique_test_dir("batch_time_pair");
+        let a1 = dir.join("alpha_20260602010101_ADATA.csv");
+        let d1 = dir.join("beta_20260602010101_DDATA.csv");
+        let a2 = dir.join("gamma_20260602020202_ADATA.csv");
+        let d2 = dir.join("delta_20260602020202_DDATA.csv");
+
+        write_indexed_analog_csv(&a1, &[10.0, 20.0]);
+        write_indexed_digital_csv(&d1, &[(1, 1, 0, 0), (0, 0, 1, 1)]);
+        write_indexed_analog_csv(&a2, &[30.0, 40.0]);
+        write_indexed_digital_csv(&d2, &[(0, 1, 0, 1), (1, 0, 1, 0)]);
+
+        let (opened, errors) = ScopeApp::open_waveform_files(
+            vec![a1.clone(), d2.clone(), a2.clone(), d1.clone()],
+            1000.0,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(opened.len(), 2);
+        assert!(opened
+            .iter()
+            .all(|dataset| dataset.source.metadata().channels.len() == 3));
+
+        let merged_values = opened
+            .iter()
+            .map(|dataset| {
+                dataset
+                    .source
+                    .read_range(0.0, 0.001, &[1], 10)
+                    .unwrap()
+                    .channels
+                    .remove(0)
+            })
+            .collect::<Vec<_>>();
+        assert!(merged_values.contains(&vec![3.0, 4.0]));
+        assert!(merged_values.contains(&vec![2.0, 5.0]));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!(
+            "scope_analyzer_{name}_{}_{}",
+            std::process::id(),
+            millis
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_indexed_analog_csv(path: &Path, values: &[f32]) {
+        let mut file = File::create(path).unwrap();
+        writeln!(file, "NUM,ACH1").unwrap();
+        for (index, value) in values.iter().enumerate() {
+            writeln!(file, "{},{}", index + 1, value).unwrap();
+        }
+    }
+
+    fn write_indexed_digital_csv(path: &Path, rows: &[(u8, u8, u8, u8)]) {
+        let mut file = File::create(path).unwrap();
+        writeln!(file, "Num,DCH1,DCH2,DCH3,DCH4").unwrap();
+        for (index, (bit0, bit1, bit2, dch4)) in rows.iter().enumerate() {
+            writeln!(file, "{},{},{},{},{}", index + 1, bit0, bit1, bit2, dch4).unwrap();
         }
     }
 }

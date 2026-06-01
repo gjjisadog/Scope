@@ -28,7 +28,10 @@ struct BlockIndex {
 #[derive(Clone, Copy, Debug)]
 enum CsvLayout {
     TimeColumn,
-    SyntheticTime { sample_interval_s: f64 },
+    SyntheticTime {
+        sample_interval_s: f64,
+        first_channel_column: usize,
+    },
 }
 
 pub struct CsvDataSource {
@@ -84,6 +87,7 @@ impl CsvDataSource {
     fn discover_layout(
         reader: &mut csv::Reader<Cursor<Vec<u8>>>,
         fallback_sample_rate_hz: f64,
+        skip_first_synthetic_column: bool,
     ) -> DataResult<(CsvLayout, Vec<String>)> {
         let mut record = StringRecord::new();
         if !reader.read_record(&mut record)? {
@@ -103,7 +107,14 @@ impl CsvDataSource {
                 return Ok((CsvLayout::TimeColumn, names));
             }
             let sample_interval_s = 1.0 / fallback_sample_rate_hz.max(1.0);
-            return Ok((CsvLayout::SyntheticTime { sample_interval_s }, names));
+            let first_channel_column = usize::from(skip_first_synthetic_column);
+            return Ok((
+                CsvLayout::SyntheticTime {
+                    sample_interval_s,
+                    first_channel_column,
+                },
+                names,
+            ));
         }
 
         let mut sample_interval_s = None;
@@ -142,7 +153,13 @@ impl CsvDataSource {
                 let sample_interval_s = sample_interval_s.ok_or_else(|| {
                     DataError::Csv("Metadata CSV is missing a positive dt value.".to_owned())
                 })?;
-                return Ok((CsvLayout::SyntheticTime { sample_interval_s }, names));
+                return Ok((
+                    CsvLayout::SyntheticTime {
+                        sample_interval_s,
+                        first_channel_column: 0,
+                    },
+                    names,
+                ));
             }
         }
     }
@@ -221,6 +238,7 @@ impl CsvDataSource {
     fn parse_synthetic_sample_into(
         record: &StringRecord,
         channel_count: usize,
+        first_channel_column: usize,
         sample_index: u64,
         sample_interval_s: f64,
         values: &mut Vec<f32>,
@@ -230,10 +248,10 @@ impl CsvDataSource {
             values.reserve(channel_count);
         }
         for index in 0..channel_count {
-            let raw = record.get(index).ok_or_else(|| {
+            let raw = record.get(index + first_channel_column).ok_or_else(|| {
                 format!(
                     "Missing channel fields: expected {channel_count}, got {}",
-                    record.len()
+                    record.len().saturating_sub(first_channel_column)
                 )
             })?;
             values.push(Self::parse_channel_value(raw, index)?);
@@ -244,6 +262,7 @@ impl CsvDataSource {
     fn parse_synthetic_selected_values(
         record: &StringRecord,
         channel_count: usize,
+        first_channel_column: usize,
         channels: &[usize],
     ) -> Result<Vec<f32>, String> {
         let mut selected = Vec::with_capacity(channels.len());
@@ -252,7 +271,7 @@ impl CsvDataSource {
                 return Err("Requested channel is out of range".to_owned());
             }
             let raw = record
-                .get(channel)
+                .get(channel + first_channel_column)
                 .ok_or_else(|| "Requested channel column is missing".to_owned())?;
             selected.push(Self::parse_channel_value(raw, channel)?);
         }
@@ -329,7 +348,9 @@ impl DataSource for CsvDataSource {
                     };
                     time
                 }
-                CsvLayout::SyntheticTime { sample_interval_s } => {
+                CsvLayout::SyntheticTime {
+                    sample_interval_s, ..
+                } => {
                     let time = sample_index as f64 * sample_interval_s;
                     sample_index += 1;
                     time
@@ -346,9 +367,13 @@ impl DataSource for CsvDataSource {
                     CsvLayout::TimeColumn => {
                         Self::parse_selected_values(&record, self.meta.channels.len(), channels)
                     }
-                    CsvLayout::SyntheticTime { .. } => Self::parse_synthetic_selected_values(
+                    CsvLayout::SyntheticTime {
+                        first_channel_column,
+                        ..
+                    } => Self::parse_synthetic_selected_values(
                         &record,
                         self.meta.channels.len(),
+                        first_channel_column,
                         channels,
                     ),
                 };
@@ -439,11 +464,36 @@ impl DataSource for CsvDataSource {
 
 impl CsvDataSource {
     pub fn open_with_sample_rate(path: &Path, fallback_sample_rate_hz: f64) -> DataResult<Self> {
+        Self::open_with_options(path, fallback_sample_rate_hz, false)
+    }
+
+    pub fn open_skipping_first_column_with_sample_rate(
+        path: &Path,
+        fallback_sample_rate_hz: f64,
+    ) -> DataResult<Self> {
+        Self::open_with_options(path, fallback_sample_rate_hz, true)
+    }
+
+    fn open_with_options(
+        path: &Path,
+        fallback_sample_rate_hz: f64,
+        skip_first_synthetic_column: bool,
+    ) -> DataResult<Self> {
         let mut reader = Self::reader_from_path(path)?;
-        let (layout, names) = Self::discover_layout(&mut reader, fallback_sample_rate_hz)?;
+        let (layout, names) = Self::discover_layout(
+            &mut reader,
+            fallback_sample_rate_hz,
+            skip_first_synthetic_column,
+        )?;
         let channel_count = match layout {
             CsvLayout::TimeColumn => names.len().saturating_sub(1).min(MAX_CHANNELS),
-            CsvLayout::SyntheticTime { .. } => names.len().min(MAX_CHANNELS),
+            CsvLayout::SyntheticTime {
+                first_channel_column,
+                ..
+            } => names
+                .len()
+                .saturating_sub(first_channel_column)
+                .min(MAX_CHANNELS),
         };
         if channel_count == 0 {
             return Err(DataError::NoChannels);
@@ -472,15 +522,17 @@ impl CsvDataSource {
                 CsvLayout::TimeColumn => {
                     Self::parse_sample_into(&record, channel_count, &mut row_values)
                 }
-                CsvLayout::SyntheticTime { sample_interval_s } => {
-                    Self::parse_synthetic_sample_into(
-                        &record,
-                        channel_count,
-                        row_count,
-                        sample_interval_s,
-                        &mut row_values,
-                    )
-                }
+                CsvLayout::SyntheticTime {
+                    sample_interval_s,
+                    first_channel_column,
+                } => Self::parse_synthetic_sample_into(
+                    &record,
+                    channel_count,
+                    first_channel_column,
+                    row_count,
+                    sample_interval_s,
+                    &mut row_values,
+                ),
             };
             let time = match sample_result {
                 Ok(time) => time,
@@ -550,7 +602,10 @@ impl CsvDataSource {
         let end_time = last_time.unwrap_or(start_time);
         let nominal_sample_rate_hz = if dt_count > 0 {
             1.0 / (dt_sum / dt_count as f64)
-        } else if let CsvLayout::SyntheticTime { sample_interval_s } = layout {
+        } else if let CsvLayout::SyntheticTime {
+            sample_interval_s, ..
+        } = layout
+        {
             1.0 / sample_interval_s
         } else {
             1.0
@@ -558,7 +613,10 @@ impl CsvDataSource {
 
         let name_iter: Box<dyn Iterator<Item = &String>> = match layout {
             CsvLayout::TimeColumn => Box::new(names.iter().skip(1).take(channel_count)),
-            CsvLayout::SyntheticTime { .. } => Box::new(names.iter().take(channel_count)),
+            CsvLayout::SyntheticTime {
+                first_channel_column,
+                ..
+            } => Box::new(names.iter().skip(first_channel_column).take(channel_count)),
         };
         let channels = name_iter
             .enumerate()
