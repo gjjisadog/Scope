@@ -3,6 +3,7 @@ use std::{
     env,
     fs::{self, File, OpenOptions},
     io::{BufWriter, Write},
+    ops::RangeInclusive,
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{Arc, Once},
@@ -59,13 +60,18 @@ const MAX_RECENT_FILES: usize = 12;
 const MAX_RECENT_CONFIGS: usize = 12;
 const LOCAL_CSV_PAIR_MTIME_WINDOW_MS: i128 = 10_000;
 const CHANNEL_NAME_AVERAGE_CHAR_WIDTH: f32 = 7.0;
-const CHANNEL_PANEL_DEFAULT_WIDTH: f32 = 170.0;
-const CHANNEL_PANEL_MIN_WIDTH: f32 = 120.0;
+const CHANNEL_PANEL_DEFAULT_WIDTH: f32 = 220.0;
+const CHANNEL_PANEL_MIN_WIDTH: f32 = 96.0;
 const CHANNEL_PANEL_MAX_WIDTH: f32 = 320.0;
-const ANALYSIS_PANEL_DEFAULT_WIDTH: f32 = 310.0;
+const ANALYSIS_PANEL_DEFAULT_WIDTH: f32 = 360.0;
 const ANALYSIS_PANEL_MIN_WIDTH: f32 = 260.0;
 const ANALYSIS_PANEL_MAX_WIDTH: f32 = 380.0;
-const CHANNEL_NAME_COLUMN_WIDTH: f32 = 112.0;
+const MIN_CENTRAL_PANEL_WIDTH: f32 = 360.0;
+const MAX_CHANNEL_PANEL_FRACTION: f32 = 0.45;
+const MAX_ANALYSIS_PANEL_FRACTION: f32 = 0.50;
+const CHANNEL_NAME_COLUMN_MIN_WIDTH: f32 = 72.0;
+const CHANNEL_NAME_COLUMN_MAX_WIDTH: f32 = 520.0;
+const ANALYSIS_PANEL_CONTENT_MIN_WIDTH: f32 = 520.0;
 const MEASUREMENT_CHANNEL_COLUMN_WIDTH: f32 = 132.0;
 const MEASUREMENT_VALUE_COLUMN_WIDTH: f32 = 78.0;
 const ANALYSIS_LABEL_COLUMN_WIDTH: f32 = 56.0;
@@ -86,6 +92,12 @@ const MAX_EXPORT_ARROW_SIZE: f32 = 28.0;
 const DEFAULT_EXPORT_LABEL_SCALE: i32 = 3;
 const MIN_EXPORT_LABEL_SCALE: i32 = 1;
 const MAX_EXPORT_LABEL_SCALE: i32 = 4;
+
+#[derive(Clone, Debug)]
+struct SidebarWidthRanges {
+    channel: RangeInclusive<f32>,
+    analysis: RangeInclusive<f32>,
+}
 
 fn default_sample_rate_hz() -> f64 {
     1000.0
@@ -679,24 +691,40 @@ impl ShortcutKey {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 struct ShortcutBinding {
     ctrl: bool,
+    #[serde(default)]
+    alt: bool,
     key: ShortcutKey,
 }
 
 impl ShortcutBinding {
     fn new(ctrl: bool, key: ShortcutKey) -> Self {
-        Self { ctrl, key }
-    }
-
-    fn label(self) -> String {
-        if self.ctrl {
-            format!("Ctrl+{}", self.key.label())
-        } else {
-            self.key.label().to_owned()
+        Self {
+            ctrl,
+            alt: false,
+            key,
         }
     }
 
+    fn with_alt(ctrl: bool, alt: bool, key: ShortcutKey) -> Self {
+        Self { ctrl, alt, key }
+    }
+
+    fn label(self) -> String {
+        let mut parts = Vec::new();
+        if self.ctrl {
+            parts.push("Ctrl");
+        }
+        if self.alt {
+            parts.push("Alt");
+        }
+        parts.push(self.key.label());
+        parts.join("+")
+    }
+
     fn pressed(self, input: &egui::InputState) -> bool {
-        input.modifiers.ctrl == self.ctrl && input.key_pressed(self.key.egui_key())
+        input.modifiers.ctrl == self.ctrl
+            && input.modifiers.alt == self.alt
+            && input.key_pressed(self.key.egui_key())
     }
 }
 
@@ -712,6 +740,10 @@ struct ShortcutConfig {
     select_all: ShortcutBinding,
     #[serde(default = "default_select_none_shortcut")]
     select_none: ShortcutBinding,
+    #[serde(default = "default_toggle_channel_panel_shortcut")]
+    toggle_channel_panel: ShortcutBinding,
+    #[serde(default = "default_toggle_analysis_panel_shortcut")]
+    toggle_analysis_panel: ShortcutBinding,
 }
 
 impl Default for ShortcutConfig {
@@ -722,6 +754,8 @@ impl Default for ShortcutConfig {
             toggle_cursors: default_toggle_cursors_shortcut(),
             select_all: default_select_all_shortcut(),
             select_none: default_select_none_shortcut(),
+            toggle_channel_panel: default_toggle_channel_panel_shortcut(),
+            toggle_analysis_panel: default_toggle_analysis_panel_shortcut(),
         }
     }
 }
@@ -744,6 +778,14 @@ fn default_select_all_shortcut() -> ShortcutBinding {
 
 fn default_select_none_shortcut() -> ShortcutBinding {
     ShortcutBinding::new(true, ShortcutKey::D)
+}
+
+fn default_toggle_channel_panel_shortcut() -> ShortcutBinding {
+    ShortcutBinding::new(true, ShortcutKey::B)
+}
+
+fn default_toggle_analysis_panel_shortcut() -> ShortcutBinding {
+    ShortcutBinding::with_alt(true, true, ShortcutKey::B)
 }
 
 fn default_shortcuts() -> ShortcutConfig {
@@ -1310,6 +1352,8 @@ pub struct ScopeApp {
     channel_filter: String,
     show_help: bool,
     show_options: bool,
+    show_channel_panel: bool,
+    show_analysis_panel: bool,
     show_export_preview: bool,
     show_batch_export: bool,
     export_preview_dirty: bool,
@@ -1878,6 +1922,8 @@ impl ScopeApp {
             channel_filter: String::new(),
             show_help: false,
             show_options: false,
+            show_channel_panel: true,
+            show_analysis_panel: true,
             show_export_preview: false,
             show_batch_export: false,
             export_preview_dirty: false,
@@ -9608,6 +9654,10 @@ impl ScopeApp {
         label.chars().count() as f32 * CHANNEL_NAME_AVERAGE_CHAR_WIDTH
     }
 
+    fn analysis_combo_width(available_width: f32) -> f32 {
+        available_width.clamp(ANALYSIS_CHANNEL_COMBO_WIDTH, 420.0)
+    }
+
     fn dataset_channel_name(&self, dataset_index: usize, channel: &ChannelMeta) -> String {
         if dataset_index > 0 && self.dataset_kind_by_index(dataset_index) == Some(SourceKind::Dat) {
             if channel.name.trim().is_empty() {
@@ -11744,16 +11794,25 @@ impl ScopeApp {
         if ctx.wants_keyboard_input() {
             return;
         }
-        let (reset_view, fit_cursors, toggle_cursors, select_all, select_none) =
-            ctx.input(|input| {
-                (
-                    self.shortcuts.reset_view.pressed(input),
-                    self.shortcuts.fit_cursors.pressed(input),
-                    self.shortcuts.toggle_cursors.pressed(input),
-                    self.shortcuts.select_all.pressed(input),
-                    self.shortcuts.select_none.pressed(input),
-                )
-            });
+        let (
+            reset_view,
+            fit_cursors,
+            toggle_cursors,
+            select_all,
+            select_none,
+            toggle_channel_panel,
+            toggle_analysis_panel,
+        ) = ctx.input(|input| {
+            (
+                self.shortcuts.reset_view.pressed(input),
+                self.shortcuts.fit_cursors.pressed(input),
+                self.shortcuts.toggle_cursors.pressed(input),
+                self.shortcuts.select_all.pressed(input),
+                self.shortcuts.select_none.pressed(input),
+                self.shortcuts.toggle_channel_panel.pressed(input),
+                self.shortcuts.toggle_analysis_panel.pressed(input),
+            )
+        });
 
         let mut handled = false;
         if reset_view {
@@ -11774,6 +11833,14 @@ impl ScopeApp {
         }
         if select_none {
             self.set_all_channels_visible(false);
+            handled = true;
+        }
+        if toggle_channel_panel {
+            self.show_channel_panel = !self.show_channel_panel;
+            handled = true;
+        }
+        if toggle_analysis_panel {
+            self.show_analysis_panel = !self.show_analysis_panel;
             handled = true;
         }
         if handled {
@@ -12966,11 +13033,52 @@ impl ScopeApp {
                 let toggle_cursors_label = self.t(UiText::ToggleCursors);
                 let select_all_label = self.t(UiText::SelectAllChannels);
                 let select_none_label = self.t(UiText::DeselectAllChannels);
-                Self::shortcut_binding_ui(ui, "shortcut_reset_view", reset_view_label, &mut self.shortcuts.reset_view);
-                Self::shortcut_binding_ui(ui, "shortcut_fit_cursors", fit_cursors_label, &mut self.shortcuts.fit_cursors);
-                Self::shortcut_binding_ui(ui, "shortcut_toggle_cursors", toggle_cursors_label, &mut self.shortcuts.toggle_cursors);
-                Self::shortcut_binding_ui(ui, "shortcut_select_all", select_all_label, &mut self.shortcuts.select_all);
-                Self::shortcut_binding_ui(ui, "shortcut_select_none", select_none_label, &mut self.shortcuts.select_none);
+                let toggle_channel_panel_label =
+                    self.tr("切换左侧栏", "Toggle left sidebar").to_owned();
+                let toggle_analysis_panel_label =
+                    self.tr("切换右侧栏", "Toggle right sidebar").to_owned();
+                Self::shortcut_binding_ui(
+                    ui,
+                    "shortcut_reset_view",
+                    reset_view_label,
+                    &mut self.shortcuts.reset_view,
+                );
+                Self::shortcut_binding_ui(
+                    ui,
+                    "shortcut_fit_cursors",
+                    fit_cursors_label,
+                    &mut self.shortcuts.fit_cursors,
+                );
+                Self::shortcut_binding_ui(
+                    ui,
+                    "shortcut_toggle_cursors",
+                    toggle_cursors_label,
+                    &mut self.shortcuts.toggle_cursors,
+                );
+                Self::shortcut_binding_ui(
+                    ui,
+                    "shortcut_select_all",
+                    select_all_label,
+                    &mut self.shortcuts.select_all,
+                );
+                Self::shortcut_binding_ui(
+                    ui,
+                    "shortcut_select_none",
+                    select_none_label,
+                    &mut self.shortcuts.select_none,
+                );
+                Self::shortcut_binding_ui(
+                    ui,
+                    "shortcut_toggle_channel_panel",
+                    &toggle_channel_panel_label,
+                    &mut self.shortcuts.toggle_channel_panel,
+                );
+                Self::shortcut_binding_ui(
+                    ui,
+                    "shortcut_toggle_analysis_panel",
+                    &toggle_analysis_panel_label,
+                    &mut self.shortcuts.toggle_analysis_panel,
+                );
                 if ui.button(self.t(UiText::ResetShortcuts)).clicked() {
                     self.shortcuts = ShortcutConfig::default();
                 }
@@ -12986,12 +13094,13 @@ impl ScopeApp {
     fn shortcut_binding_ui(
         ui: &mut egui::Ui,
         id: &'static str,
-        label: &'static str,
+        label: &str,
         binding: &mut ShortcutBinding,
     ) {
         ui.horizontal(|ui| {
             ui.label(label);
             ui.checkbox(&mut binding.ctrl, "Ctrl");
+            ui.checkbox(&mut binding.alt, "Alt");
             egui::ComboBox::from_id_source(id)
                 .selected_text(binding.key.label())
                 .show_ui(ui, |ui| {
@@ -13026,6 +13135,68 @@ impl ScopeApp {
         self.last_analysis_panel_width = Some(analysis_width);
         if channel_changed || analysis_changed {
             self.layout_resize_active_until = Some(Instant::now() + LAYOUT_RESIZE_ACTIVE_GRACE);
+        }
+    }
+
+    fn sidebar_width_ranges(window_width: f32) -> SidebarWidthRanges {
+        Self::sidebar_width_ranges_for_visibility(window_width, true, true)
+    }
+
+    fn sidebar_width_ranges_for_visibility(
+        window_width: f32,
+        channel_visible: bool,
+        analysis_visible: bool,
+    ) -> SidebarWidthRanges {
+        let window_width = window_width.max(0.0);
+        let channel_min = CHANNEL_PANEL_MIN_WIDTH;
+        let analysis_min = ANALYSIS_PANEL_MIN_WIDTH;
+        let minimum_sidebar_total = if channel_visible { channel_min } else { 0.0 }
+            + if analysis_visible { analysis_min } else { 0.0 };
+        let sidebar_budget = (window_width - MIN_CENTRAL_PANEL_WIDTH).max(minimum_sidebar_total);
+
+        let channel_cap = if channel_visible {
+            (window_width * MAX_CHANNEL_PANEL_FRACTION)
+                .max(CHANNEL_PANEL_MAX_WIDTH)
+                .max(channel_min)
+        } else {
+            channel_min
+        };
+        let analysis_cap = if analysis_visible {
+            (window_width * MAX_ANALYSIS_PANEL_FRACTION)
+                .max(ANALYSIS_PANEL_MAX_WIDTH)
+                .max(analysis_min)
+        } else {
+            analysis_min
+        };
+
+        let (channel_max, analysis_max) = if channel_cap + analysis_cap <= sidebar_budget {
+            (channel_cap, analysis_cap)
+        } else {
+            let extra_budget = (sidebar_budget - minimum_sidebar_total).max(0.0);
+            let channel_extra = if channel_visible {
+                (channel_cap - channel_min).max(0.0)
+            } else {
+                0.0
+            };
+            let analysis_extra = if analysis_visible {
+                (analysis_cap - analysis_min).max(0.0)
+            } else {
+                0.0
+            };
+            let extra_total = channel_extra + analysis_extra;
+            if extra_total <= f32::EPSILON {
+                (channel_min, analysis_min)
+            } else {
+                (
+                    channel_min + extra_budget * channel_extra / extra_total,
+                    analysis_min + extra_budget * analysis_extra / extra_total,
+                )
+            }
+        };
+
+        SidebarWidthRanges {
+            channel: channel_min..=channel_max.max(channel_min),
+            analysis: analysis_min..=analysis_max.max(analysis_min),
         }
     }
 
@@ -13234,8 +13405,7 @@ impl ScopeApp {
                 let rename_hint = self.t(UiText::DoubleClickRename);
                 let name_width = ui
                     .available_width()
-                    .min(CHANNEL_NAME_COLUMN_WIDTH)
-                    .max(96.0);
+                    .clamp(CHANNEL_NAME_COLUMN_MIN_WIDTH, CHANNEL_NAME_COLUMN_MAX_WIDTH);
                 let is_digital =
                     Self::channel_is_digital(self.dataset_kind_by_index(dataset_index), channel);
                 let compact_display_name =
@@ -13500,9 +13670,12 @@ impl ScopeApp {
                     self.derived_measurement_cache = None;
                     self.needs_derived_reload = true;
                 }
+                let label_width = ui
+                    .available_width()
+                    .clamp(CHANNEL_NAME_COLUMN_MIN_WIDTH, CHANNEL_NAME_COLUMN_MAX_WIDTH);
                 let label_response = ui
                     .add_sized(
-                        [170.0, ui.spacing().interact_size.y],
+                        [label_width, ui.spacing().interact_size.y],
                         egui::Label::new(Self::derived_channel_name(derived_index))
                             .sense(egui::Sense::click())
                             .truncate(true),
@@ -13556,7 +13729,7 @@ impl ScopeApp {
             } else {
                 46.0
             };
-            let filter_width = (ui.available_width() - clear_width).clamp(72.0, 180.0);
+            let filter_width = (ui.available_width() - clear_width).max(72.0);
             ui.add(
                 egui::TextEdit::singleline(&mut self.channel_filter)
                     .hint_text(filter_hint)
@@ -13677,7 +13850,7 @@ impl ScopeApp {
             let selected_short =
                 Self::compact_label(&selected_name, ANALYSIS_CHANNEL_LABEL_CHARS + 2);
             let response = egui::ComboBox::from_id_source("analysis_channel_select")
-                .width(ANALYSIS_CHANNEL_COMBO_WIDTH)
+                .width(Self::analysis_combo_width(ui.available_width()))
                 .selected_text(selected_short)
                 .show_ui(ui, |ui| {
                     for channel_index in &channel_options {
@@ -14338,7 +14511,7 @@ impl ScopeApp {
                     self.fft_dataset_index,
                     phase_index,
                 ))
-                .width(ANALYSIS_CHANNEL_COMBO_WIDTH)
+                .width(Self::analysis_combo_width(ui.available_width()))
                 .selected_text(selected_short)
                 .show_ui(ui, |ui| {
                     for channel_index in channel_options {
@@ -14514,7 +14687,7 @@ impl ScopeApp {
                     Self::compact_label(selected_name, ANALYSIS_CHANNEL_LABEL_CHARS);
                 let response =
                     egui::ComboBox::from_id_source((id_prefix, dataset_index, phase_index))
-                        .width(ANALYSIS_CHANNEL_COMBO_WIDTH)
+                        .width(Self::analysis_combo_width(ui.available_width()))
                         .selected_text(selected_short)
                         .show_ui(ui, |ui| {
                             for (channel_index, channel_name, related_channels) in channel_options {
@@ -15385,25 +15558,50 @@ impl ScopeApp {
         self.export_preview_window(ctx);
         self.batch_export_window(ctx);
 
-        let channel_panel_response = egui::SidePanel::left("channels")
-            .resizable(true)
-            .default_width(CHANNEL_PANEL_DEFAULT_WIDTH)
-            .width_range(CHANNEL_PANEL_MIN_WIDTH..=CHANNEL_PANEL_MAX_WIDTH)
-            .show(ctx, |ui| self.channel_panel(ui));
-        let channel_panel_width = channel_panel_response.response.rect.width();
+        let window_width = ctx.screen_rect().width();
+        let sidebar_ranges = if self.show_channel_panel && self.show_analysis_panel {
+            Self::sidebar_width_ranges(window_width)
+        } else {
+            Self::sidebar_width_ranges_for_visibility(
+                window_width,
+                self.show_channel_panel,
+                self.show_analysis_panel,
+            )
+        };
+        let channel_panel_width = if self.show_channel_panel {
+            let channel_panel_response = egui::SidePanel::left("channels")
+                .resizable(true)
+                .default_width(CHANNEL_PANEL_DEFAULT_WIDTH)
+                .width_range(sidebar_ranges.channel.clone())
+                .show(ctx, |ui| self.channel_panel(ui));
+            channel_panel_response.response.rect.width()
+        } else {
+            0.0
+        };
 
-        let analysis_panel_response = egui::SidePanel::right("analysis")
-            .resizable(true)
-            .default_width(ANALYSIS_PANEL_DEFAULT_WIDTH)
-            .width_range(ANALYSIS_PANEL_MIN_WIDTH..=ANALYSIS_PANEL_MAX_WIDTH)
-            .show(ctx, |ui| {
-                self.analysis_dataset_selector(ui);
-                ui.separator();
-                self.measurements_panel(ui);
-                ui.separator();
-                self.fft_panel(ui);
-            });
-        let analysis_panel_width = analysis_panel_response.response.rect.width();
+        let analysis_panel_width = if self.show_analysis_panel {
+            let analysis_panel_response = egui::SidePanel::right("analysis")
+                .resizable(true)
+                .default_width(ANALYSIS_PANEL_DEFAULT_WIDTH)
+                .width_range(sidebar_ranges.analysis.clone())
+                .show(ctx, |ui| {
+                    egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_min_width(
+                                ui.available_width().max(ANALYSIS_PANEL_CONTENT_MIN_WIDTH),
+                            );
+                            self.analysis_dataset_selector(ui);
+                            ui.separator();
+                            self.measurements_panel(ui);
+                            ui.separator();
+                            self.fft_panel(ui);
+                        });
+                });
+            analysis_panel_response.response.rect.width()
+        } else {
+            0.0
+        };
         self.observe_layout_panel_widths(channel_panel_width, analysis_panel_width);
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -15665,6 +15863,39 @@ mod tests {
             ScopeApp::channel_panel_display_name("Fault", true, 40.0),
             "Fault"
         );
+    }
+
+    #[test]
+    fn sidebar_shortcuts_default_to_vscode_style_bindings() {
+        let shortcuts = ShortcutConfig::default();
+        assert_eq!(shortcuts.toggle_channel_panel.label(), "Ctrl+B");
+        assert_eq!(shortcuts.toggle_analysis_panel.label(), "Ctrl+Alt+B");
+    }
+
+    #[test]
+    fn responsive_sidebar_ranges_expand_but_preserve_plot_space() {
+        let compact = ScopeApp::sidebar_width_ranges(980.0);
+        assert_eq!(*compact.channel.start(), CHANNEL_PANEL_MIN_WIDTH);
+        assert_eq!(*compact.analysis.start(), ANALYSIS_PANEL_MIN_WIDTH);
+        assert!(compact.channel.end() + compact.analysis.end() <= 980.0 - MIN_CENTRAL_PANEL_WIDTH);
+
+        let left_only = ScopeApp::sidebar_width_ranges_for_visibility(980.0, true, false);
+        assert!(left_only.channel.end() > compact.channel.end());
+        assert_eq!(*left_only.analysis.end(), ANALYSIS_PANEL_MIN_WIDTH);
+
+        let right_only = ScopeApp::sidebar_width_ranges_for_visibility(980.0, false, true);
+        assert!(right_only.analysis.end() > compact.analysis.end());
+        assert_eq!(*right_only.channel.end(), CHANNEL_PANEL_MIN_WIDTH);
+
+        let normal = ScopeApp::sidebar_width_ranges(1440.0);
+        assert!(normal.channel.end() > &CHANNEL_PANEL_MAX_WIDTH);
+        assert!(normal.analysis.end() > &ANALYSIS_PANEL_MAX_WIDTH);
+
+        let wide = ScopeApp::sidebar_width_ranges(1920.0);
+        assert!(wide.channel.end() > normal.channel.end());
+        assert!(wide.analysis.end() > normal.analysis.end());
+        assert!(wide.channel.end() <= &(1920.0 * MAX_CHANNEL_PANEL_FRACTION));
+        assert!(wide.analysis.end() <= &(1920.0 * MAX_ANALYSIS_PANEL_FRACTION));
     }
 
     #[test]
