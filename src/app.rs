@@ -11842,10 +11842,27 @@ impl ScopeApp {
         self.show_cursor_b = show;
     }
 
-    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.wants_keyboard_input() {
-            return;
+    fn sidebar_visibility_after_shortcuts(
+        channel_visible: bool,
+        analysis_visible: bool,
+        toggle_channel_panel: bool,
+        toggle_analysis_panel: bool,
+    ) -> (bool, bool, bool) {
+        let mut channel_visible = channel_visible;
+        let mut analysis_visible = analysis_visible;
+        let mut handled = false;
+        if toggle_channel_panel {
+            channel_visible = !channel_visible;
+            handled = true;
         }
+        if toggle_analysis_panel {
+            analysis_visible = !analysis_visible;
+            handled = true;
+        }
+        (channel_visible, analysis_visible, handled)
+    }
+
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let (
             reset_view,
             fit_cursors,
@@ -11866,6 +11883,23 @@ impl ScopeApp {
             )
         });
 
+        let (show_channel_panel, show_analysis_panel, sidebar_handled) =
+            Self::sidebar_visibility_after_shortcuts(
+                self.show_channel_panel,
+                self.show_analysis_panel,
+                toggle_channel_panel,
+                toggle_analysis_panel,
+            );
+        self.show_channel_panel = show_channel_panel;
+        self.show_analysis_panel = show_analysis_panel;
+        if sidebar_handled {
+            ctx.request_repaint();
+        }
+
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+
         let mut handled = false;
         if reset_view {
             self.reset_view();
@@ -11885,14 +11919,6 @@ impl ScopeApp {
         }
         if select_none {
             self.set_all_channels_visible(false);
-            handled = true;
-        }
-        if toggle_channel_panel {
-            self.show_channel_panel = !self.show_channel_panel;
-            handled = true;
-        }
-        if toggle_analysis_panel {
-            self.show_analysis_panel = !self.show_analysis_panel;
             handled = true;
         }
         if handled {
@@ -15994,6 +16020,22 @@ mod tests {
         let shortcuts = ShortcutConfig::default();
         assert_eq!(shortcuts.toggle_channel_panel.label(), "Ctrl+B");
         assert_eq!(shortcuts.toggle_analysis_panel.label(), "Ctrl+Alt+B");
+    }
+
+    #[test]
+    fn sidebar_shortcut_toggles_are_independent_from_text_input_focus() {
+        assert_eq!(
+            ScopeApp::sidebar_visibility_after_shortcuts(true, true, false, true),
+            (true, false, true)
+        );
+        assert_eq!(
+            ScopeApp::sidebar_visibility_after_shortcuts(true, false, true, false),
+            (false, false, true)
+        );
+        assert_eq!(
+            ScopeApp::sidebar_visibility_after_shortcuts(true, true, false, false),
+            (true, true, false)
+        );
     }
 
     #[test]
