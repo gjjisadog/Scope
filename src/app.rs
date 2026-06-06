@@ -124,7 +124,7 @@ fn default_scope_layout_cols() -> usize {
 }
 
 fn default_language() -> Language {
-    Language::En
+    Language::Zh
 }
 
 fn default_theme_mode() -> ThemeMode {
@@ -16020,6 +16020,11 @@ mod tests {
         let shortcuts = ShortcutConfig::default();
         assert_eq!(shortcuts.toggle_channel_panel.label(), "Ctrl+B");
         assert_eq!(shortcuts.toggle_analysis_panel.label(), "Ctrl+Alt+B");
+    }
+
+    #[test]
+    fn default_language_is_chinese() {
+        assert_eq!(default_language(), Language::Zh);
     }
 
     #[test]
