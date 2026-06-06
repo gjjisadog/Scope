@@ -38,6 +38,7 @@ use plot::{
 const MAX_DRAW_POINTS_PER_CHANNEL: usize = 8_000;
 const MAX_TOTAL_DRAW_POINTS: usize = 60_000;
 const MIN_DRAW_POINTS_PER_CHANNEL: usize = 192;
+const MAX_RAW_PLOT_SOURCE_SAMPLES: usize = 250_000;
 const LAYOUT_RESIZE_DRAW_POINTS_PER_CHANNEL: usize = 384;
 const LAYOUT_RESIZE_ACTIVE_GRACE: Duration = Duration::from_millis(180);
 const DEFAULT_PLOT_PIXEL_WIDTH: f32 = 1024.0;
@@ -9715,8 +9716,7 @@ impl ScopeApp {
                 break;
             };
             let len = bin_count.min(mins.len()).min(maxes.len());
-            let mut lower = Vec::with_capacity(len * 2);
-            let mut upper = Vec::with_capacity(len * 2);
+            let mut series = Vec::with_capacity(len);
             let mut min = f64::INFINITY;
             let mut max = f64::NEG_INFINITY;
             for i in 0..len {
@@ -9734,21 +9734,16 @@ impl ScopeApp {
                 }
                 min = min.min(scaled_min);
                 max = max.max(scaled_max);
-                lower.push(PlotPoint::new(x0, scaled_min));
-                lower.push(PlotPoint::new(x1, scaled_min));
-                upper.push(PlotPoint::new(x0, scaled_max));
-                upper.push(PlotPoint::new(x1, scaled_max));
-            }
-            let mut envelope = Vec::with_capacity(lower.len() + upper.len() + 1);
-            envelope.extend(lower);
-            envelope.extend(upper.into_iter().rev());
-            if let Some(first) = envelope.first().copied() {
-                envelope.push(first);
+                let x = (x0 + x1) * 0.5;
+                let y = (scaled_min + scaled_max) * 0.5;
+                if x.is_finite() && y.is_finite() {
+                    series.push(PlotPoint::new(x, y));
+                }
             }
             let bounds_for_series = (min.is_finite() && max.is_finite()).then_some((min, max));
-            let envelope: Arc<[PlotPoint]> = Arc::from(envelope);
-            lightweight_points.push(Self::lightweight_plot_points(&envelope));
-            points.push(envelope);
+            let series: Arc<[PlotPoint]> = Arc::from(series);
+            lightweight_points.push(Self::lightweight_plot_points(&series));
+            points.push(series);
             bounds.push(bounds_for_series);
         }
         PreparedPlotSeries {
@@ -9815,7 +9810,7 @@ impl ScopeApp {
         let summary_bins = Self::summary_bins_for_channels(budget_series_count, plot_pixel_width);
         let estimated_points =
             ((end_time - start_time) * source.metadata().nominal_sample_rate_hz).max(0.0) as usize;
-        if estimated_points > max_points {
+        if estimated_points > MAX_RAW_PLOT_SOURCE_SAMPLES {
             source
                 .summarize_range(start_time, end_time, channels, summary_bins)
                 .map(|summary| Some(PlotJobData::Summary(summary)))
@@ -15564,6 +15559,153 @@ mod tests {
         assert!(merged_values.contains(&vec![2.0, 5.0]));
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn real_dat_samples_read_zoom_and_dense_summary() {
+        let files = [
+            "Data/20250214_140409.dat",
+            "Data/20250214_140850.dat",
+            "Data/20250214_140918.dat",
+        ];
+
+        for file in files {
+            let path = sample_data_path(file);
+            if !path.exists() {
+                continue;
+            }
+            let source = DatDataSource::open(&path).unwrap();
+            let meta = source.metadata();
+            let start_time = meta.start_time;
+            let end_time = meta.end_time;
+            assert!(meta.sample_count > 0, "{file}");
+            assert!(meta.channels.len() >= 7, "{file}");
+            assert!(
+                meta.channels
+                    .iter()
+                    .any(|channel| channel.name.contains("电网")),
+                "{file}"
+            );
+
+            let channels = [3, 4, 5, 6];
+            let zoom_end = (start_time + 1.0).min(end_time);
+            let zoom = source
+                .read_range(start_time, zoom_end, &channels, 10_000)
+                .unwrap();
+            assert!(!zoom.times.is_empty(), "{file}");
+            assert_eq!(zoom.channels.len(), channels.len(), "{file}");
+            assert!(
+                zoom.channels
+                    .iter()
+                    .flatten()
+                    .all(|value| value.is_finite()),
+                "{file}"
+            );
+
+            let summary = source
+                .summarize_range(start_time, end_time, &channels, 1200)
+                .unwrap();
+            let expected_min_bins = meta.sample_count.min(900) as usize;
+            assert!(
+                summary.bin_start.len() >= expected_min_bins,
+                "{file}: summary bins {} < {expected_min_bins}",
+                summary.bin_start.len()
+            );
+            assert_summary_is_finite(&summary, channels.len(), file);
+
+            let plot_data =
+                ScopeApp::load_plot_data(Arc::new(source), start_time, end_time, &[3], 1, 1200.0)
+                    .unwrap();
+            assert!(
+                matches!(plot_data, Some(PlotJobData::Samples(_))),
+                "{file}: medium DAT full view should use raw sampled plot data"
+            );
+        }
+    }
+
+    #[test]
+    fn real_cloud_csv_reads_plot_summary_fft_and_measurement_samples() {
+        let path = sample_data_path("Data/105329025C120033_mc02_21_20260507192102_wave_data.csv");
+        if !path.exists() {
+            return;
+        }
+
+        let opened = ScopeApp::open_waveform_file(&path, 1000.0).unwrap();
+        assert_eq!(opened.kind, SourceKind::Cloud);
+        let meta = opened.source.metadata();
+        assert_eq!(meta.channels.len(), 60);
+        assert!(meta.sample_count > 0);
+
+        let channels = [0, 3, 4, 5, 30];
+        let block = opened
+            .source
+            .read_range(meta.start_time, meta.end_time.min(0.5), &channels, 20_000)
+            .unwrap();
+        assert!(!block.times.is_empty());
+        assert_eq!(block.channels.len(), channels.len());
+        assert!(block
+            .channels
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite()));
+
+        let summary = opened
+            .source
+            .summarize_range(meta.start_time, meta.end_time, &channels, 1000)
+            .unwrap();
+        assert!(!summary.bin_start.is_empty());
+        assert_summary_is_finite(&summary, channels.len(), "real cloud csv");
+
+        let plot_data = ScopeApp::load_plot_data(
+            opened.source.clone(),
+            meta.start_time,
+            meta.end_time,
+            &channels,
+            channels.len(),
+            1200.0,
+        )
+        .unwrap();
+        assert!(plot_data.is_some());
+
+        let fft_samples = block.channels.first().cloned().unwrap_or_default();
+        assert!(!fft_samples.is_empty());
+        let _ = fft::analyze(
+            "real".to_owned(),
+            &fft_samples,
+            meta.nominal_sample_rate_hz,
+            50.0,
+            9,
+        );
+    }
+
+    fn sample_data_path(relative: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
+    }
+
+    fn assert_summary_is_finite(summary: &RangeSummary, channel_count: usize, label: &str) {
+        assert_eq!(summary.min.len(), channel_count, "{label}");
+        assert_eq!(summary.max.len(), channel_count, "{label}");
+        assert_eq!(summary.bin_start.len(), summary.bin_end.len(), "{label}");
+        for channel_index in 0..channel_count {
+            assert_eq!(
+                summary.min[channel_index].len(),
+                summary.bin_start.len(),
+                "{label} channel {channel_index} min length"
+            );
+            assert_eq!(
+                summary.max[channel_index].len(),
+                summary.bin_start.len(),
+                "{label} channel {channel_index} max length"
+            );
+            for (min, max) in summary.min[channel_index]
+                .iter()
+                .zip(&summary.max[channel_index])
+            {
+                assert!(min.is_finite(), "{label} channel {channel_index} min");
+                assert!(max.is_finite(), "{label} channel {channel_index} max");
+                assert!(max >= min, "{label} channel {channel_index} range");
+            }
+        }
     }
 
     fn unique_test_dir(name: &str) -> PathBuf {

@@ -13,6 +13,7 @@ use super::{
 
 const MAX_CHANNELS: usize = 128;
 const INDEX_BLOCK_ROWS: u64 = 4096;
+const MAX_EXACT_SUMMARY_ROWS_PER_BIN: usize = 512;
 
 #[derive(Clone, Debug)]
 struct BlockIndex {
@@ -413,6 +414,27 @@ impl DataSource for CsvDataSource {
 
         let first = self.find_block_for_time(start_time);
         let last = self.find_block_for_time(end_time);
+        let estimated_points =
+            ((end_time - start_time) * self.meta.nominal_sample_rate_hz).max(1.0) as usize;
+        let exact_summary_limit = target_bins
+            .max(1)
+            .saturating_mul(MAX_EXACT_SUMMARY_ROWS_PER_BIN);
+        if estimated_points <= exact_summary_limit {
+            let block = self.read_range(
+                start_time,
+                end_time,
+                channels,
+                estimated_points.saturating_add(2),
+            )?;
+            return Ok(RangeSummary::from_samples(
+                &block,
+                channels.len(),
+                start_time,
+                end_time,
+                target_bins,
+            ));
+        }
+
         let block_count = last.saturating_sub(first) + 1;
         let group = block_count.div_ceil(target_bins.max(1)).max(1);
         let capacity = target_bins.min(block_count).max(1);

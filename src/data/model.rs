@@ -67,6 +67,81 @@ pub struct RangeSummary {
     pub max: Vec<Vec<f32>>,
 }
 
+impl RangeSummary {
+    pub fn from_samples(
+        block: &SampleBlock,
+        channel_count: usize,
+        start_time: f64,
+        end_time: f64,
+        target_bins: usize,
+    ) -> Self {
+        if block.times.is_empty() || channel_count == 0 || end_time <= start_time {
+            return Self {
+                bin_start: Vec::new(),
+                bin_end: Vec::new(),
+                min: vec![Vec::new(); channel_count],
+                max: vec![Vec::new(); channel_count],
+            };
+        }
+
+        let bin_count = target_bins.max(1).min(block.times.len());
+        let time_span = (end_time - start_time).max(f64::EPSILON);
+        let mut counts = vec![0_u32; bin_count];
+        let mut min = vec![vec![f32::INFINITY; bin_count]; channel_count];
+        let mut max = vec![vec![f32::NEG_INFINITY; bin_count]; channel_count];
+
+        for (row, time) in block.times.iter().enumerate() {
+            if !time.is_finite() {
+                continue;
+            }
+            let relative = ((*time - start_time) / time_span).clamp(0.0, 1.0);
+            let bin = ((relative * bin_count as f64).floor() as usize).min(bin_count - 1);
+            let mut any_value = false;
+            for channel_index in 0..channel_count {
+                let Some(value) = block
+                    .channels
+                    .get(channel_index)
+                    .and_then(|values| values.get(row))
+                    .copied()
+                else {
+                    continue;
+                };
+                if value.is_finite() {
+                    min[channel_index][bin] = min[channel_index][bin].min(value);
+                    max[channel_index][bin] = max[channel_index][bin].max(value);
+                    any_value = true;
+                }
+            }
+            if any_value {
+                counts[bin] += 1;
+            }
+        }
+
+        let mut bin_start = Vec::new();
+        let mut bin_end = Vec::new();
+        let mut compact_min = vec![Vec::new(); channel_count];
+        let mut compact_max = vec![Vec::new(); channel_count];
+        for (bin, count) in counts.iter().enumerate() {
+            if *count == 0 {
+                continue;
+            }
+            bin_start.push(start_time + time_span * bin as f64 / bin_count as f64);
+            bin_end.push(start_time + time_span * (bin + 1) as f64 / bin_count as f64);
+            for channel_index in 0..channel_count {
+                compact_min[channel_index].push(min[channel_index][bin]);
+                compact_max[channel_index].push(max[channel_index][bin]);
+            }
+        }
+
+        Self {
+            bin_start,
+            bin_end,
+            min: compact_min,
+            max: compact_max,
+        }
+    }
+}
+
 pub trait DataSource: Send + Sync {
     fn open(path: &Path) -> DataResult<Self>
     where

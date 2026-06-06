@@ -12,6 +12,7 @@ use super::{
 const MAX_CHANNELS: usize = 128;
 const INDEX_BLOCK_SAMPLES: u64 = 4096;
 const MAX_EXACT_SUMMARY_SAMPLES: u64 = INDEX_BLOCK_SAMPLES * 4;
+const MAX_EXACT_SUMMARY_SAMPLES_PER_BIN: u64 = 512;
 const HEADER_FIXED_WORDS: usize = 4;
 const HEADER_WORD_BYTES: usize = 4;
 
@@ -499,7 +500,12 @@ impl DataSource for DatDataSource {
         }
 
         let sample_span = last_sample - first_sample + 1;
-        if sample_span <= MAX_EXACT_SUMMARY_SAMPLES {
+        let exact_summary_limit = MAX_EXACT_SUMMARY_SAMPLES.max(
+            (target_bins as u64)
+                .saturating_mul(MAX_EXACT_SUMMARY_SAMPLES_PER_BIN)
+                .max(1),
+        );
+        if sample_span <= exact_summary_limit {
             self.summarize_range_exact(
                 start_time,
                 end_time,
@@ -627,6 +633,62 @@ mod tests {
         assert_eq!(summary.max[0], vec![12287.0, 20479.0]);
         assert_eq!(summary.min[1], vec![-12287.0, -20479.0]);
         assert_eq!(summary.max[1], vec![0.0, -12288.0]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn summarizes_medium_dat_sine_with_screen_level_bins() {
+        let path = std::env::temp_dir().join("scope_analyzer_medium_sine_summary_test.dat");
+        let header_len = 64_u32;
+        let sample_rate_hz = 1000_u32;
+        let channel_count = 1_u32;
+        let sample_count = 80_000_u64;
+        let mut header = Vec::new();
+        header.extend_from_slice(&header_len.to_le_bytes());
+        header.extend_from_slice(&0_u32.to_le_bytes());
+        header.extend_from_slice(&sample_rate_hz.to_le_bytes());
+        header.extend_from_slice(&channel_count.to_le_bytes());
+        for value in [0_u32; 5] {
+            header.extend_from_slice(&value.to_le_bytes());
+        }
+        header.extend_from_slice(b"SINE\xff");
+        header.resize(header_len as usize, 0xff);
+
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&header).unwrap();
+        for index in 0..sample_count {
+            let time = index as f64 / sample_rate_hz as f64;
+            let value = (10_000.0 * (std::f64::consts::TAU * time).sin()).round() as i16;
+            file.write_all(&value.to_le_bytes()).unwrap();
+        }
+        drop(file);
+
+        let source = DatDataSource::open(&path).unwrap();
+        let summary = source
+            .summarize_range(
+                0.0,
+                (sample_count - 1) as f64 / sample_rate_hz as f64,
+                &[0],
+                1000,
+            )
+            .unwrap();
+
+        assert!(summary.bin_start.len() > 900);
+        let max_range = summary.max[0]
+            .iter()
+            .copied()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), value| {
+                (lo.min(value), hi.max(value))
+            });
+        let min_range = summary.min[0]
+            .iter()
+            .copied()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), value| {
+                (lo.min(value), hi.max(value))
+            });
+        assert!(max_range.1 - max_range.0 > 15_000.0);
+        assert!(min_range.1 - min_range.0 > 15_000.0);
 
         let _ = std::fs::remove_file(path);
     }
