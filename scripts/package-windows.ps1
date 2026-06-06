@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
-$version = "0.1.0"
+$version = "0.2.0"
 $dist = Join-Path $root "dist"
 $stage = Join-Path $dist "ScopeAnalyzer-$version-win-x64"
 $zip = Join-Path $dist "ScopeAnalyzer-$version-win-x64.zip"
@@ -38,6 +38,40 @@ function Resolve-Tool {
     return $null
 }
 
+function Resolve-AngleRuntimeDir {
+    $candidateDirs = @()
+    if ($env:SystemRoot) {
+        $candidateDirs += Join-Path $env:SystemRoot "System32\Microsoft-Edge-WebView"
+    }
+    if (${env:ProgramFiles(x86)}) {
+        $candidateDirs += Join-Path ${env:ProgramFiles(x86)} "Microsoft\EdgeWebView\Application"
+        $candidateDirs += Join-Path ${env:ProgramFiles(x86)} "Microsoft\Edge\Application"
+    }
+    if ($env:ProgramFiles) {
+        $candidateDirs += Join-Path $env:ProgramFiles "Microsoft\Edge\Application"
+    }
+
+    foreach ($dir in $candidateDirs) {
+        if ((Test-Path (Join-Path $dir "libEGL.dll")) -and (Test-Path (Join-Path $dir "libGLESv2.dll"))) {
+            return $dir
+        }
+
+        if (-not (Test-Path $dir)) {
+            continue
+        }
+
+        $versionDirs = Get-ChildItem -Path $dir -Directory -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending
+        foreach ($versionDir in $versionDirs) {
+            if ((Test-Path (Join-Path $versionDir.FullName "libEGL.dll")) -and (Test-Path (Join-Path $versionDir.FullName "libGLESv2.dll"))) {
+                return $versionDir.FullName
+            }
+        }
+    }
+
+    return $null
+}
+
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 if (Test-Path $stage) {
     Remove-Item -Recurse -Force $stage
@@ -54,6 +88,8 @@ if (Test-Path $wixobj) {
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
 $includeLibUnwind = "false"
+$includeAngleRuntime = "false"
+$includeD3DCompiler = "false"
 
 Push-Location $root
 try {
@@ -73,6 +109,20 @@ try {
     Copy-Item "target\release\scope_analyzer.exe" (Join-Path $stage "ScopeAnalyzer.exe")
     Copy-Item "resources\ScopeAnalyzer.ico" (Join-Path $stage "ScopeAnalyzer.ico")
     Copy-Item "README.md" (Join-Path $stage "README.txt")
+    $angleRuntimeDir = Resolve-AngleRuntimeDir
+    if ($angleRuntimeDir) {
+        Copy-Item (Join-Path $angleRuntimeDir "libEGL.dll") (Join-Path $stage "libEGL.dll") -Force
+        Copy-Item (Join-Path $angleRuntimeDir "libGLESv2.dll") (Join-Path $stage "libGLESv2.dll") -Force
+        $includeAngleRuntime = "true"
+
+        $d3dCompiler = Join-Path $angleRuntimeDir "d3dcompiler_47.dll"
+        if (Test-Path $d3dCompiler) {
+            Copy-Item $d3dCompiler (Join-Path $stage "d3dcompiler_47.dll") -Force
+            $includeD3DCompiler = "true"
+        }
+    } else {
+        Write-Warning "ANGLE runtime DLLs were not found. The package will rely on the target machine's OpenGL/ANGLE installation."
+    }
 Set-Content -Path (Join-Path $stage "Start-ScopeAnalyzer.bat") -Encoding ASCII -Value @(
     "@echo off",
     "cd /d ""%~dp0""",
@@ -87,7 +137,7 @@ Set-Content -Path (Join-Path $stage "Start-ScopeAnalyzer-DX12.bat") -Encoding AS
 Set-Content -Path (Join-Path $stage "Start-ScopeAnalyzer-Software.bat") -Encoding ASCII -Value @(
     "@echo off",
     "cd /d ""%~dp0""",
-    "set SCOPE_RENDERER=wgpu-software",
+    "set SCOPE_RENDERER=glow-software",
     "start """" ""%~dp0ScopeAnalyzer.exe"""
 )
 Set-Content -Path (Join-Path $stage "Start-ScopeAnalyzer-OpenGL.bat") -Encoding ASCII -Value @(
@@ -116,7 +166,7 @@ Write-Host "Created $zip"
 $candle = Resolve-Tool "candle.exe"
 $light = Resolve-Tool "light.exe"
 if ($candle -and $light) {
-    & $candle -arch x64 -dStageDir="$stage" -dIncludeLibUnwind="$includeLibUnwind" -out $wixobj $wxs
+    & $candle -arch x64 -dStageDir="$stage" -dIncludeLibUnwind="$includeLibUnwind" -dIncludeAngleRuntime="$includeAngleRuntime" -dIncludeD3DCompiler="$includeD3DCompiler" -out $wixobj $wxs
     if ($LASTEXITCODE -ne 0) {
         throw "candle failed with exit code $LASTEXITCODE"
     }

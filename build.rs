@@ -3,6 +3,7 @@ use std::{env, path::PathBuf, process::Command};
 fn main() {
     println!("cargo:rerun-if-changed=resources/ScopeAnalyzer.rc");
     println!("cargo:rerun-if-changed=resources/ScopeAnalyzer.ico");
+    println!("cargo:rerun-if-env-changed=WINDRES");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
@@ -14,9 +15,13 @@ fn main() {
     };
     let output = out_dir.join("scope_analyzer_icon.res");
     let output_arg = output.to_string_lossy().into_owned();
+    let default_windres = match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("x86_64") => "x86_64-w64-mingw32-windres",
+        _ => "windres",
+    };
     let windres = env::var_os("WINDRES")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("windres"));
+        .unwrap_or_else(|| PathBuf::from(default_windres));
 
     match Command::new(&windres)
         .args([

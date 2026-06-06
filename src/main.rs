@@ -22,13 +22,13 @@ const FALLBACK_WAIT: Duration = Duration::from_secs(6);
 const INITIAL_WINDOW_SIZE: [f32; 2] = [1280.0, 760.0];
 const MIN_WINDOW_SIZE: [f32; 2] = [860.0, 520.0];
 const DEFAULT_RENDERER_ORDER: [RendererMode; 4] = [
-    RendererMode::GlowHardware,
     RendererMode::GlowSoftware,
-    RendererMode::WgpuDx12,
+    RendererMode::GlowHardware,
     RendererMode::WgpuDx12Software,
+    RendererMode::WgpuDx12,
 ];
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RendererMode {
     GlowHardware,
     GlowSoftware,
@@ -40,7 +40,9 @@ impl RendererMode {
     fn from_env_value(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
             "glow" | "opengl" => Some(Self::GlowHardware),
-            "glow-software" | "opengl-software" | "software" => Some(Self::GlowSoftware),
+            "glow-software" | "opengl-software" | "software" | "cloud" | "virtual" => {
+                Some(Self::GlowSoftware)
+            }
             "wgpu" | "dx12" => Some(Self::WgpuDx12),
             "wgpu-software" | "dx12-software" | "warp" => Some(Self::WgpuDx12Software),
             _ => None,
@@ -99,7 +101,7 @@ fn main() -> eframe::Result<()> {
     if let Ok(renderer) = std::env::var(RENDERER_ENV) {
         if let Some(mode) = RendererMode::from_env_value(&renderer) {
             write_startup_log(&format!("starting renderer: {}", mode.label()));
-            return run_app(mode);
+            return run_selected_renderer(mode);
         }
         write_startup_log(&format!(
             "unknown {RENDERER_ENV}={renderer}; using automatic fallback"
@@ -174,8 +176,9 @@ fn launch_with_process_fallback() -> eframe::Result<()> {
             }
         }
     }
-    write_startup_log("launcher: all child renderers failed; running WARP fallback in-process");
-    run_app(RendererMode::WgpuDx12Software)
+    write_startup_log(exhausted_renderer_message());
+    eprintln!("{}", exhausted_renderer_message());
+    std::process::exit(1);
 }
 
 fn spawn_renderer_child(mode: RendererMode) -> std::io::Result<std::process::Child> {
@@ -195,6 +198,31 @@ fn status_text(status: ExitStatus) -> String {
 
 fn try_run_app(mode: RendererMode) -> std::thread::Result<eframe::Result<()>> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_app(mode)))
+}
+
+fn run_selected_renderer(mode: RendererMode) -> eframe::Result<()> {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|panic_info| {
+        write_startup_log(&format!("renderer startup panic: {panic_info}"));
+    }));
+
+    let result = try_run_app(mode);
+    std::panic::set_hook(previous_hook);
+
+    match result {
+        Ok(result) => result,
+        Err(_) => {
+            write_startup_log(&format!(
+                "{} renderer panicked; exiting child so launcher can try the next renderer",
+                mode.label()
+            ));
+            std::process::exit(101);
+        }
+    }
+}
+
+fn exhausted_renderer_message() -> &'static str {
+    "launcher: all child renderers failed; not running WGPU/WARP in-process because virtual graphics drivers can panic before returning an error"
 }
 
 fn run_app(mode: RendererMode) -> eframe::Result<()> {
@@ -246,6 +274,11 @@ fn scope_window_icon() -> Option<eframe::egui::IconData> {
 
 fn configure_graphics_runtime() {
     let mut angle_dirs = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            angle_dirs.push(parent.to_owned());
+        }
+    }
     if let Some(system_root) = std::env::var_os("SystemRoot") {
         let system_root = std::path::PathBuf::from(system_root);
         angle_dirs.push(system_root.join("System32").join("Microsoft-Edge-WebView"));
@@ -328,5 +361,36 @@ mod tests {
         );
         assert_eq!(viewport.resizable, Some(true));
         assert_eq!(viewport.maximized, Some(cfg!(target_os = "windows")));
+    }
+
+    #[test]
+    fn default_renderer_order_prefers_cloud_desktop_safe_modes() {
+        assert_eq!(DEFAULT_RENDERER_ORDER[0], RendererMode::GlowSoftware);
+        assert!(
+            DEFAULT_RENDERER_ORDER
+                .iter()
+                .position(|mode| *mode == RendererMode::GlowSoftware)
+                < DEFAULT_RENDERER_ORDER
+                    .iter()
+                    .position(|mode| *mode == RendererMode::WgpuDx12Software)
+        );
+    }
+
+    #[test]
+    fn renderer_env_accepts_cloud_desktop_aliases() {
+        assert_eq!(
+            RendererMode::from_env_value("cloud"),
+            Some(RendererMode::GlowSoftware)
+        );
+        assert_eq!(
+            RendererMode::from_env_value("virtual"),
+            Some(RendererMode::GlowSoftware)
+        );
+    }
+
+    #[test]
+    fn exhausted_renderer_fallback_does_not_run_wgpu_in_process() {
+        let message = exhausted_renderer_message();
+        assert!(message.contains("not running WGPU/WARP in-process"));
     }
 }

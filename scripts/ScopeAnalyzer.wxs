@@ -4,7 +4,7 @@
     Id="*"
     Name="Scope Analyzer"
     Language="1033"
-    Version="0.1.0"
+    Version="0.2.0"
     Manufacturer="Scope"
     UpgradeCode="{8C47D14B-9AA6-4F93-89C8-1B2D66B70B94}">
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="x64" />
@@ -54,6 +54,17 @@
         <File Id="StartScopeAnalyzerSoftwareBat" Source="$(var.StageDir)\Start-ScopeAnalyzer-Software.bat" />
         <File Id="StartScopeAnalyzerOpenGlBat" Source="$(var.StageDir)\Start-ScopeAnalyzer-OpenGL.bat" />
       </Component>
+      <?if $(var.IncludeAngleRuntime) = "true" ?>
+      <Component Id="AngleRuntimeDlls" Directory="INSTALLFOLDER" Guid="{C8DC6012-6B21-4D31-9B92-E68C3F8E1D19}" Win64="yes">
+        <File Id="LibEglDllFile" Source="$(var.StageDir)\libEGL.dll" KeyPath="yes" />
+        <File Id="LibGlesV2DllFile" Source="$(var.StageDir)\libGLESv2.dll" />
+      </Component>
+      <?endif?>
+      <?if $(var.IncludeD3DCompiler) = "true" ?>
+      <Component Id="D3DCompilerDll" Directory="INSTALLFOLDER" Guid="{3D3DF175-3B6C-4749-94E8-E0F8A635B001}" Win64="yes">
+        <File Id="D3DCompiler47DllFile" Source="$(var.StageDir)\d3dcompiler_47.dll" KeyPath="yes" />
+      </Component>
+      <?endif?>
       <?if $(var.IncludeLibUnwind) = "true" ?>
       <Component Id="LibUnwindDll" Directory="INSTALLFOLDER" Guid="{ACEE3B3E-514B-4BE0-A21D-3AC33B84D181}" Win64="yes">
         <File Id="LibUnwindDllFile" Source="$(var.StageDir)\libunwind.dll" KeyPath="yes" />

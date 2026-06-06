@@ -135,8 +135,8 @@ powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1
 
 产物在：
 
-- `dist/ScopeAnalyzer-0.1.0-win-x64.zip`
-- `dist/ScopeAnalyzer-0.1.0-win-x64.msi`
+- `dist/ScopeAnalyzer-0.2.0-win-x64.zip`
+- `dist/ScopeAnalyzer-0.2.0-win-x64.msi`
 
 ## Startup renderer fallback
 
@@ -144,14 +144,21 @@ The default launcher tries several renderers in order and writes details to
 `ScopeAnalyzer-startup.log` beside the executable, or to the system temp
 directory if the install directory is not writable:
 
-1. `glow` / OpenGL via ANGLE, hardware preferred.
-2. `glow-software` / OpenGL via ANGLE, hardware acceleration off.
-3. `wgpu` / DX12.
-4. `wgpu-software` / DX12 fallback adapter, intended for WARP/software rendering.
+1. `glow-software` / OpenGL via ANGLE, hardware acceleration off, intended for
+   cloud desktops and virtual display adapters.
+2. `glow` / OpenGL via ANGLE, hardware preferred.
+3. `wgpu-software` / DX12 fallback adapter, intended for WARP/software rendering.
+4. `wgpu` / DX12.
+
+Packaged builds copy ANGLE runtime DLLs from the build machine when available, so
+installed copies can use the executable directory before falling back to system
+Edge/WebView locations. If every renderer exits during startup, the launcher
+stops after logging the failures instead of running the WGPU/WARP path inside
+the parent process.
 
 Packaged builds also include:
 
 - `Start-ScopeAnalyzer.bat`: automatic fallback.
 - `Start-ScopeAnalyzer-OpenGL.bat`: force `SCOPE_RENDERER=glow`.
 - `Start-ScopeAnalyzer-DX12.bat`: force `SCOPE_RENDERER=wgpu`.
-- `Start-ScopeAnalyzer-Software.bat`: force `SCOPE_RENDERER=wgpu-software`.
+- `Start-ScopeAnalyzer-Software.bat`: force `SCOPE_RENDERER=glow-software`.
