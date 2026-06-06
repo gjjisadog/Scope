@@ -61,7 +61,7 @@ const MAX_RECENT_CONFIGS: usize = 12;
 const LOCAL_CSV_PAIR_MTIME_WINDOW_MS: i128 = 10_000;
 const CHANNEL_NAME_AVERAGE_CHAR_WIDTH: f32 = 7.0;
 const CHANNEL_PANEL_DEFAULT_WIDTH: f32 = 220.0;
-const CHANNEL_PANEL_MIN_WIDTH: f32 = 96.0;
+const CHANNEL_PANEL_MIN_WIDTH: f32 = 56.0;
 const CHANNEL_PANEL_MAX_WIDTH: f32 = 320.0;
 const ANALYSIS_PANEL_DEFAULT_WIDTH: f32 = 360.0;
 const ANALYSIS_PANEL_MIN_WIDTH: f32 = 260.0;
@@ -69,7 +69,8 @@ const ANALYSIS_PANEL_MAX_WIDTH: f32 = 380.0;
 const MIN_CENTRAL_PANEL_WIDTH: f32 = 360.0;
 const MAX_CHANNEL_PANEL_FRACTION: f32 = 0.45;
 const MAX_ANALYSIS_PANEL_FRACTION: f32 = 0.50;
-const CHANNEL_NAME_COLUMN_MIN_WIDTH: f32 = 72.0;
+const CHANNEL_NAME_COLUMN_MIN_WIDTH: f32 = 56.0;
+const CHANNEL_NAME_HIDE_WIDTH: f32 = 42.0;
 const CHANNEL_NAME_COLUMN_MAX_WIDTH: f32 = 520.0;
 const ANALYSIS_PANEL_CONTENT_MIN_WIDTH: f32 = 520.0;
 const THREE_PHASE_SELECTOR_VERTICAL_WIDTH: f32 = 760.0;
@@ -9657,6 +9658,42 @@ impl ScopeApp {
         }
     }
 
+    fn channel_panel_display_text(
+        name: &str,
+        is_digital: bool,
+        available_width: f32,
+    ) -> Option<String> {
+        if available_width < CHANNEL_NAME_HIDE_WIDTH {
+            None
+        } else {
+            Some(Self::channel_panel_display_name(
+                name,
+                is_digital,
+                available_width,
+            ))
+        }
+    }
+
+    fn channel_filter_width(available_width: f32, clear_visible: bool) -> (f32, bool) {
+        let clear_width = if clear_visible && available_width >= 88.0 {
+            46.0
+        } else {
+            0.0
+        };
+        ((available_width - clear_width).max(24.0), clear_width > 0.0)
+    }
+
+    fn sidebar_header_label(full_label: &str, short_label: &str, available_width: f32) -> String {
+        if available_width < 120.0 {
+            short_label.to_owned()
+        } else {
+            let max_chars = (available_width / CHANNEL_NAME_AVERAGE_CHAR_WIDTH)
+                .floor()
+                .max(8.0) as usize;
+            Self::compact_label(full_label, max_chars)
+        }
+    }
+
     fn estimated_label_width(label: &str) -> f32 {
         label.chars().count() as f32 * CHANNEL_NAME_AVERAGE_CHAR_WIDTH
     }
@@ -12016,8 +12053,13 @@ impl ScopeApp {
         let delete_group_label = Self::icon_label("\u{E74D}", self.t(UiText::DeleteDataset));
         let mut delete_group = None;
         let primary_header = self.dataset_label(0);
+        let primary_header_display = Self::sidebar_header_label(
+            &primary_header,
+            &self.dataset_short_label(0),
+            ui.available_width(),
+        );
         let primary_meta = self.meta().cloned();
-        let primary_response = egui::CollapsingHeader::new(primary_header)
+        let primary_response = egui::CollapsingHeader::new(primary_header_display)
             .id_source(("dataset_group", 0usize))
             .default_open(true)
             .show(ui, |ui| {
@@ -12026,6 +12068,10 @@ impl ScopeApp {
                 }
             });
         let mut delete_primary = false;
+        primary_response
+            .header_response
+            .clone()
+            .on_hover_text(primary_header);
         primary_response.header_response.context_menu(|ui| {
             self.dataset_context_menu(ui, 0, delete_group_label.as_str(), &mut delete_primary);
         });
@@ -12035,8 +12081,13 @@ impl ScopeApp {
 
         for index in 0..self.imported_datasets.len() {
             let header = self.dataset_label(index + 1);
+            let header_display = Self::sidebar_header_label(
+                &header,
+                &self.dataset_short_label(index + 1),
+                ui.available_width(),
+            );
             let dataset_meta = self.imported_meta(index).cloned();
-            let response = egui::CollapsingHeader::new(header)
+            let response = egui::CollapsingHeader::new(header_display)
                 .id_source(("dataset_group", index + 1))
                 .default_open(false)
                 .show(ui, |ui| {
@@ -12051,6 +12102,7 @@ impl ScopeApp {
                     }
                 });
             let mut delete_this = false;
+            response.header_response.clone().on_hover_text(header);
             response.header_response.context_menu(|ui| {
                 self.dataset_context_menu(
                     ui,
@@ -13418,13 +13470,16 @@ impl ScopeApp {
                     self.set_dataset_channel_visible(dataset_index, channel.index, visible);
                 }
                 let rename_hint = self.t(UiText::DoubleClickRename);
-                let name_width = ui
-                    .available_width()
+                let available_name_width = ui.available_width();
+                let name_width = available_name_width
                     .clamp(CHANNEL_NAME_COLUMN_MIN_WIDTH, CHANNEL_NAME_COLUMN_MAX_WIDTH);
                 let is_digital =
                     Self::channel_is_digital(self.dataset_kind_by_index(dataset_index), channel);
-                let compact_display_name =
-                    Self::channel_panel_display_name(display_name, is_digital, name_width);
+                let compact_display_text = Self::channel_panel_display_text(
+                    display_name,
+                    is_digital,
+                    available_name_width,
+                );
                 if editable_name {
                     let Some(name) = self.display_names.get_mut(channel.index) else {
                         return row_hovered;
@@ -13474,11 +13529,11 @@ impl ScopeApp {
                                 .send_viewport_cmd(egui::ViewportCommand::IMEAllowed(false));
                             self.editing_display_name = None;
                         }
-                    } else {
+                    } else if let Some(compact_display_name) = compact_display_text.as_deref() {
                         let label_response = ui
                             .add_sized(
                                 [name_width, ui.spacing().interact_size.y],
-                                egui::Label::new(compact_display_name.as_str())
+                                egui::Label::new(compact_display_name)
                                     .sense(egui::Sense::click())
                                     .truncate(true),
                             )
@@ -13494,11 +13549,11 @@ impl ScopeApp {
                             ui.ctx().request_repaint();
                         }
                     }
-                } else {
+                } else if let Some(compact_display_name) = compact_display_text.as_deref() {
                     let label_response = ui
                         .add_sized(
                             [name_width, ui.spacing().interact_size.y],
-                            egui::Label::new(compact_display_name.as_str())
+                            egui::Label::new(compact_display_name)
                                 .sense(egui::Sense::click())
                                 .truncate(true),
                         )
@@ -13512,10 +13567,10 @@ impl ScopeApp {
                 if add_from_name {
                     self.set_dataset_channel_visible(dataset_index, channel.index, true);
                 }
-                if !channel.unit.is_empty() {
+                if compact_display_text.is_some() && !channel.unit.is_empty() {
                     row_hovered |= ui.label(format!("({})", channel.unit)).hovered();
                 }
-                if display_name != channel.name {
+                if compact_display_text.is_some() && display_name != channel.name {
                     row_hovered |= ui
                         .label(RichText::new(format!("{source_label}: {}", channel.name)).small())
                         .hovered();
@@ -13685,27 +13740,33 @@ impl ScopeApp {
                     self.derived_measurement_cache = None;
                     self.needs_derived_reload = true;
                 }
-                let label_width = ui
-                    .available_width()
+                let available_label_width = ui.available_width();
+                let label_width = available_label_width
                     .clamp(CHANNEL_NAME_COLUMN_MIN_WIDTH, CHANNEL_NAME_COLUMN_MAX_WIDTH);
-                let label_response = ui
-                    .add_sized(
-                        [label_width, ui.spacing().interact_size.y],
-                        egui::Label::new(Self::derived_channel_name(derived_index))
-                            .sense(egui::Sense::click())
-                            .truncate(true),
-                    )
-                    .on_hover_text(Self::derived_channel_name(derived_index));
-                if label_response.clicked() && !label_response.double_clicked() {
-                    if let Some(stored_visible) = self.derived_visible.get_mut(derived_index) {
-                        *stored_visible = true;
+                if let Some(display_text) = Self::channel_panel_display_text(
+                    Self::derived_channel_name(derived_index),
+                    false,
+                    available_label_width,
+                ) {
+                    let label_response = ui
+                        .add_sized(
+                            [label_width, ui.spacing().interact_size.y],
+                            egui::Label::new(display_text)
+                                .sense(egui::Sense::click())
+                                .truncate(true),
+                        )
+                        .on_hover_text(Self::derived_channel_name(derived_index));
+                    if label_response.clicked() && !label_response.double_clicked() {
+                        if let Some(stored_visible) = self.derived_visible.get_mut(derived_index) {
+                            *stored_visible = true;
+                        }
+                        let active_pane = self.current_scope_pane();
+                        if let Some(pane) = self.derived_panes.get_mut(derived_index) {
+                            *pane = active_pane;
+                        }
+                        self.clear_y_overrides();
+                        self.needs_derived_reload = true;
                     }
-                    let active_pane = self.current_scope_pane();
-                    if let Some(pane) = self.derived_panes.get_mut(derived_index) {
-                        *pane = active_pane;
-                    }
-                    self.clear_y_overrides();
-                    self.needs_derived_reload = true;
                 }
             });
             row_response.response.context_menu(|ui| {
@@ -13739,18 +13800,14 @@ impl ScopeApp {
         }
         let filter_hint = self.t(UiText::FilterChannelsHint);
         ui.horizontal(|ui| {
-            let clear_width = if self.channel_filter.is_empty() {
-                0.0
-            } else {
-                46.0
-            };
-            let filter_width = (ui.available_width() - clear_width).max(72.0);
+            let (filter_width, show_clear) =
+                Self::channel_filter_width(ui.available_width(), !self.channel_filter.is_empty());
             ui.add(
                 egui::TextEdit::singleline(&mut self.channel_filter)
                     .hint_text(filter_hint)
                     .desired_width(filter_width),
             );
-            if !self.channel_filter.is_empty()
+            if show_clear
                 && ui
                     .add_sized([42.0, ui.spacing().interact_size.y], egui::Button::new("×"))
                     .on_hover_text(self.t(UiText::Clear))
@@ -15897,6 +15954,39 @@ mod tests {
             ScopeApp::channel_panel_display_name("Fault", true, 40.0),
             "Fault"
         );
+    }
+
+    #[test]
+    fn channel_names_are_hidden_when_left_sidebar_is_very_narrow() {
+        assert_eq!(
+            ScopeApp::channel_panel_display_text("stVbus_0.iVal", false, 32.0),
+            None
+        );
+        assert_eq!(
+            ScopeApp::channel_panel_display_text("LogicStsWord2.BatteryAReady", true, 70.0),
+            Some("BatteryAReady".to_owned())
+        );
+        assert_eq!(
+            ScopeApp::channel_panel_display_text("stVbus_0.iVal", false, 140.0),
+            Some("stVbus_0.iVal".to_owned())
+        );
+    }
+
+    #[test]
+    fn channel_filter_shrinks_and_hides_clear_button_when_sidebar_is_narrow() {
+        assert_eq!(ScopeApp::channel_filter_width(60.0, true), (60.0, false));
+        assert_eq!(ScopeApp::channel_filter_width(36.0, true), (36.0, false));
+        assert_eq!(ScopeApp::channel_filter_width(120.0, true), (74.0, true));
+    }
+
+    #[test]
+    fn sidebar_headers_fall_back_to_short_labels_when_narrow() {
+        let full = "数据A 105329025C120033_mc02_21_20260507192102_wave_data";
+        assert_eq!(ScopeApp::sidebar_header_label(full, "数据A", 80.0), "数据A");
+        let compact = ScopeApp::sidebar_header_label(full, "数据A", 180.0);
+        assert!(compact.starts_with("数据A"));
+        assert!(compact.ends_with("..."));
+        assert!(compact.len() < full.len());
     }
 
     #[test]
