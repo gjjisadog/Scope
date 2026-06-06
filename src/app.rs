@@ -58,6 +58,7 @@ const MAX_CHANNEL_SCALE: f32 = 1_000_000.0;
 const MAX_RECENT_FILES: usize = 12;
 const MAX_RECENT_CONFIGS: usize = 12;
 const LOCAL_CSV_PAIR_MTIME_WINDOW_MS: i128 = 10_000;
+const CHANNEL_NAME_AVERAGE_CHAR_WIDTH: f32 = 7.0;
 const CHANNEL_PANEL_DEFAULT_WIDTH: f32 = 170.0;
 const CHANNEL_PANEL_MIN_WIDTH: f32 = 120.0;
 const CHANNEL_PANEL_MAX_WIDTH: f32 = 320.0;
@@ -9589,6 +9590,24 @@ impl ScopeApp {
         output
     }
 
+    fn channel_panel_display_name(name: &str, is_digital: bool, available_width: f32) -> String {
+        if !is_digital || Self::estimated_label_width(name) <= available_width {
+            return name.to_owned();
+        }
+        let Some((_, suffix)) = name.rsplit_once('.') else {
+            return name.to_owned();
+        };
+        if suffix.trim().is_empty() {
+            name.to_owned()
+        } else {
+            suffix.to_owned()
+        }
+    }
+
+    fn estimated_label_width(label: &str) -> f32 {
+        label.chars().count() as f32 * CHANNEL_NAME_AVERAGE_CHAR_WIDTH
+    }
+
     fn dataset_channel_name(&self, dataset_index: usize, channel: &ChannelMeta) -> String {
         if dataset_index > 0 && self.dataset_kind_by_index(dataset_index) == Some(SourceKind::Dat) {
             if channel.name.trim().is_empty() {
@@ -13217,6 +13236,10 @@ impl ScopeApp {
                     .available_width()
                     .min(CHANNEL_NAME_COLUMN_WIDTH)
                     .max(96.0);
+                let is_digital =
+                    Self::channel_is_digital(self.dataset_kind_by_index(dataset_index), channel);
+                let compact_display_name =
+                    Self::channel_panel_display_name(display_name, is_digital, name_width);
                 if editable_name {
                     let Some(name) = self.display_names.get_mut(channel.index) else {
                         return row_hovered;
@@ -13270,11 +13293,11 @@ impl ScopeApp {
                         let label_response = ui
                             .add_sized(
                                 [name_width, ui.spacing().interact_size.y],
-                                egui::Label::new(name.as_str())
+                                egui::Label::new(compact_display_name.as_str())
                                     .sense(egui::Sense::click())
                                     .truncate(true),
                             )
-                            .on_hover_text(rename_hint);
+                            .on_hover_text(format!("{display_name}\n{rename_hint}"));
                         row_hovered |= label_response.hovered();
                         name_context_response = Some(label_response.clone());
                         if label_response.clicked() && !label_response.double_clicked() {
@@ -13290,11 +13313,11 @@ impl ScopeApp {
                     let label_response = ui
                         .add_sized(
                             [name_width, ui.spacing().interact_size.y],
-                            egui::Label::new(display_name)
+                            egui::Label::new(compact_display_name.as_str())
                                 .sense(egui::Sense::click())
                                 .truncate(true),
                         )
-                        .on_hover_text(&channel.name);
+                        .on_hover_text(display_name);
                     row_hovered |= label_response.hovered();
                     name_context_response = Some(label_response.clone());
                     if label_response.clicked() && !label_response.double_clicked() {
@@ -15621,6 +15644,27 @@ mod tests {
                 "{file}: medium DAT full view should use raw sampled plot data"
             );
         }
+    }
+
+    #[test]
+    fn digital_channel_name_shortens_to_suffix_only_when_width_is_tight() {
+        let name = "LogicStsWord2.BatteryAReady";
+        assert_eq!(
+            ScopeApp::channel_panel_display_name(name, true, 96.0),
+            "BatteryAReady"
+        );
+        assert_eq!(
+            ScopeApp::channel_panel_display_name(name, true, 320.0),
+            name
+        );
+        assert_eq!(
+            ScopeApp::channel_panel_display_name(name, false, 96.0),
+            name
+        );
+        assert_eq!(
+            ScopeApp::channel_panel_display_name("Fault", true, 40.0),
+            "Fault"
+        );
     }
 
     #[test]

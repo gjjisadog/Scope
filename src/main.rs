@@ -19,6 +19,8 @@ use std::{
 const RENDERER_CHILD_ENV: &str = "SCOPE_RENDERER_CHILD";
 const RENDERER_ENV: &str = "SCOPE_RENDERER";
 const FALLBACK_WAIT: Duration = Duration::from_secs(6);
+const INITIAL_WINDOW_SIZE: [f32; 2] = [1280.0, 760.0];
+const MIN_WINDOW_SIZE: [f32; 2] = [860.0, 520.0];
 const DEFAULT_RENDERER_ORDER: [RendererMode; 4] = [
     RendererMode::GlowHardware,
     RendererMode::GlowSoftware,
@@ -201,10 +203,7 @@ fn run_app(mode: RendererMode) -> eframe::Result<()> {
     wgpu_options.power_preference = eframe::wgpu::PowerPreference::LowPower;
     wgpu_options.force_fallback_adapter = mode.force_wgpu_fallback_adapter();
 
-    let mut viewport = eframe::egui::ViewportBuilder::default()
-        .with_title("Scope Analyzer")
-        .with_inner_size([1440.0, 900.0])
-        .with_min_inner_size([980.0, 640.0]);
+    let mut viewport = base_scope_viewport_builder();
     if let Some(icon) = scope_window_icon() {
         viewport = viewport.with_icon(icon);
     }
@@ -225,6 +224,20 @@ fn run_app(mode: RendererMode) -> eframe::Result<()> {
         native_options,
         Box::new(|cc| Box::new(app::ScopeApp::new(cc))),
     )
+}
+
+fn base_scope_viewport_builder() -> eframe::egui::ViewportBuilder {
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_title("Scope Analyzer")
+        .with_inner_size(INITIAL_WINDOW_SIZE)
+        .with_min_inner_size(MIN_WINDOW_SIZE)
+        .with_resizable(true);
+
+    if cfg!(target_os = "windows") {
+        viewport = viewport.with_maximized(true);
+    }
+
+    viewport
 }
 
 fn scope_window_icon() -> Option<eframe::egui::IconData> {
@@ -299,4 +312,21 @@ fn startup_log_paths() -> Vec<std::path::PathBuf> {
     }
     paths.push(std::env::temp_dir().join("ScopeAnalyzer-startup.log"));
     paths
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scope_window_starts_resizable_with_taskbar_friendly_bounds() {
+        let viewport = base_scope_viewport_builder();
+        assert_eq!(viewport.inner_size, Some(eframe::egui::vec2(1280.0, 760.0)));
+        assert_eq!(
+            viewport.min_inner_size,
+            Some(eframe::egui::vec2(860.0, 520.0))
+        );
+        assert_eq!(viewport.resizable, Some(true));
+        assert_eq!(viewport.maximized, Some(cfg!(target_os = "windows")));
+    }
 }
