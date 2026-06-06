@@ -72,6 +72,7 @@ const MAX_ANALYSIS_PANEL_FRACTION: f32 = 0.50;
 const CHANNEL_NAME_COLUMN_MIN_WIDTH: f32 = 72.0;
 const CHANNEL_NAME_COLUMN_MAX_WIDTH: f32 = 520.0;
 const ANALYSIS_PANEL_CONTENT_MIN_WIDTH: f32 = 520.0;
+const THREE_PHASE_SELECTOR_VERTICAL_WIDTH: f32 = 760.0;
 const MEASUREMENT_CHANNEL_COLUMN_WIDTH: f32 = 132.0;
 const MEASUREMENT_VALUE_COLUMN_WIDTH: f32 = 78.0;
 const ANALYSIS_LABEL_COLUMN_WIDTH: f32 = 56.0;
@@ -97,6 +98,12 @@ const MAX_EXPORT_LABEL_SCALE: i32 = 4;
 struct SidebarWidthRanges {
     channel: RangeInclusive<f32>,
     analysis: RangeInclusive<f32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThreePhaseSelectorLayout {
+    Horizontal,
+    Vertical,
 }
 
 fn default_sample_rate_hz() -> f64 {
@@ -9658,6 +9665,14 @@ impl ScopeApp {
         available_width.clamp(ANALYSIS_CHANNEL_COMBO_WIDTH, 420.0)
     }
 
+    fn three_phase_selector_layout(available_width: f32) -> ThreePhaseSelectorLayout {
+        if available_width < THREE_PHASE_SELECTOR_VERTICAL_WIDTH {
+            ThreePhaseSelectorLayout::Vertical
+        } else {
+            ThreePhaseSelectorLayout::Horizontal
+        }
+    }
+
     fn dataset_channel_name(&self, dataset_index: usize, channel: &ChannelMeta) -> String {
         if dataset_index > 0 && self.dataset_kind_by_index(dataset_index) == Some(SourceKind::Dat) {
             if channel.name.trim().is_empty() {
@@ -14499,52 +14514,62 @@ impl ScopeApp {
         }
 
         let phase_labels = ["A", "B", "C"];
-        ui.horizontal_wrapped(|ui| {
-            for (phase_index, phase_label) in phase_labels.iter().enumerate() {
-                ui.label(*phase_label);
-                let selected_name = self
-                    .fft_channel_name(self.fft_dataset_index, self.sequence_channels[phase_index]);
-                let selected_short =
-                    Self::compact_label(&selected_name, ANALYSIS_CHANNEL_LABEL_CHARS);
-                let response = egui::ComboBox::from_id_source((
-                    "sequence_channel",
-                    self.fft_dataset_index,
-                    phase_index,
-                ))
-                .width(Self::analysis_combo_width(ui.available_width()))
-                .selected_text(selected_short)
-                .show_ui(ui, |ui| {
-                    for channel_index in channel_options {
-                        let channel_name =
-                            self.fft_channel_name(self.fft_dataset_index, *channel_index);
-                        let channel_short =
-                            Self::compact_label(&channel_name, ANALYSIS_CHANNEL_LABEL_CHARS + 8);
-                        if ui
-                            .selectable_value(
-                                &mut self.sequence_channels[phase_index],
+        let layout = Self::three_phase_selector_layout(ui.available_width());
+        let mut phase_selector = |ui: &mut egui::Ui, phase_index: usize, phase_label: &str| {
+            ui.label(phase_label);
+            let selected_name =
+                self.fft_channel_name(self.fft_dataset_index, self.sequence_channels[phase_index]);
+            let selected_short = Self::compact_label(&selected_name, ANALYSIS_CHANNEL_LABEL_CHARS);
+            let response = egui::ComboBox::from_id_source((
+                "sequence_channel",
+                self.fft_dataset_index,
+                phase_index,
+            ))
+            .width(Self::analysis_combo_width(ui.available_width()))
+            .selected_text(selected_short)
+            .show_ui(ui, |ui| {
+                for channel_index in channel_options {
+                    let channel_name =
+                        self.fft_channel_name(self.fft_dataset_index, *channel_index);
+                    let channel_short =
+                        Self::compact_label(&channel_name, ANALYSIS_CHANNEL_LABEL_CHARS + 8);
+                    if ui
+                        .selectable_value(
+                            &mut self.sequence_channels[phase_index],
+                            *channel_index,
+                            channel_short,
+                        )
+                        .on_hover_text(channel_name)
+                        .changed()
+                    {
+                        self.sequence_channels_user_selected = true;
+                        if phase_index == 0 {
+                            if let Some(channels) = self.related_three_phase_channels_from_anchor(
                                 *channel_index,
-                                channel_short,
-                            )
-                            .on_hover_text(channel_name)
-                            .changed()
-                        {
-                            self.sequence_channels_user_selected = true;
-                            if phase_index == 0 {
-                                if let Some(channels) = self
-                                    .related_three_phase_channels_from_anchor(
-                                        *channel_index,
-                                        channel_options,
-                                    )
-                                {
-                                    self.sequence_channels = channels;
-                                }
+                                channel_options,
+                            ) {
+                                self.sequence_channels = channels;
                             }
                         }
                     }
+                }
+            });
+            response.response.on_hover_text(selected_name);
+        };
+        match layout {
+            ThreePhaseSelectorLayout::Horizontal => {
+                ui.horizontal_wrapped(|ui| {
+                    for (phase_index, phase_label) in phase_labels.iter().enumerate() {
+                        phase_selector(ui, phase_index, phase_label);
+                    }
                 });
-                response.response.on_hover_text(selected_name);
             }
-        });
+            ThreePhaseSelectorLayout::Vertical => {
+                for (phase_index, phase_label) in phase_labels.iter().enumerate() {
+                    ui.horizontal(|ui| phase_selector(ui, phase_index, phase_label));
+                }
+            }
+        }
 
         let start = self.cursor_a.min(self.cursor_b);
         let end = self.cursor_a.max(self.cursor_b);
@@ -14675,47 +14700,56 @@ impl ScopeApp {
     ) -> bool {
         let phase_labels = ["A", "B", "C"];
         let mut changed = false;
-        ui.horizontal_wrapped(|ui| {
-            for (phase_index, phase_label) in phase_labels.iter().enumerate() {
-                ui.label(*phase_label);
-                let selected_name = channel_options
-                    .iter()
-                    .find(|(channel_index, _, _)| *channel_index == channels[phase_index])
-                    .map(|(_, name, _)| name.as_str())
-                    .unwrap_or("");
-                let selected_short =
-                    Self::compact_label(selected_name, ANALYSIS_CHANNEL_LABEL_CHARS);
-                let response =
-                    egui::ComboBox::from_id_source((id_prefix, dataset_index, phase_index))
-                        .width(Self::analysis_combo_width(ui.available_width()))
-                        .selected_text(selected_short)
-                        .show_ui(ui, |ui| {
-                            for (channel_index, channel_name, related_channels) in channel_options {
-                                let channel_short = Self::compact_label(
-                                    channel_name,
-                                    ANALYSIS_CHANNEL_LABEL_CHARS + 8,
-                                );
-                                if ui
-                                    .selectable_value(
-                                        &mut channels[phase_index],
-                                        *channel_index,
-                                        channel_short,
-                                    )
-                                    .on_hover_text(channel_name)
-                                    .changed()
-                                {
-                                    if phase_index == 0 {
-                                        if let Some(related) = related_channels {
-                                            *channels = *related;
-                                        }
-                                    }
-                                    changed = true;
+        let layout = Self::three_phase_selector_layout(ui.available_width());
+        let mut phase_selector = |ui: &mut egui::Ui, phase_index: usize, phase_label: &str| {
+            ui.label(phase_label);
+            let selected_name = channel_options
+                .iter()
+                .find(|(channel_index, _, _)| *channel_index == channels[phase_index])
+                .map(|(_, name, _)| name.as_str())
+                .unwrap_or("");
+            let selected_short = Self::compact_label(selected_name, ANALYSIS_CHANNEL_LABEL_CHARS);
+            let response = egui::ComboBox::from_id_source((id_prefix, dataset_index, phase_index))
+                .width(Self::analysis_combo_width(ui.available_width()))
+                .selected_text(selected_short)
+                .show_ui(ui, |ui| {
+                    for (channel_index, channel_name, related_channels) in channel_options {
+                        let channel_short =
+                            Self::compact_label(channel_name, ANALYSIS_CHANNEL_LABEL_CHARS + 8);
+                        if ui
+                            .selectable_value(
+                                &mut channels[phase_index],
+                                *channel_index,
+                                channel_short,
+                            )
+                            .on_hover_text(channel_name)
+                            .changed()
+                        {
+                            if phase_index == 0 {
+                                if let Some(related) = related_channels {
+                                    *channels = *related;
                                 }
                             }
-                        });
-                response.response.on_hover_text(selected_name);
+                            changed = true;
+                        }
+                    }
+                });
+            response.response.on_hover_text(selected_name);
+        };
+        match layout {
+            ThreePhaseSelectorLayout::Horizontal => {
+                ui.horizontal_wrapped(|ui| {
+                    for (phase_index, phase_label) in phase_labels.iter().enumerate() {
+                        phase_selector(ui, phase_index, phase_label);
+                    }
+                });
             }
-        });
+            ThreePhaseSelectorLayout::Vertical => {
+                for (phase_index, phase_label) in phase_labels.iter().enumerate() {
+                    ui.horizontal(|ui| phase_selector(ui, phase_index, phase_label));
+                }
+            }
+        }
         changed
     }
 
@@ -15896,6 +15930,18 @@ mod tests {
         assert!(wide.analysis.end() > normal.analysis.end());
         assert!(wide.channel.end() <= &(1920.0 * MAX_CHANNEL_PANEL_FRACTION));
         assert!(wide.analysis.end() <= &(1920.0 * MAX_ANALYSIS_PANEL_FRACTION));
+    }
+
+    #[test]
+    fn three_phase_selectors_stack_vertically_when_analysis_panel_is_tight() {
+        assert_eq!(
+            ScopeApp::three_phase_selector_layout(640.0),
+            ThreePhaseSelectorLayout::Vertical
+        );
+        assert_eq!(
+            ScopeApp::three_phase_selector_layout(900.0),
+            ThreePhaseSelectorLayout::Horizontal
+        );
     }
 
     #[test]
