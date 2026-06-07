@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
-$version = "0.2.0"
+$version = "0.3.0"
 $dist = Join-Path $root "dist"
 $stage = Join-Path $dist "ScopeAnalyzer-$version-win-x64"
 $zip = Join-Path $dist "ScopeAnalyzer-$version-win-x64.zip"
@@ -72,6 +72,124 @@ function Resolve-AngleRuntimeDir {
     return $null
 }
 
+function Test-MesaRuntimeDir {
+    param([string]$Dir)
+
+    if (-not $Dir -or -not (Test-Path $Dir)) {
+        return $false
+    }
+
+    $required = @("opengl32.dll", "libgallium_wgl.dll", "libEGL.dll", "libGLESv2.dll")
+    foreach ($name in $required) {
+        if (-not (Test-Path (Join-Path $Dir $name))) {
+            return $false
+        }
+    }
+
+    return $true
+}
+
+function Resolve-MesaRuntimeCandidate {
+    param([string]$Dir)
+
+    if (Test-MesaRuntimeDir $Dir) {
+        return $Dir
+    }
+
+    $x64Dir = Join-Path $Dir "x64"
+    if (Test-MesaRuntimeDir $x64Dir) {
+        return $x64Dir
+    }
+
+    return $null
+}
+
+function Install-MesaRuntime {
+    $cacheDir = Join-Path $root "target\mesa-runtime"
+    $runtimeDir = Join-Path $cacheDir "x64"
+    $cached = Resolve-MesaRuntimeCandidate $runtimeDir
+    if ($cached) {
+        return $cached
+    }
+
+    New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+    $headers = @{ "User-Agent" = "ScopeAnalyzerPackageScript" }
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest" -Headers $headers
+    $asset = $release.assets |
+        Where-Object { $_.name -like "*release-msvc.7z" } |
+        Select-Object -First 1
+    if (-not $asset) {
+        Write-Warning "Mesa release-msvc asset was not found in the latest mesa-dist-win release."
+        return $null
+    }
+
+    $archive = Join-Path $cacheDir $asset.name
+    if (-not (Test-Path $archive)) {
+        Invoke-WebRequest -Uri $asset.browser_download_url -Headers $headers -OutFile $archive
+    }
+
+    $sevenZip = Join-Path $cacheDir "7zr.exe"
+    if (-not (Test-Path $sevenZip)) {
+        Invoke-WebRequest -Uri "https://www.7-zip.org/a/7zr.exe" -OutFile $sevenZip
+    }
+
+    $extractDir = Join-Path $cacheDir "extract"
+    if (Test-Path $extractDir) {
+        Remove-Item -Recurse -Force $extractDir
+    }
+    New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+
+    & $sevenZip x $archive "-o$extractDir" -y | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Failed to extract Mesa runtime archive."
+        return $null
+    }
+
+    $sourceDir = Resolve-MesaRuntimeCandidate $extractDir
+    if (-not $sourceDir) {
+        $sourceDir = Get-ChildItem -Path $extractDir -Directory -Recurse -ErrorAction SilentlyContinue |
+            ForEach-Object { Resolve-MesaRuntimeCandidate $_.FullName } |
+            Where-Object { $_ } |
+            Select-Object -First 1
+    }
+    if (-not $sourceDir) {
+        Write-Warning "Mesa runtime DLLs were not found after extraction."
+        return $null
+    }
+
+    New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
+    foreach ($name in @("opengl32.dll", "libgallium_wgl.dll", "libEGL.dll", "libGLESv2.dll", "libGLESv1_CM.dll")) {
+        if (-not (Test-Path (Join-Path $sourceDir $name))) {
+            continue
+        }
+        Copy-Item (Join-Path $sourceDir $name) (Join-Path $runtimeDir $name) -Force
+    }
+
+    return $runtimeDir
+}
+
+function Resolve-MesaRuntimeDir {
+    $candidateDirs = @()
+    if ($env:MESA_RUNTIME_DIR) {
+        $candidateDirs += $env:MESA_RUNTIME_DIR
+    }
+    $candidateDirs += Join-Path $root "third_party\mesa"
+    $candidateDirs += Join-Path $root "target\mesa-runtime\x64"
+
+    foreach ($dir in $candidateDirs) {
+        $resolved = Resolve-MesaRuntimeCandidate $dir
+        if ($resolved) {
+            return $resolved
+        }
+    }
+
+    if ($env:SCOPE_SKIP_MESA_DOWNLOAD -eq "1") {
+        return $null
+    }
+
+    return Install-MesaRuntime
+}
+
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 if (Test-Path $stage) {
     Remove-Item -Recurse -Force $stage
@@ -90,6 +208,7 @@ New-Item -ItemType Directory -Force -Path $stage | Out-Null
 $includeLibUnwind = "false"
 $includeAngleRuntime = "false"
 $includeD3DCompiler = "false"
+$includeMesaRuntime = "false"
 
 Push-Location $root
 try {
@@ -123,6 +242,22 @@ try {
     } else {
         Write-Warning "ANGLE runtime DLLs were not found. The package will rely on the target machine's OpenGL/ANGLE installation."
     }
+    $mesaRuntimeDir = Resolve-MesaRuntimeDir
+    if ($mesaRuntimeDir) {
+        $mesaStage = Join-Path $stage "mesa"
+        New-Item -ItemType Directory -Force -Path $mesaStage | Out-Null
+        Copy-Item "target\release\scope_analyzer.exe" (Join-Path $mesaStage "ScopeAnalyzerMesa.exe") -Force
+        Set-Content -Path (Join-Path $mesaStage "ScopeAnalyzerMesa.exe.local") -Encoding ASCII -Value "local"
+        foreach ($name in @("opengl32.dll", "libgallium_wgl.dll", "libEGL.dll", "libGLESv2.dll", "libGLESv1_CM.dll")) {
+            if (-not (Test-Path (Join-Path $mesaRuntimeDir $name))) {
+                continue
+            }
+            Copy-Item (Join-Path $mesaRuntimeDir $name) (Join-Path $mesaStage $name) -Force
+        }
+        $includeMesaRuntime = "true"
+    } else {
+        Write-Warning "Mesa runtime DLLs were not found. Mesa/llvmpipe fallback will be unavailable in this package."
+    }
 Set-Content -Path (Join-Path $stage "Start-ScopeAnalyzer.bat") -Encoding ASCII -Value @(
     "@echo off",
     "cd /d ""%~dp0""",
@@ -146,6 +281,19 @@ Set-Content -Path (Join-Path $stage "Start-ScopeAnalyzer-OpenGL.bat") -Encoding 
     "set SCOPE_RENDERER=glow",
     "start """" ""%~dp0ScopeAnalyzer.exe"""
 )
+Set-Content -Path (Join-Path $stage "Start-ScopeAnalyzer-Mesa.bat") -Encoding ASCII -Value @(
+    "@echo off",
+    "cd /d ""%~dp0""",
+    "if exist ""%~dp0mesa\ScopeAnalyzerMesa.exe"" (",
+    "  set SCOPE_RENDERER=mesa",
+    "  set SCOPE_APP_HOME=%~dp0",
+    "  set SCOPE_GL_API=wgl",
+    "  start """" ""%~dp0mesa\ScopeAnalyzerMesa.exe""",
+    ") else (",
+    "  echo Mesa runtime was not packaged.",
+    "  pause",
+    ")"
+)
 
 $clang = Get-Command "x86_64-w64-mingw32-clang.exe" -ErrorAction SilentlyContinue
     if ($clang) {
@@ -153,6 +301,9 @@ $clang = Get-Command "x86_64-w64-mingw32-clang.exe" -ErrorAction SilentlyContinu
         $libunwind = Join-Path $runtimeDir "libunwind.dll"
         if (Test-Path $libunwind) {
             Copy-Item $libunwind (Join-Path $stage "libunwind.dll")
+            if ($includeMesaRuntime -eq "true") {
+                Copy-Item $libunwind (Join-Path $stage "mesa\libunwind.dll")
+            }
             $includeLibUnwind = "true"
         }
     }
@@ -166,7 +317,7 @@ Write-Host "Created $zip"
 $candle = Resolve-Tool "candle.exe"
 $light = Resolve-Tool "light.exe"
 if ($candle -and $light) {
-    & $candle -arch x64 -dStageDir="$stage" -dIncludeLibUnwind="$includeLibUnwind" -dIncludeAngleRuntime="$includeAngleRuntime" -dIncludeD3DCompiler="$includeD3DCompiler" -out $wixobj $wxs
+    & $candle -arch x64 -dStageDir="$stage" -dIncludeLibUnwind="$includeLibUnwind" -dIncludeAngleRuntime="$includeAngleRuntime" -dIncludeD3DCompiler="$includeD3DCompiler" -dIncludeMesaRuntime="$includeMesaRuntime" -out $wixobj $wxs
     if ($LASTEXITCODE -ne 0) {
         throw "candle failed with exit code $LASTEXITCODE"
     }

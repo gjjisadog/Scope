@@ -905,13 +905,21 @@ impl GlutinWindowContext {
 
         log::debug!("trying to create glutin Display with config: {config_template_builder:?}");
 
+        let api_preference =
+            if std::env::var("SCOPE_GL_API").is_ok_and(|value| value.eq_ignore_ascii_case("wgl")) {
+                glutin_winit::ApiPreference::FallbackEgl
+            } else {
+                glutin_winit::ApiPreference::PreferEgl
+            };
+
         // Create GL display. This may probably create a window too on most platforms. Definitely on `MS windows`. Never on Android.
         let display_builder = glutin_winit::DisplayBuilder::new()
             // Scope Analyzer targets cloud desktops that may only provide a
             // virtual display driver. Prefer EGL first so bundled/system ANGLE
             // can translate OpenGL ES to Direct3D/software instead of trying
-            // Windows WGL/OpenGL first.
-            .with_preference(glutin_winit::ApiPreference::PreferEgl)
+            // Windows WGL/OpenGL first. Mesa/llvmpipe sets SCOPE_GL_API=wgl
+            // because its Windows runtime is exposed through WGL.
+            .with_preference(api_preference)
             .with_window_builder(Some(egui_winit::create_winit_window_builder(
                 egui_ctx,
                 event_loop,

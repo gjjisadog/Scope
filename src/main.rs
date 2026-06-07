@@ -18,14 +18,19 @@ use std::{
 
 const RENDERER_CHILD_ENV: &str = "SCOPE_RENDERER_CHILD";
 const RENDERER_ENV: &str = "SCOPE_RENDERER";
+const APP_HOME_ENV: &str = "SCOPE_APP_HOME";
+const GL_API_ENV: &str = "SCOPE_GL_API";
 const FALLBACK_WAIT: Duration = Duration::from_secs(6);
 const INITIAL_WINDOW_SIZE: [f32; 2] = [1280.0, 760.0];
 const MIN_WINDOW_SIZE: [f32; 2] = [860.0, 520.0];
-const DEFAULT_RENDERER_ORDER: [RendererMode; 4] = [
+const MESA_RUNTIME_DIR: &str = "mesa";
+const MESA_HELPER_EXE: &str = "ScopeAnalyzerMesa.exe";
+const DEFAULT_RENDERER_ORDER: [RendererMode; 5] = [
     RendererMode::GlowSoftware,
     RendererMode::GlowHardware,
     RendererMode::WgpuDx12Software,
     RendererMode::WgpuDx12,
+    RendererMode::MesaSoftware,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,6 +39,7 @@ enum RendererMode {
     GlowSoftware,
     WgpuDx12,
     WgpuDx12Software,
+    MesaSoftware,
 }
 
 impl RendererMode {
@@ -45,6 +51,7 @@ impl RendererMode {
             }
             "wgpu" | "dx12" => Some(Self::WgpuDx12),
             "wgpu-software" | "dx12-software" | "warp" => Some(Self::WgpuDx12Software),
+            "mesa" | "llvmpipe" | "mesa-software" => Some(Self::MesaSoftware),
             _ => None,
         }
     }
@@ -55,6 +62,7 @@ impl RendererMode {
             Self::GlowSoftware => "glow-software",
             Self::WgpuDx12 => "wgpu",
             Self::WgpuDx12Software => "wgpu-software",
+            Self::MesaSoftware => "mesa",
         }
     }
 
@@ -64,12 +72,13 @@ impl RendererMode {
             Self::GlowSoftware => "glow/OpenGL software",
             Self::WgpuDx12 => "wgpu/DX12",
             Self::WgpuDx12Software => "wgpu/DX12 software/WARP",
+            Self::MesaSoftware => "Mesa/llvmpipe software OpenGL",
         }
     }
 
     fn renderer(self) -> eframe::Renderer {
         match self {
-            Self::GlowHardware | Self::GlowSoftware => eframe::Renderer::Glow,
+            Self::GlowHardware | Self::GlowSoftware | Self::MesaSoftware => eframe::Renderer::Glow,
             Self::WgpuDx12 | Self::WgpuDx12Software => eframe::Renderer::Wgpu,
         }
     }
@@ -77,7 +86,9 @@ impl RendererMode {
     fn hardware_acceleration(self) -> eframe::HardwareAcceleration {
         match self {
             Self::GlowSoftware | Self::WgpuDx12Software => eframe::HardwareAcceleration::Off,
-            Self::GlowHardware | Self::WgpuDx12 => eframe::HardwareAcceleration::Preferred,
+            Self::GlowHardware | Self::WgpuDx12 | Self::MesaSoftware => {
+                eframe::HardwareAcceleration::Preferred
+            }
         }
     }
 
@@ -183,10 +194,39 @@ fn launch_with_process_fallback() -> eframe::Result<()> {
 
 fn spawn_renderer_child(mode: RendererMode) -> std::io::Result<std::process::Child> {
     let exe = std::env::current_exe()?;
-    Command::new(exe)
+    let renderer_exe = renderer_executable(mode, &exe);
+    let mut command = Command::new(&renderer_exe);
+    command
         .env(RENDERER_CHILD_ENV, "1")
-        .env(RENDERER_ENV, mode.env_value())
-        .spawn()
+        .env(RENDERER_ENV, mode.env_value());
+
+    if let Some(app_home) = exe.parent() {
+        command.env(APP_HOME_ENV, app_home);
+    }
+
+    if mode == RendererMode::MesaSoftware {
+        if let Some(mesa_dir) = renderer_exe.parent() {
+            command.current_dir(mesa_dir);
+            command.env("GALLIUM_DRIVER", "llvmpipe");
+            command.env("LIBGL_ALWAYS_SOFTWARE", "1");
+            command.env("MESA_LOADER_DRIVER_OVERRIDE", "llvmpipe");
+            command.env(GL_API_ENV, "wgl");
+        }
+    }
+
+    command.spawn()
+}
+
+fn renderer_executable(mode: RendererMode, current_exe: &std::path::Path) -> std::path::PathBuf {
+    if mode != RendererMode::MesaSoftware {
+        return current_exe.to_owned();
+    }
+
+    let Some(parent) = current_exe.parent() else {
+        return current_exe.to_owned();
+    };
+
+    parent.join(MESA_RUNTIME_DIR).join(MESA_HELPER_EXE)
 }
 
 fn status_text(status: ExitStatus) -> String {
@@ -338,6 +378,12 @@ fn write_startup_log(message: &str) {
 
 fn startup_log_paths() -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
+    if let Some(app_home) = std::env::var_os(APP_HOME_ENV)
+        .map(std::path::PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        paths.push(app_home.join("ScopeAnalyzer-startup.log"));
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             paths.push(parent.join("ScopeAnalyzer-startup.log"));
@@ -366,6 +412,10 @@ mod tests {
     #[test]
     fn default_renderer_order_prefers_cloud_desktop_safe_modes() {
         assert_eq!(DEFAULT_RENDERER_ORDER[0], RendererMode::GlowSoftware);
+        assert_eq!(
+            DEFAULT_RENDERER_ORDER.last(),
+            Some(&RendererMode::MesaSoftware)
+        );
         assert!(
             DEFAULT_RENDERER_ORDER
                 .iter()
@@ -386,11 +436,28 @@ mod tests {
             RendererMode::from_env_value("virtual"),
             Some(RendererMode::GlowSoftware)
         );
+        assert_eq!(
+            RendererMode::from_env_value("mesa"),
+            Some(RendererMode::MesaSoftware)
+        );
+        assert_eq!(
+            RendererMode::from_env_value("llvmpipe"),
+            Some(RendererMode::MesaSoftware)
+        );
     }
 
     #[test]
     fn exhausted_renderer_fallback_does_not_run_wgpu_in_process() {
         let message = exhausted_renderer_message();
         assert!(message.contains("not running WGPU/WARP in-process"));
+    }
+
+    #[test]
+    fn mesa_renderer_uses_isolated_helper_executable() {
+        let exe = std::path::Path::new(r"C:\Apps\ScopeAnalyzer\ScopeAnalyzer.exe");
+        assert_eq!(
+            renderer_executable(RendererMode::MesaSoftware, exe),
+            std::path::PathBuf::from(r"C:\Apps\ScopeAnalyzer\mesa\ScopeAnalyzerMesa.exe")
+        );
     }
 }

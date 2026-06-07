@@ -58,6 +58,7 @@ const MIN_CHANNEL_SCALE: f32 = -1_000_000.0;
 const MAX_CHANNEL_SCALE: f32 = 1_000_000.0;
 const MAX_RECENT_FILES: usize = 12;
 const MAX_RECENT_CONFIGS: usize = 12;
+const APP_HOME_ENV: &str = "SCOPE_APP_HOME";
 const LOCAL_CSV_PAIR_MTIME_WINDOW_MS: i128 = 10_000;
 const CHANNEL_NAME_AVERAGE_CHAR_WIDTH: f32 = 7.0;
 const CHANNEL_PANEL_DEFAULT_WIDTH: f32 = 220.0;
@@ -2081,28 +2082,33 @@ impl ScopeApp {
     }
 
     fn crash_log_path() -> PathBuf {
-        env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(|parent| parent.join("scope-crash.log")))
-            .unwrap_or_else(|| PathBuf::from("scope-crash.log"))
+        Self::app_home_dir().join("scope-crash.log")
     }
 
     fn startup_log_paths() -> Vec<PathBuf> {
         let mut paths = Vec::new();
-        if let Ok(exe) = env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                paths.push(parent.join("ScopeAnalyzer-startup.log"));
-            }
-        }
+        paths.push(Self::app_home_dir().join("ScopeAnalyzer-startup.log"));
         paths.push(env::temp_dir().join("ScopeAnalyzer-startup.log"));
         paths
     }
 
     fn log_directory() -> PathBuf {
+        Self::app_home_dir()
+    }
+
+    fn app_home_dir() -> PathBuf {
+        if let Some(path) = env::var_os(APP_HOME_ENV)
+            .map(PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty())
+        {
+            return path;
+        }
+
         env::current_exe()
             .ok()
             .and_then(|path| path.parent().map(Path::to_path_buf))
-            .unwrap_or_else(env::temp_dir)
+            .or_else(|| env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
     }
 
     fn open_log_directory(&mut self) {
@@ -2151,6 +2157,7 @@ impl ScopeApp {
                 .unwrap_or_else(|error| format!("unknown ({error})"))
         ));
         text.push_str(&format!("log_dir: {}\n", Self::log_directory().display()));
+        text.push_str(&format!("app_home: {}\n", Self::app_home_dir().display()));
         text.push_str(&format!(
             "renderer_env: {}\n",
             env::var("SCOPE_RENDERER").unwrap_or_else(|_| "(unset)".to_owned())
@@ -2810,21 +2817,11 @@ impl ScopeApp {
     }
 
     fn recent_files_path() -> PathBuf {
-        env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
-            .or_else(|| env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("scope-recent-files.json")
+        Self::app_home_dir().join("scope-recent-files.json")
     }
 
     fn recent_configs_path() -> PathBuf {
-        env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
-            .or_else(|| env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("scope-recent-configs.json")
+        Self::app_home_dir().join("scope-recent-configs.json")
     }
 
     fn load_recent_files() -> Vec<PathBuf> {

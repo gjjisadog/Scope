@@ -4,7 +4,7 @@
     Id="*"
     Name="Scope Analyzer"
     Language="1033"
-    Version="0.2.0"
+    Version="0.3.0"
     Manufacturer="Scope"
     UpgradeCode="{8C47D14B-9AA6-4F93-89C8-1B2D66B70B94}">
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="x64" />
@@ -23,7 +23,9 @@
   <Fragment>
     <Directory Id="TARGETDIR" Name="SourceDir">
       <Directory Id="ProgramFiles64Folder">
-        <Directory Id="INSTALLFOLDER" Name="Scope Analyzer" />
+        <Directory Id="INSTALLFOLDER" Name="Scope Analyzer">
+          <Directory Id="MESAFOLDER" Name="mesa" />
+        </Directory>
       </Directory>
       <Directory Id="ProgramMenuFolder">
         <Directory Id="ApplicationProgramsFolder" Name="Scope Analyzer" />
@@ -53,6 +55,7 @@
         <File Id="StartScopeAnalyzerDx12Bat" Source="$(var.StageDir)\Start-ScopeAnalyzer-DX12.bat" />
         <File Id="StartScopeAnalyzerSoftwareBat" Source="$(var.StageDir)\Start-ScopeAnalyzer-Software.bat" />
         <File Id="StartScopeAnalyzerOpenGlBat" Source="$(var.StageDir)\Start-ScopeAnalyzer-OpenGL.bat" />
+        <File Id="StartScopeAnalyzerMesaBat" Source="$(var.StageDir)\Start-ScopeAnalyzer-Mesa.bat" />
       </Component>
       <?if $(var.IncludeAngleRuntime) = "true" ?>
       <Component Id="AngleRuntimeDlls" Directory="INSTALLFOLDER" Guid="{C8DC6012-6B21-4D31-9B92-E68C3F8E1D19}" Win64="yes">
@@ -63,6 +66,20 @@
       <?if $(var.IncludeD3DCompiler) = "true" ?>
       <Component Id="D3DCompilerDll" Directory="INSTALLFOLDER" Guid="{3D3DF175-3B6C-4749-94E8-E0F8A635B001}" Win64="yes">
         <File Id="D3DCompiler47DllFile" Source="$(var.StageDir)\d3dcompiler_47.dll" KeyPath="yes" />
+      </Component>
+      <?endif?>
+      <?if $(var.IncludeMesaRuntime) = "true" ?>
+      <Component Id="MesaRuntimeFiles" Directory="MESAFOLDER" Guid="{F6E6D9F7-28F0-4EB5-94F5-B3641793CB89}" Win64="yes">
+        <File Id="ScopeAnalyzerMesaExe" Source="$(var.StageDir)\mesa\ScopeAnalyzerMesa.exe" KeyPath="yes" />
+        <File Id="ScopeAnalyzerMesaLocal" Source="$(var.StageDir)\mesa\ScopeAnalyzerMesa.exe.local" />
+        <File Id="MesaOpenGl32Dll" Source="$(var.StageDir)\mesa\opengl32.dll" />
+        <File Id="MesaLibGalliumWglDll" Source="$(var.StageDir)\mesa\libgallium_wgl.dll" />
+        <File Id="MesaLibEglDll" Source="$(var.StageDir)\mesa\libEGL.dll" />
+        <File Id="MesaLibGlesV2Dll" Source="$(var.StageDir)\mesa\libGLESv2.dll" />
+        <File Id="MesaLibGlesV1Dll" Source="$(var.StageDir)\mesa\libGLESv1_CM.dll" />
+        <?if $(var.IncludeLibUnwind) = "true" ?>
+        <File Id="MesaLibUnwindDllFile" Source="$(var.StageDir)\mesa\libunwind.dll" />
+        <?endif?>
       </Component>
       <?endif?>
       <?if $(var.IncludeLibUnwind) = "true" ?>
