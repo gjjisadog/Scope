@@ -12628,6 +12628,11 @@ impl ScopeApp {
                         ui.label("第一列是秒级时间，后续列为通道值，最多读取 128 个数值通道。文件打开时只建立索引，绘图按当前视窗读取原始采样或 min/max 摘要。");
                         ui.monospace("time,CH1,CH2,CH3\n0.000000,0.0,0.1,0.2\n0.000010,0.1,0.2,0.3");
                         ui.add_space(6.0);
+                        ui.strong("本地 ADATA/DDATA CSV");
+                        ui.label("文件名包含 ADATA 和 DDATA 的本地 CSV 会自动识别并配对，可单个选择其中一个文件，也可批量选择多个文件。配对优先使用文件名时间戳，其次使用名称关系和修改时间。");
+                        ui.label("ADATA 作为模拟量通道，DDATA 作为数字量通道。两类文件第一列序号会自动剔除；DDATA 去掉序号列后的前三个 bit 通道会合并为一个数字量通道：bit0 + 2*bit1 + 4*bit2。");
+                        ui.label("该规则只作用于这种本地 ADATA/DDATA 格式，不影响云端 Content CSV、标准数值 CSV 或 DAT 文件。变量名会尽量与云端 CSV 保持一致。");
+                        ui.add_space(6.0);
                         ui.strong("二进制 DAT");
                         ui.label("DAT 文件从二进制文件头读取采样率和通道名，每帧按小端 int16 通道值解码。");
                         ui.label("大文件不会一次性全部载入内存。缩小时绘制最小/最大包络，放大后读取原始采样点。");
@@ -12641,6 +12646,8 @@ impl ScopeApp {
                         ui.label("鼠标滚轮：以鼠标位置为中心缩放纵轴幅值范围。Ctrl + 滚轮/触摸板滚动：缩放横轴时间范围。");
                         ui.label("左侧变量栏：按数据组、模拟量/数字量和变量名组织。右键数据组可全选/全不选并配置线型；双击变量名可编辑显示名；右键变量名可配置变比。");
                         ui.label("变量名导入/导出：只保存和恢复显示名，不覆盖通道可见性、颜色、线宽、倍率、FFT 设置、语言、主题或快捷键。");
+                        ui.label("侧栏：左右侧栏都可以拖动调整宽度。窗口变窄时变量名会自动缩短或隐藏，右侧分析选择项会按空间自动横向或纵向排列。");
+                        ui.label("默认快捷键：Ctrl+B 显示/隐藏左侧变量栏，Ctrl+Alt+B 显示/隐藏右侧分析栏。快捷键在输入框获得焦点时仍可生效。");
                         ui.label("左键点击波形：移动最近的光标。左键拖拽：框选时间范围并放大。右键点击：打开光标菜单。右键拖拽：平移当前视图。");
                         ui.label("放置光标 X1/X2：显示红色虚线预览，左键确认，Esc 取消。隐藏/显示光标只切换可见状态，不改变位置和测量结果。");
                         ui.label("适配光标：缩放到 X1/X2 两个光标之间。快捷键可在选项中配置。");
@@ -12661,6 +12668,13 @@ impl ScopeApp {
                         ui.label("谐波分析前会去除直流均值并使用 Hann 窗，按目标谐波频率做相量投影和窗增益补偿。");
                         ui.label("谐波基准频率可在选项中设置，默认 50 Hz。谐波表显示 0 次直流量以及 1-10 次谐波的幅值、相位、相对基波比例和 THD。");
                         ui.label("THD 为 2 次及以上谐波平方和开根号后除以 1 次谐波幅值。");
+
+                        ui.separator();
+                        ui.heading("启动、诊断和云桌面");
+                        ui.label("默认启动器会依次尝试多个渲染器，并把启动过程写入程序目录下的 ScopeAnalyzer-startup.log；如果程序目录不可写，会写入系统临时目录。");
+                        ui.label("打包版本会优先使用随程序携带的 ANGLE DLL，以提高虚拟显卡和云桌面的 OpenGL 兼容性。若普通渲染器都失败，会最后尝试隔离在 mesa 目录下的 Mesa/llvmpipe 软件 OpenGL。");
+                        ui.label("可使用 Start-ScopeAnalyzer-Software.bat 强制软件 OpenGL，或使用 Start-ScopeAnalyzer-Mesa.bat 强制 Mesa/llvmpipe。Mesa 主要作为云桌面最后兜底，画质基本一致，但 CPU 占用和拖拽缩放性能可能变差。");
+                        ui.label("Help 菜单中的“复制诊断信息”会复制版本、渲染器环境、日志路径、当前数据和最近错误；“打开日志目录”可直接查看启动日志和崩溃日志。");
                     } else {
                         ui.heading("Scope Analyzer");
                         ui.label("Windows offline waveform analyzer with channel selection, oscilloscope-style zooming, cursor measurement, FFT, and THD analysis.");
@@ -12678,6 +12692,11 @@ impl ScopeApp {
                         ui.label("The first column is time in seconds. Remaining columns are channel values. Up to 128 numeric channels are loaded. The file is indexed in blocks and the plot reads only the current view or min/max summaries.");
                         ui.monospace("time,CH1,CH2,CH3\n0.000000,0.0,0.1,0.2\n0.000010,0.1,0.2,0.3");
                         ui.add_space(6.0);
+                        ui.strong("Local ADATA/DDATA CSV");
+                        ui.label("Local CSV files whose names contain ADATA and DDATA are detected and paired automatically. You can select one side of a pair or select many files in one batch. Pairing prefers filename timestamps, then name relationships and file modification time.");
+                        ui.label("ADATA is treated as analog channels and DDATA as digital channels. The first sequence column is removed from both files. After the sequence column is removed, the first three DDATA bit channels are merged as bit0 + 2*bit1 + 4*bit2.");
+                        ui.label("This rule only applies to the local ADATA/DDATA format and does not affect cloud Content CSV, standard numeric CSV, or DAT files. Variable names are kept aligned with the cloud CSV names where possible.");
+                        ui.add_space(6.0);
                         ui.strong("Binary DAT");
                         ui.label("DAT files are read from their binary header. The header supplies the sample rate and channel names; each frame is decoded as little-endian int16 channel values.");
                         ui.label("Large files are not loaded fully into memory. Zoomed-out views draw min/max envelopes; zoomed-in views read raw samples.");
@@ -12690,6 +12709,8 @@ impl ScopeApp {
                         ui.label("Mouse wheel zooms the vertical axis around the pointer. Ctrl + wheel or touchpad scroll zooms the time axis.");
                         ui.label("The left channel list is organized by dataset, analog/digital type, and channel name. Right-click datasets or channels for related settings.");
                         ui.label("Name import/export only stores display names; it does not overwrite visibility, color, line width, scale, FFT, language, theme, or shortcut settings.");
+                        ui.label("Sidebars can be resized by dragging. When the window is narrow, channel names shorten or hide automatically, and analysis selectors switch between horizontal and vertical layouts based on available space.");
+                        ui.label("Default sidebar shortcuts follow VS Code style: Ctrl+B toggles the left channel sidebar, and Ctrl+Alt+B toggles the right analysis sidebar. These shortcuts still work while text inputs are focused.");
                         ui.label("Left-click the plot to move the nearest cursor. Drag with the left button to zoom a time range. Right-click for the cursor menu; right-drag pans the current view.");
 
                         ui.separator();
@@ -12706,6 +12727,13 @@ impl ScopeApp {
                         ui.label("The FFT panel analyzes the selected dataset and channel between X1 and X2.");
                         ui.label("Harmonic analysis removes the DC mean and applies a Hann window before calculating harmonic phasors.");
                         ui.label("The harmonic table shows the DC component plus the 1st through 10th harmonic amplitude, phase, ratio to fundamental, and THD.");
+
+                        ui.separator();
+                        ui.heading("Startup, Diagnostics, and Cloud Desktops");
+                        ui.label("The default launcher tries several renderers in order and writes startup details to ScopeAnalyzer-startup.log beside the executable, or to the system temp directory if the install directory is not writable.");
+                        ui.label("Packaged builds prefer bundled ANGLE DLLs to improve OpenGL compatibility on virtual display adapters and cloud desktops. If the normal renderers all fail, the launcher finally tries the isolated Mesa/llvmpipe software OpenGL helper in the mesa directory.");
+                        ui.label("Use Start-ScopeAnalyzer-Software.bat to force software OpenGL, or Start-ScopeAnalyzer-Mesa.bat to force Mesa/llvmpipe. Mesa is intended as the last cloud-desktop fallback; visual output should remain similar, but CPU usage and interaction latency can be higher.");
+                        ui.label("Copy Diagnostics in the Help menu copies the version, renderer environment, log paths, active data, and last error. Open Log Directory opens the folder containing startup and crash logs.");
                     }
                 });
             });

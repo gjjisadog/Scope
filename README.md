@@ -50,6 +50,18 @@ time,CH1,CH2,CH3
 - 大文件不会一次性全部载入内存；缩小视图使用 min/max 包络，放大后读取原始采样点。
 - 绘图使用总点数预算，通道越多每通道绘图点越少；缩放和平移只替换当前窗口缓存，不累积历史窗口数据。
 
+### 本地 ADATA/DDATA CSV
+
+适配本地导出的 `ADATA`/`DDATA` 成对 CSV：
+
+- 文件名包含 `ADATA` 和 `DDATA` 时会自动识别，可只选择单个文件并自动查找配对文件，也可批量选择多个文件自动配对。
+- 配对优先使用文件名中的时间戳，其次使用名称关系和文件修改时间。
+- `ADATA` 作为模拟量通道，`DDATA` 作为数字量通道。
+- 两类文件的第一列序号会自动剔除。
+- `DDATA` 去掉序号列后的前三个 bit 通道会合并成一个数字量通道：`bit0 + 2*bit1 + 4*bit2`。
+- 该读取规则只作用于这种本地 `ADATA`/`DDATA` 格式，不影响云端 `Content` CSV、标准数值 CSV 或 DAT 文件。
+- 本地数据文件的变量命名尽量与云端 CSV 保持一致。
+
 后续如果还有新的二进制、加密或报文格式，应新增 `DataSource` 适配器，不需要改 UI 与 FFT 模块。
 
 ## 主要功能
@@ -70,6 +82,8 @@ time,CH1,CH2,CH3
 - 搜索支持多关键词，并匹配显示名和原始名。
 - 鼠标悬停左侧变量时，对应波形会加粗高亮。
 - 附加数据组按相同通道序号叠加，使用同一通道颜色、线宽和倍率，并可用数据组线型区分。
+- 左右侧栏都可拖动调整宽度。窗口变窄时，变量名会自动缩短或隐藏，右侧分析面板会按可用空间自动横向或纵向排列。
+- 数字量变量名在空间不足时优先显示 `.` 后半截；空间充足时显示全名。
 
 ### 变量名文件
 
@@ -118,6 +132,10 @@ time,CH1,CH2,CH3
 - `H`：隐藏/显示 X1/X2 光标。
 - `Ctrl+A`：全选通道。
 - `Ctrl+D`：取消全选。
+- `Ctrl+B`：隐藏/显示左侧变量栏。
+- `Ctrl+Alt+B`：隐藏/显示右侧分析栏。
+
+侧栏快捷键采用类似 VS Code 的默认习惯，并且在输入框获得焦点时仍可生效。
 
 ## 本地运行
 
@@ -138,11 +156,10 @@ powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1
 - `dist/ScopeAnalyzer-0.3.0-win-x64.zip`
 - `dist/ScopeAnalyzer-0.3.0-win-x64.msi`
 
-## Startup renderer fallback
+## 启动渲染器和云桌面兜底
 
-The default launcher tries several renderers in order and writes details to
-`ScopeAnalyzer-startup.log` beside the executable, or to the system temp
-directory if the install directory is not writable:
+默认启动器会依次尝试多个渲染器，并把详细过程写入程序目录下的
+`ScopeAnalyzer-startup.log`；如果安装目录不可写，则写入系统临时目录：
 
 1. `glow-software` / OpenGL via ANGLE, hardware acceleration off, intended for
    cloud desktops and virtual display adapters.
@@ -167,3 +184,12 @@ Packaged builds also include:
 - `Start-ScopeAnalyzer-DX12.bat`: force `SCOPE_RENDERER=wgpu`.
 - `Start-ScopeAnalyzer-Software.bat`: force `SCOPE_RENDERER=glow-software`.
 - `Start-ScopeAnalyzer-Mesa.bat`: force the isolated Mesa llvmpipe helper.
+
+云桌面建议优先使用默认启动器。若虚拟显卡仍无法启动，可依次尝试
+`Start-ScopeAnalyzer-Software.bat` 和 `Start-ScopeAnalyzer-Mesa.bat`。Mesa
+主要作为最后兜底，显示效果通常一致，但 CPU 占用和拖拽缩放流畅度可能下降。
+
+软件顶部 `Help` 菜单提供：
+
+- `复制诊断信息`：复制版本、渲染器环境、日志路径、当前数据和最近错误。
+- `打开日志目录`：打开启动日志和崩溃日志所在目录。
