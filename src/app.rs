@@ -94,7 +94,7 @@ const MIN_EXPORT_ARROW_SIZE: f32 = 4.0;
 const MAX_EXPORT_ARROW_SIZE: f32 = 28.0;
 const DEFAULT_EXPORT_LABEL_SCALE: i32 = 3;
 const MIN_EXPORT_LABEL_SCALE: i32 = 1;
-const MAX_EXPORT_LABEL_SCALE: i32 = 4;
+const MAX_EXPORT_LABEL_SCALE: i32 = 8;
 
 #[derive(Clone, Debug)]
 struct SidebarWidthRanges {
@@ -4157,9 +4157,7 @@ impl ScopeApp {
             config.export_arrow_custom_color[2],
             config.export_arrow_custom_color[3],
         );
-        self.export_label_scale = config
-            .export_label_scale
-            .clamp(MIN_EXPORT_LABEL_SCALE, MAX_EXPORT_LABEL_SCALE);
+        self.export_label_scale = Self::effective_export_label_scale(config.export_label_scale);
         self.export_label_font_style = config.export_label_font_style;
         self.export_resolution = config.export_resolution;
         self.export_dpi = config.export_dpi;
@@ -4411,9 +4409,7 @@ impl ScopeApp {
             config.export_arrow_custom_color[2],
             config.export_arrow_custom_color[3],
         );
-        self.export_label_scale = config
-            .export_label_scale
-            .clamp(MIN_EXPORT_LABEL_SCALE, MAX_EXPORT_LABEL_SCALE);
+        self.export_label_scale = Self::effective_export_label_scale(config.export_label_scale);
         self.export_label_font_style = config.export_label_font_style;
         self.export_resolution = config.export_resolution;
         self.export_dpi = config.export_dpi;
@@ -5356,7 +5352,15 @@ impl ScopeApp {
     }
 
     fn export_cursor_table_text_scale(&self) -> i32 {
-        self.export_label_scale.clamp(1, 2)
+        Self::effective_export_cursor_table_scale(self.export_label_scale)
+    }
+
+    fn effective_export_label_scale(scale: i32) -> i32 {
+        scale.clamp(MIN_EXPORT_LABEL_SCALE, MAX_EXPORT_LABEL_SCALE)
+    }
+
+    fn effective_export_cursor_table_scale(scale: i32) -> i32 {
+        scale.clamp(1, 4)
     }
 
     fn export_cursor_table_height(curve_count: usize, scale: i32) -> i32 {
@@ -6693,9 +6697,7 @@ impl ScopeApp {
             text: text.to_owned(),
             pos: [96 + offset, 96 + offset],
             color: Color32::from_rgb(24, 36, 56),
-            scale: self
-                .export_label_scale
-                .clamp(MIN_EXPORT_LABEL_SCALE, MAX_EXPORT_LABEL_SCALE),
+            scale: Self::effective_export_label_scale(self.export_label_scale),
         });
         self.push_export_preview_undo(before);
         self.mark_export_preview_dirty();
@@ -7171,9 +7173,7 @@ impl ScopeApp {
         let mut occupied_rects =
             self.export_cursor_obstacle_rects(plot, &curves, x_min, x_max, y_min, y_max);
 
-        let label_scale = self
-            .export_label_scale
-            .clamp(MIN_EXPORT_LABEL_SCALE, MAX_EXPORT_LABEL_SCALE);
+        let label_scale = Self::effective_export_label_scale(self.export_label_scale);
         let label_height = Canvas::text_height(label_scale);
         let label_step = label_height + 10;
         let max_labels = ((plot.bottom - plot.top - 10) / label_step).max(0) as usize;
@@ -12658,7 +12658,7 @@ impl ScopeApp {
                         ui.label("导出波形图片 PNG：从顶部菜单打开当前示波器视图的导出预览，不会直接保存文件。预览中保留当前波形、光标、X 轴坐标、变量标注和可选的光标数据表。");
                         ui.label("导出预览工具栏：选择工具可拖动变量名和箭头锚点；双击变量名可在原位置直接编辑；文字工具可添加文字；画笔可手写标注；橡皮可擦除画笔笔迹。");
                         ui.label("撤销/重做：拖动变量名、移动锚点、改变量名、改箭头样式、添加文字、画笔和橡皮操作都可撤销或重做。");
-                        ui.label("箭头与标注：可在预览窗口设置箭头大小、实线/虚线/点线/粗箭头/双线箭头、标注颜色、变量名字号和字体。箭头尖默认吸附并指向曲线。");
+                        ui.label("箭头与标注：可在预览窗口设置箭头大小、实线/虚线/点线/粗箭头/双线箭头、标注颜色、变量名字号和字体。变量名和文字标注字号支持 1-8 档。箭头尖默认吸附并指向曲线。");
                         ui.label("导出设置：在选项中可设置分辨率、DPI、导出子窗口范围、时间范围和是否显示光标数据表；DPI 支持预设，也可手动输入数值。导出风格固定为示波器截图风格。");
                         ui.label("批量导出波形 PNG：在选项中勾选“批量导出波形 PNG”打开批量导出窗口，可按当前视图、X1-X2 区间或手动时间窗口批量保存 PNG。批量导出会沿用当前分辨率、DPI、箭头和标注设置。");
 
@@ -12718,7 +12718,7 @@ impl ScopeApp {
                         ui.label("Export Waveform PNG opens an export preview for the current scope view instead of saving immediately. The preview keeps waveform traces, cursors, X-axis cursor labels, variable annotations, and the optional cursor data table.");
                         ui.label("Preview toolbar: Select drags variable labels and arrow anchors; double-click a variable label to edit it in place; Text adds text notes; Brush draws freehand marks; Eraser removes brush strokes.");
                         ui.label("Undo and redo cover label moves, anchor moves, label edits, arrow style changes, text notes, brush strokes, and eraser actions.");
-                        ui.label("Arrows and labels can be configured in the preview: arrow size, solid/dashed/dotted/thick/double arrows, annotation color, variable label size, and label font. Arrow tips stay snapped to the curve by default.");
+                        ui.label("Arrows and labels can be configured in the preview: arrow size, solid/dashed/dotted/thick/double arrows, annotation color, variable label size, and label font. Variable labels and text notes support size levels 1-8. Arrow tips stay snapped to the curve by default.");
                         ui.label("Export settings in Options control resolution, DPI, scope pane range, time range, and the cursor data table. DPI can use presets or a custom typed value. The image style is fixed to the oscilloscope screenshot style.");
                         ui.label("Batch Export Waveform PNG is opened from the checkbox in Options. It can save PNGs for the current view, X1-X2, or manual time windows, and uses the current resolution, DPI, arrow, and label settings.");
 
@@ -16050,6 +16050,13 @@ mod tests {
     #[test]
     fn default_language_is_chinese() {
         assert_eq!(default_language(), Language::Zh);
+    }
+
+    #[test]
+    fn export_label_scale_allows_large_report_labels() {
+        assert_eq!(MAX_EXPORT_LABEL_SCALE, 8);
+        assert_eq!(ScopeApp::effective_export_label_scale(8), 8);
+        assert_eq!(ScopeApp::effective_export_cursor_table_scale(8), 4);
     }
 
     #[test]

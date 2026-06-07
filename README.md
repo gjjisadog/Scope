@@ -153,8 +153,8 @@ powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1
 
 产物在：
 
-- `dist/ScopeAnalyzer-0.3.0-win-x64.zip`
-- `dist/ScopeAnalyzer-0.3.0-win-x64.msi`
+- `dist/ScopeAnalyzer-0.4.0-win-x64.zip`
+- `dist/ScopeAnalyzer-0.4.0-win-x64.msi`
 
 ## 启动渲染器和云桌面兜底
 
