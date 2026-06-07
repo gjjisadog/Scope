@@ -1126,6 +1126,7 @@ struct ExportLabelPlacement {
     anchor_rect: [i32; 4],
     anchor_point: [i32; 2],
     plot_rect: ClipRect,
+    drag_bounds: ClipRect,
 }
 
 #[derive(Clone, Debug)]
@@ -5155,6 +5156,12 @@ impl ScopeApp {
             (margin + rows as i32 * pane_h + (rows as i32 - 1) * gap + margin).max(480) as usize;
         let palette = self.export_style_palette();
         let mut canvas = Canvas::new(width, height, palette.canvas_bg);
+        let canvas_bounds = ClipRect {
+            left: 0,
+            top: 0,
+            right: width as i32,
+            bottom: height as i32,
+        };
         let mut label_cursor = 0usize;
         let mut label_layout = Vec::new();
 
@@ -5190,6 +5197,7 @@ impl ScopeApp {
                 &pane_title,
                 &mut label_cursor,
                 &mut label_layout,
+                canvas_bounds,
             );
         }
         self.draw_export_text_annotations(&mut canvas);
@@ -5240,6 +5248,12 @@ impl ScopeApp {
             (margin + rows as i32 * pane_h + (rows as i32 - 1) * gap + margin).max(480) as usize;
         let palette = self.export_style_palette();
         let mut canvas = SvgCanvas::new(width, height, palette.canvas_bg);
+        let canvas_bounds = ClipRect {
+            left: 0,
+            top: 0,
+            right: width as i32,
+            bottom: height as i32,
+        };
         let mut label_cursor = 0usize;
         let mut label_layout = Vec::new();
 
@@ -5275,6 +5289,7 @@ impl ScopeApp {
                 &pane_title,
                 &mut label_cursor,
                 &mut label_layout,
+                canvas_bounds,
             );
         }
         self.draw_export_text_annotations(&mut canvas);
@@ -5937,7 +5952,6 @@ impl ScopeApp {
                         .clicked()
                     {
                         self.export_preview_tool = ExportPreviewTool::Text;
-                        self.add_export_text_annotation();
                         ctx.request_repaint();
                     }
                     ui.selectable_value(
@@ -6130,6 +6144,10 @@ impl ScopeApp {
             self.export_preview_ink_interactions(ui, image_rect, scale, ctx);
             return;
         }
+        if self.export_preview_tool == ExportPreviewTool::Text {
+            self.export_preview_text_placement_interactions(ui, image_rect, scale, ctx);
+            return;
+        }
         for placement in self.export_preview_label_layout.clone() {
             let label_rect = Self::canvas_rect_to_preview(image_rect, placement.label_rect, scale);
             let label_hit_rect = label_rect.expand((8.0 * scale).clamp(4.0, 12.0));
@@ -6274,11 +6292,18 @@ impl ScopeApp {
                 };
                 if let Some((start_pos, before_drag)) = drag_info {
                     let delta = response.drag_delta() / scale;
-                    let next = [
-                        start_pos[0] + delta.x.round() as i32,
-                        start_pos[1] + delta.y.round() as i32,
-                    ];
-                    self.set_export_label_canvas_position(placement.label_index, next);
+                    let text_w = (placement.label_rect[2] - placement.label_rect[0] - 8).max(1);
+                    let text_h = (placement.label_rect[3] - placement.label_rect[1] - 7).max(1);
+                    let next = Self::clamp_export_label_position(
+                        [
+                            start_pos[0] + delta.x.round() as i32,
+                            start_pos[1] + delta.y.round() as i32,
+                        ],
+                        placement.drag_bounds,
+                        text_w,
+                        text_h,
+                    );
+                    self.set_export_label_canvas_position(placement.label_index, [next.0, next.1]);
                     if let Some(before_drag) = before_drag {
                         self.push_export_preview_undo(before_drag);
                     }
@@ -6383,6 +6408,30 @@ impl ScopeApp {
         }
     }
 
+    fn export_preview_text_placement_interactions(
+        &mut self,
+        ui: &mut egui::Ui,
+        image_rect: egui::Rect,
+        scale: f32,
+        ctx: &egui::Context,
+    ) {
+        let id = ui.id().with("export_preview_text_placement");
+        let response = ui.interact(image_rect, id, egui::Sense::click());
+        if response.hovered() {
+            ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::Crosshair);
+        }
+        if response.clicked_by(PointerButton::Primary) {
+            let Some(pointer_pos) = response.interact_pointer_pos() else {
+                return;
+            };
+            let canvas_pos = Self::preview_pos_to_canvas(image_rect, scale, pointer_pos);
+            self.add_export_text_annotation_at(canvas_pos);
+            self.export_preview_edit_text_index = self.export_text_annotations.len().checked_sub(1);
+            self.export_preview_tool = ExportPreviewTool::Select;
+            ctx.request_repaint();
+        }
+    }
+
     fn export_preview_text_interactions(
         &mut self,
         ui: &mut egui::Ui,
@@ -6441,11 +6490,23 @@ impl ScopeApp {
                 });
                 if let Some((start_pos, before)) = drag_info {
                     let delta = response.drag_delta() / scale;
-                    if let Some(text) = self.export_text_annotations.get_mut(index) {
-                        text.pos = [
+                    let bounds = ClipRect {
+                        left: 0,
+                        top: 0,
+                        right: self.export_preview_size[0] as i32,
+                        bottom: self.export_preview_size[1] as i32,
+                    };
+                    let next = Self::clamp_export_label_position(
+                        [
                             start_pos[0] + delta.x.round() as i32,
                             start_pos[1] + delta.y.round() as i32,
-                        ];
+                        ],
+                        bounds,
+                        text_w,
+                        text_h,
+                    );
+                    if let Some(text) = self.export_text_annotations.get_mut(index) {
+                        text.pos = [next.0, next.1];
                     }
                     if let Some(before) = before {
                         self.push_export_preview_undo(before);
@@ -6481,6 +6542,17 @@ impl ScopeApp {
                 image_rect.top() + canvas_rect[3] as f32 * scale,
             ),
         )
+    }
+
+    fn preview_pos_to_canvas(
+        image_rect: egui::Rect,
+        scale: f32,
+        pointer_pos: egui::Pos2,
+    ) -> [i32; 2] {
+        [
+            ((pointer_pos.x - image_rect.left()) / scale).round() as i32,
+            ((pointer_pos.y - image_rect.top()) / scale).round() as i32,
+        ]
     }
 
     fn export_preview_inline_label_editor(
@@ -6686,21 +6758,34 @@ impl ScopeApp {
         }
     }
 
-    fn add_export_text_annotation(&mut self) {
+    fn add_export_text_annotation_at(&mut self, position: [i32; 2]) {
         let before = self.export_preview_state();
-        let offset = (self.export_text_annotations.len() as i32 * 28).min(160);
-        let text = match self.language {
+        let scale = Self::effective_export_label_scale(self.export_label_scale);
+        self.export_text_annotations
+            .push(Self::new_export_text_annotation(
+                self.language,
+                position,
+                scale,
+            ));
+        self.push_export_preview_undo(before);
+        self.mark_export_preview_dirty();
+    }
+
+    fn new_export_text_annotation(
+        language: Language,
+        position: [i32; 2],
+        scale: i32,
+    ) -> ExportTextAnnotation {
+        let text = match language {
             Language::Zh => "文字标注",
             Language::En => "Text note",
         };
-        self.export_text_annotations.push(ExportTextAnnotation {
+        ExportTextAnnotation {
             text: text.to_owned(),
-            pos: [96 + offset, 96 + offset],
+            pos: position,
             color: Color32::from_rgb(24, 36, 56),
-            scale: Self::effective_export_label_scale(self.export_label_scale),
-        });
-        self.push_export_preview_undo(before);
-        self.mark_export_preview_dirty();
+            scale: Self::effective_export_label_scale(scale),
+        }
     }
 
     fn draw_export_text_annotations<C: WaveformCanvas>(&self, canvas: &mut C) {
@@ -6975,6 +7060,7 @@ impl ScopeApp {
         _title: &str,
         label_cursor: &mut usize,
         label_layout: &mut Vec<ExportLabelPlacement>,
+        canvas_bounds: ClipRect,
     ) {
         let (y_min, y_max) = y_bounds;
         let palette = self.export_style_palette();
@@ -7206,6 +7292,7 @@ impl ScopeApp {
                 curve.label_index,
                 default_label_x,
                 default_label_y,
+                canvas_bounds,
                 plot,
                 text_w,
                 label_height,
@@ -7267,6 +7354,7 @@ impl ScopeApp {
                 ],
                 anchor_point: [target_px, target_py],
                 plot_rect: plot,
+                drag_bounds: canvas_bounds,
             });
             occupied_rects.push(Self::inflate_rect(label_rect, 8));
         }
@@ -7697,6 +7785,7 @@ impl ScopeApp {
         label_index: usize,
         default_x: i32,
         default_y: i32,
+        canvas_bounds: ClipRect,
         plot: ClipRect,
         text_w: i32,
         text_h: i32,
@@ -7715,10 +7804,7 @@ impl ScopeApp {
             .get(label_index)
             .and_then(|position| *position)
         {
-            return (
-                x.clamp(plot.left + 5, plot.right - text_w - 5),
-                y.clamp(plot.top + 5, plot.bottom - text_h - 5),
-            );
+            return Self::clamp_export_label_position([x, y], canvas_bounds, text_w, text_h);
         }
         self.auto_export_label_position(
             plot,
@@ -7735,6 +7821,22 @@ impl ScopeApp {
             x_max,
             y_min,
             y_max,
+        )
+    }
+
+    fn clamp_export_label_position(
+        position: [i32; 2],
+        bounds: ClipRect,
+        text_w: i32,
+        text_h: i32,
+    ) -> (i32, i32) {
+        let min_x = bounds.left + 5;
+        let max_x = (bounds.right - text_w - 5).max(min_x);
+        let min_y = bounds.top + 5;
+        let max_y = (bounds.bottom - text_h - 5).max(min_y);
+        (
+            position[0].clamp(min_x, max_x),
+            position[1].clamp(min_y, max_y),
         )
     }
 
@@ -12656,7 +12758,7 @@ impl ScopeApp {
                         ui.separator();
                         ui.heading("波形图片导出");
                         ui.label("导出波形图片 PNG：从顶部菜单打开当前示波器视图的导出预览，不会直接保存文件。预览中保留当前波形、光标、X 轴坐标、变量标注和可选的光标数据表。");
-                        ui.label("导出预览工具栏：选择工具可拖动变量名和箭头锚点；双击变量名可在原位置直接编辑；文字工具可添加文字；画笔可手写标注；橡皮可擦除画笔笔迹。");
+                        ui.label("导出预览工具栏：选择工具可在整张导出图内拖动变量名和箭头锚点；双击变量名可在原位置直接编辑；文字工具会进入放置模式，点击预览图选择文字位置后再编辑内容；画笔可手写标注；橡皮可擦除画笔笔迹。");
                         ui.label("撤销/重做：拖动变量名、移动锚点、改变量名、改箭头样式、添加文字、画笔和橡皮操作都可撤销或重做。");
                         ui.label("箭头与标注：可在预览窗口设置箭头大小、实线/虚线/点线/粗箭头/双线箭头、标注颜色、变量名字号和字体。变量名和文字标注字号支持 1-8 档。箭头尖默认吸附并指向曲线。");
                         ui.label("导出设置：在选项中可设置分辨率、DPI、导出子窗口范围、时间范围和是否显示光标数据表；DPI 支持预设，也可手动输入数值。导出风格固定为示波器截图风格。");
@@ -12716,7 +12818,7 @@ impl ScopeApp {
                         ui.separator();
                         ui.heading("Waveform Image Export");
                         ui.label("Export Waveform PNG opens an export preview for the current scope view instead of saving immediately. The preview keeps waveform traces, cursors, X-axis cursor labels, variable annotations, and the optional cursor data table.");
-                        ui.label("Preview toolbar: Select drags variable labels and arrow anchors; double-click a variable label to edit it in place; Text adds text notes; Brush draws freehand marks; Eraser removes brush strokes.");
+                        ui.label("Preview toolbar: Select drags variable labels anywhere within the exported image and adjusts arrow anchors; double-click a variable label to edit it in place; Text enters placement mode so you can click the preview image to choose where the new note is inserted; Brush draws freehand marks; Eraser removes brush strokes.");
                         ui.label("Undo and redo cover label moves, anchor moves, label edits, arrow style changes, text notes, brush strokes, and eraser actions.");
                         ui.label("Arrows and labels can be configured in the preview: arrow size, solid/dashed/dotted/thick/double arrows, annotation color, variable label size, and label font. Variable labels and text notes support size levels 1-8. Arrow tips stay snapped to the curve by default.");
                         ui.label("Export settings in Options control resolution, DPI, scope pane range, time range, and the cursor data table. DPI can use presets or a custom typed value. The image style is fixed to the oscilloscope screenshot style.");
@@ -16057,6 +16159,47 @@ mod tests {
         assert_eq!(MAX_EXPORT_LABEL_SCALE, 8);
         assert_eq!(ScopeApp::effective_export_label_scale(8), 8);
         assert_eq!(ScopeApp::effective_export_cursor_table_scale(8), 4);
+    }
+
+    #[test]
+    fn manually_dragged_export_labels_use_canvas_bounds() {
+        let canvas = ClipRect {
+            left: 0,
+            top: 0,
+            right: 1200,
+            bottom: 900,
+        };
+        let plot = ClipRect {
+            left: 120,
+            top: 80,
+            right: 1080,
+            bottom: 640,
+        };
+
+        assert_eq!(
+            ScopeApp::clamp_export_label_position([48, 720], canvas, 160, 32),
+            (48, 720)
+        );
+        assert_ne!(
+            ScopeApp::clamp_export_label_position([48, 720], canvas, 160, 32),
+            (
+                48.clamp(plot.left + 5, plot.right - 160 - 5),
+                720.clamp(plot.top + 5, plot.bottom - 32 - 5),
+            )
+        );
+        assert_eq!(
+            ScopeApp::clamp_export_label_position([1170, 890], canvas, 160, 32),
+            (1035, 863)
+        );
+    }
+
+    #[test]
+    fn export_text_annotation_uses_selected_canvas_position() {
+        let annotation = ScopeApp::new_export_text_annotation(Language::Zh, [420, 260], 6);
+
+        assert_eq!(annotation.text, "文字标注");
+        assert_eq!(annotation.pos, [420, 260]);
+        assert_eq!(annotation.scale, 6);
     }
 
     #[test]

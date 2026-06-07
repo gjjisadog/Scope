@@ -92,6 +92,13 @@ time,CH1,CH2,CH3
 - 导入或导出成功的文件会显示在 `Names > Recent Names`，可清空列表。
 - 变量名文件不会覆盖通道可见性、颜色、线宽、倍率、FFT 设置、快捷键、语言或主题。
 
+### 波形图片导出
+
+- `Export > Export Waveform PNG` 会先打开导出预览窗口，不会立即保存。
+- 选择工具可在整张导出图内自由拖动变量名标注，并可拖动箭头锚点调整箭头指向曲线的位置。
+- 文字工具会进入放置模式；在预览图上点击希望放置的位置后新增文字标注，并打开编辑窗口修改内容、字号和颜色。
+- 画笔和橡皮用于手写标注；导出预览中的变量名、文字、箭头和画笔操作都支持撤销/重做。
+
 ### 光标与缩放
 
 - 鼠标滚轮：以鼠标位置为中心缩放纵轴幅值范围。
@@ -153,8 +160,8 @@ powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1
 
 产物在：
 
-- `dist/ScopeAnalyzer-0.4.0-win-x64.zip`
-- `dist/ScopeAnalyzer-0.4.0-win-x64.msi`
+- `dist/ScopeAnalyzer-0.5.0-win-x64.zip`
+- `dist/ScopeAnalyzer-0.5.0-win-x64.msi`
 
 ## 启动渲染器和云桌面兜底
 
