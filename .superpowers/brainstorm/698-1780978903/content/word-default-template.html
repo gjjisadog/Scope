@@ -1,0 +1,88 @@
+<h2>默认 Word 模板版式</h2>
+<p class="subtitle">第一版会内置一个默认模板，并把批量波形图填进去。光标数据表可以在导出时勾选显示或不显示。</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup" style="margin:0">
+        <div class="mockup-header">A. 简洁实验报告</div>
+        <div class="mockup-body">
+          <div style="width:78%;margin:0 auto;padding:12px;border:1px solid #9aa8b8;background:white;font-size:12px;min-height:185px">
+            <div style="text-align:center;font-weight:700;font-size:16px;margin-bottom:10px">实验波形报告</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 14px;margin-bottom:10px">
+              <div>实验名称：________</div><div>导出时间：自动填充</div>
+              <div>数据文件：自动填充</div><div>采样率：自动填充</div>
+            </div>
+            <div style="border:1px solid #c9d4e2;height:58px;text-align:center;padding-top:32px;margin-bottom:6px">图 1 已标注波形图</div>
+            <div style="font-size:11px;text-align:center;margin-bottom:6px">图 1：窗口 #1 0.10s - 0.20s</div>
+            <div style="border:1px solid #d6dee8;padding:5px;color:#667">可选：光标数据表</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>A. 简洁报告</h3>
+      <p>首页就是报告标题和基础信息，后面按“图 + 图题 + 可选数据表”重复。适合快速生成实验报告。</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup" style="margin:0">
+        <div class="mockup-header">B. 表格式记录单</div>
+        <div class="mockup-body">
+          <div style="width:82%;margin:0 auto;padding:10px;border:1px solid #9aa8b8;background:white;font-size:11px;min-height:185px">
+            <table style="width:100%;border-collapse:collapse">
+              <tr><td colspan="4" style="border:1px solid #9aa8b8;text-align:center;font-weight:700;padding:6px">实验记录表</td></tr>
+              <tr><td style="border:1px solid #c9d4e2;padding:4px">实验</td><td style="border:1px solid #c9d4e2;padding:4px">自动/手填</td><td style="border:1px solid #c9d4e2;padding:4px">日期</td><td style="border:1px solid #c9d4e2;padding:4px">自动</td></tr>
+              <tr><td style="border:1px solid #c9d4e2;padding:4px">工况</td><td style="border:1px solid #c9d4e2;padding:4px">手填</td><td style="border:1px solid #c9d4e2;padding:4px">数据文件</td><td style="border:1px solid #c9d4e2;padding:4px">自动</td></tr>
+              <tr><td colspan="4" style="border:1px solid #c9d4e2;height:62px;text-align:center;padding-top:36px">波形图</td></tr>
+              <tr><td colspan="4" style="border:1px solid #c9d4e2;padding:5px;color:#667">可选光标数据表</td></tr>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>B. 表格式记录单</h3>
+      <p>更像实验台账，字段清楚，便于打印签字或归档。视觉上更硬一些，但适合规范记录。</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup" style="margin:0">
+        <div class="mockup-header">C. 图片集报告</div>
+        <div class="mockup-body">
+          <div style="width:84%;margin:0 auto;padding:10px;border:1px solid #9aa8b8;background:white;font-size:11px;min-height:185px">
+            <div style="font-weight:700;margin-bottom:6px">实验波形汇总</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+              <div>
+                <div style="border:1px solid #c9d4e2;height:52px;text-align:center;padding-top:28px">图 1</div>
+                <div style="text-align:center;margin-top:3px">窗口 #1</div>
+              </div>
+              <div>
+                <div style="border:1px solid #c9d4e2;height:52px;text-align:center;padding-top:28px">图 2</div>
+                <div style="text-align:center;margin-top:3px">窗口 #2</div>
+              </div>
+              <div>
+                <div style="border:1px solid #c9d4e2;height:52px;text-align:center;padding-top:28px">图 3</div>
+                <div style="text-align:center;margin-top:3px">窗口 #3</div>
+              </div>
+              <div style="border:1px dashed #c9d4e2;padding:8px;color:#667">可选数据表另起页</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>C. 图片集</h3>
+      <p>一页多图，适合快速浏览大量窗口。缺点是每张图会变小，细节和标注可读性下降。</p>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>我建议</h3>
+  <p>默认选 A：每张波形图保持足够大，报告能直接看；光标数据表作为每张图下面的可选块，导出时统一勾选。</p>
+</div>

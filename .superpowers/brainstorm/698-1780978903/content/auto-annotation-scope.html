@@ -1,0 +1,76 @@
+<h2>自动标注第一版范围</h2>
+<p class="subtitle">截图软件式标注台会支持手动箭头和文字。这里确认“自动标注”优先自动生成哪一类内容。</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup" style="margin:0">
+        <div class="mockup-header">A. 自动变量名箭头</div>
+        <div class="mockup-body">
+          <div class="placeholder" style="height:150px;position:relative;background:#f9fbff">
+            <div style="position:absolute;left:9%;right:8%;top:18%;height:60%;border:1px solid #2b3a50;background:white"></div>
+            <div style="position:absolute;left:16%;top:36%;width:58%;height:2px;background:#d42630;transform:rotate(-8deg)"></div>
+            <div style="position:absolute;left:17%;top:58%;width:58%;height:2px;background:#0d74b8;transform:rotate(7deg)"></div>
+            <div style="position:absolute;left:67%;top:24%;font-size:12px;color:#d42630">Ia</div>
+            <div style="position:absolute;left:64%;top:30%;width:42px;height:2px;background:#d42630;transform:rotate(135deg)"></div>
+            <div style="position:absolute;left:69%;top:64%;font-size:12px;color:#0d74b8">Vbus</div>
+            <div style="position:absolute;left:64%;top:60%;width:45px;height:2px;background:#0d74b8;transform:rotate(25deg)"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>A. 自动给曲线加变量名</h3>
+      <p>导出时自动为已选曲线放置变量名、箭头指向曲线，并尽量避开遮挡。用户可以再手动拖动、改名、改颜色。</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup" style="margin:0">
+        <div class="mockup-header">B. 自动关键点标注</div>
+        <div class="mockup-body">
+          <div class="placeholder" style="height:150px;position:relative;background:#f9fbff">
+            <div style="position:absolute;left:9%;right:8%;top:18%;height:60%;border:1px solid #2b3a50;background:white"></div>
+            <div style="position:absolute;left:16%;top:52%;width:62%;height:2px;background:#d42630;transform:rotate(-10deg)"></div>
+            <div style="position:absolute;left:45%;top:18%;bottom:22%;border-left:2px dashed #d42630"></div>
+            <div style="position:absolute;left:49%;top:25%;font-size:12px;color:#d42630">故障触发点</div>
+            <div style="position:absolute;left:46%;top:32%;width:42px;height:2px;background:#d42630;transform:rotate(20deg)"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>B. 自动标关键时间点</h3>
+      <p>基于 X1/X2、手动窗口、峰值/突变点等位置自动放箭头和文字。更接近“实验现象解释”，但规则需要定义清楚。</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup" style="margin:0">
+        <div class="mockup-header">C. 变量名自动 + 关键点手动</div>
+        <div class="mockup-body">
+          <div class="placeholder" style="height:150px;position:relative;background:#f9fbff">
+            <div style="position:absolute;left:9%;right:8%;top:18%;height:60%;border:1px solid #2b3a50;background:white"></div>
+            <div style="position:absolute;left:16%;top:42%;width:60%;height:2px;background:#d42630;transform:rotate(-7deg)"></div>
+            <div style="position:absolute;left:17%;top:60%;width:58%;height:2px;background:#0d74b8;transform:rotate(7deg)"></div>
+            <div style="position:absolute;left:67%;top:26%;font-size:12px;color:#d42630">Ia</div>
+            <div style="position:absolute;left:63%;top:31%;width:42px;height:2px;background:#d42630;transform:rotate(135deg)"></div>
+            <div style="position:absolute;left:38%;top:22%;font-size:12px;color:#0d5bd7">用户补充说明</div>
+            <div style="position:absolute;left:42%;top:30%;width:45px;height:2px;background:#0d5bd7;transform:rotate(52deg)"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>C. 推荐：变量自动，现象手动</h3>
+      <p>第一版自动做好变量名和曲线箭头；故障点、实验现象、结论文字由用户用截图工具式箭头/文字补充。稳定、可控、容易批量导出。</p>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>我建议</h3>
+  <p>先做 C：自动变量名箭头保证批量导出可用，关键现象用手动标注保证准确性。后续如果有固定规则，再增加自动峰值/突变/光标点标注。</p>
+</div>

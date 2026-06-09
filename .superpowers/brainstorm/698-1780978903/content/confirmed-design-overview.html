@@ -1,0 +1,76 @@
+<h2>已确认的导出模块设计草案</h2>
+<p class="subtitle">本页是当前确认结果汇总。后续会按它写正式 spec，再拆实施计划。</p>
+
+<div class="mockup">
+  <div class="mockup-header">截图软件式导出标注台</div>
+  <div class="mockup-body">
+    <div style="display:grid;grid-template-columns:52px 1fr 230px;gap:12px;min-height:260px">
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <button class="mock-button">↖</button>
+        <button class="mock-button">T</button>
+        <button class="mock-button">→</button>
+        <button class="mock-button">✎</button>
+        <button class="mock-button">⌫</button>
+        <button class="mock-button">↶</button>
+        <button class="mock-button">↷</button>
+      </div>
+      <div class="placeholder" style="position:relative;background:#f9fbff;min-height:260px">
+        <div style="position:absolute;left:7%;right:6%;top:12%;height:60%;border:1px solid #2b3a50;background:white"></div>
+        <div style="position:absolute;left:13%;top:38%;width:67%;height:3px;background:#d42630;transform:rotate(-9deg);transform-origin:left center"></div>
+        <div style="position:absolute;left:14%;top:57%;width:66%;height:3px;background:#0d74b8;transform:rotate(7deg);transform-origin:left center"></div>
+        <div style="position:absolute;left:65%;top:22%;padding:4px 8px;border:1px solid #d42630;background:white;color:#d42630;font-size:13px">Ia</div>
+        <div style="position:absolute;left:61%;top:31%;width:72px;height:3px;background:#d42630;transform:rotate(118deg);transform-origin:left center"></div>
+        <div style="position:absolute;left:57%;top:42%;width:10px;height:10px;border-radius:10px;background:white;border:2px solid #d42630"></div>
+        <div style="position:absolute;left:32%;top:20%;font-size:13px;color:#0d5bd7">用户手动说明</div>
+        <div style="position:absolute;left:41%;top:28%;width:54px;height:3px;background:#0d5bd7;transform:rotate(54deg);transform-origin:left center"></div>
+        <div style="position:absolute;left:6%;right:6%;bottom:8%;height:44px;border:1px solid #d6dee8;background:#fff;color:#667;font-size:12px;padding:8px">可选：光标数据表，导出 Word 时可统一包含或隐藏</div>
+      </div>
+      <div style="font-size:12px;display:flex;flex-direction:column;gap:8px">
+        <div class="label">属性面板</div>
+        <div style="padding:8px;border:1px solid #c9d4e2;background:white">
+          <b>选中：变量标注 Ia</b><br>
+          文字：可编辑<br>
+          颜色：跟随曲线 / 自定义<br>
+          字号：1-8<br>
+          箭头：实线 / 虚线 / 粗线
+        </div>
+        <div style="padding:8px;border:1px solid #c9d4e2;background:white">
+          <b>批量导出</b><br>
+          时间窗口：当前视图 / X1-X2 / 手动多窗口<br>
+          输出：PNG / SVG / Word<br>
+          Word：一个文档批量插入多图
+        </div>
+        <button class="mock-button">导出 PNG</button>
+        <button class="mock-button">导出 Word 报告</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>默认 Word 模板</h3>
+  <div style="width:66%;margin:0 auto;padding:14px;border:1px solid #9aa8b8;background:white;font-size:12px">
+    <div style="text-align:center;font-weight:700;font-size:16px;margin-bottom:10px">实验波形报告</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 14px;margin-bottom:10px">
+      <div>实验名称：用户填写或默认</div><div>导出时间：自动填充</div>
+      <div>数据文件：自动填充</div><div>采样率：自动填充</div>
+    </div>
+    <div style="border:1px solid #c9d4e2;height:72px;text-align:center;padding-top:42px;margin-bottom:6px">图 1：已标注波形图</div>
+    <div style="font-size:11px;text-align:center;margin-bottom:6px">图 1：窗口 #1 0.10s - 0.20s</div>
+    <div style="border:1px solid #d6dee8;padding:5px;color:#667">可选光标数据表</div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>范围边界</h3>
+  <div class="options" data-multiselect>
+    <div class="option selected" data-choice="confirmed-1">
+      <div class="letter">✓</div>
+      <div class="content"><h3>第一版包含</h3><p>截图式标注台、自动变量名箭头、手动箭头/文字/画笔/橡皮、撤销重做、批量 PNG、一个 Word 批量插图、默认简洁模板、可选光标数据表。</p></div>
+    </div>
+    <div class="option selected" data-choice="confirmed-2">
+      <div class="letter">✓</div>
+      <div class="content"><h3>第一版不做</h3><p>复杂外部 Word 模板导入、自动识别故障点/峰值/突变点、OCR/截图系统级区域捕获、多人协作批注。</p></div>
+    </div>
+  </div>
+</div>

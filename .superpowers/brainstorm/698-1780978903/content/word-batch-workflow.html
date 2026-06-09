@@ -1,0 +1,94 @@
+<h2>Word 批量导入/生成：需要确认的工作流</h2>
+<p class="subtitle">你已选择 B：截图软件式标注台。现在确认 Word 导出的批量逻辑，避免只做成单张图另存为 Word。</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup" style="margin:0">
+        <div class="mockup-header">A. 多张图导入同一个 Word</div>
+        <div class="mockup-body">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;align-items:stretch">
+            <div>
+              <div class="label">批量任务</div>
+              <div style="padding:8px;border:1px solid #c9d4e2;background:#fff;margin-bottom:6px">窗口 #1 0.10s-0.20s</div>
+              <div style="padding:8px;border:1px solid #c9d4e2;background:#fff;margin-bottom:6px">窗口 #2 0.35s-0.42s</div>
+              <div style="padding:8px;border:1px solid #c9d4e2;background:#fff">窗口 #3 0.80s-1.00s</div>
+            </div>
+            <div>
+              <div class="label">输出</div>
+              <div style="padding:10px;border:1px solid #8795a8;background:white;height:118px">
+                <div style="font-weight:700;margin-bottom:6px">实验报告.docx</div>
+                <div>图 1：窗口 #1 波形</div>
+                <div>图 2：窗口 #2 波形</div>
+                <div>图 3：窗口 #3 波形</div>
+                <div style="margin-top:6px;color:#667">附：光标数据表</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>A. 一个 Word，批量插图</h3>
+      <p>把多个时间窗口、多个子窗口或多个数据组批量渲染成图片，并按顺序插入同一个 Word。最适合“一份实验报告里包含多张波形图”。</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup" style="margin:0">
+        <div class="mockup-header">B. 每个任务生成一个 Word</div>
+        <div class="mockup-body">
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
+            <div style="padding:10px;border:1px solid #8795a8;background:white;height:118px">
+              <b>窗口01.docx</b><br>图片<br>光标表<br>说明
+            </div>
+            <div style="padding:10px;border:1px solid #8795a8;background:white;height:118px">
+              <b>窗口02.docx</b><br>图片<br>光标表<br>说明
+            </div>
+            <div style="padding:10px;border:1px solid #8795a8;background:white;height:118px">
+              <b>窗口03.docx</b><br>图片<br>光标表<br>说明
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>B. 批量生成多个 Word</h3>
+      <p>每个时间窗口、数据组或子窗口生成独立 Word 文件。适合一次分析多个实验，每个实验要单独交付一份报告。</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup" style="margin:0">
+        <div class="mockup-header">C. 导入 Word 模板并填充</div>
+        <div class="mockup-body">
+          <div style="display:grid;grid-template-columns:1fr 1.2fr;gap:10px">
+            <div>
+              <button class="mock-button">导入模板.docx</button>
+              <div style="font-size:12px;margin-top:8px;color:#667">识别占位符：</div>
+              <div style="font-size:12px">{{实验名称}}</div>
+              <div style="font-size:12px">{{波形图片}}</div>
+              <div style="font-size:12px">{{光标表}}</div>
+            </div>
+            <div style="padding:10px;border:1px solid #8795a8;background:white;height:120px">
+              <b>公司模板</b>
+              <div style="margin-top:8px">实验：自动填充</div>
+              <div style="margin-top:8px;border:1px dashed #8fa1b8;height:38px;text-align:center;padding-top:12px">插入波形图</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>C. 导入模板后批量填充</h3>
+      <p>用户先导入现有实验报告模板，软件把图片、标题、数据表填到占位符位置。自动化最好，但实现和模板规则需要更严格。</p>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>建议的第一版</h3>
+  <p>先做 A：一个 Word 批量插入多张已标注波形图，并附光标数据表；后续再扩展 C 的模板填充。</p>
+</div>

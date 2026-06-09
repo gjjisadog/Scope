@@ -1,0 +1,62 @@
+<h2>变量标注与箭头跟随交互</h2>
+<p class="subtitle">第一版建议同时支持拖变量名和拖曲线锚点。变量名移动时箭头自动变长、缩短、旋转；锚点移动时箭头尖端重新吸附曲线。</p>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">拖动变量名：箭头自动跟随</div>
+    <div class="mockup-body">
+      <div class="placeholder" style="height:230px;position:relative;background:#f9fbff">
+        <div style="position:absolute;left:8%;right:7%;top:13%;height:66%;border:1px solid #2b3a50;background:white"></div>
+        <div style="position:absolute;left:14%;top:48%;width:66%;height:3px;background:#d42630;transform:rotate(-10deg);transform-origin:left center"></div>
+        <div style="position:absolute;left:60%;top:37%;width:92px;height:3px;background:#d42630;transform:rotate(145deg);transform-origin:left center"></div>
+        <div style="position:absolute;left:53%;top:30%;padding:4px 8px;border:1px solid #d42630;background:white;color:#d42630;font-size:13px">Ia</div>
+        <div style="position:absolute;left:38%;top:23%;font-size:12px;color:#667">拖到这里</div>
+        <div style="position:absolute;left:37%;top:31%;padding:4px 8px;border:1px dashed #d42630;background:#fff;color:#d42630;font-size:13px">Ia</div>
+        <div style="position:absolute;left:53%;top:36%;font-size:18px;color:#667">→</div>
+        <div style="position:absolute;left:61%;top:41%;width:10px;height:10px;border-radius:10px;background:white;border:2px solid #d42630"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="mockup">
+    <div class="mockup-header">拖动锚点：箭头尖端重新吸附曲线</div>
+    <div class="mockup-body">
+      <div class="placeholder" style="height:230px;position:relative;background:#f9fbff">
+        <div style="position:absolute;left:8%;right:7%;top:13%;height:66%;border:1px solid #2b3a50;background:white"></div>
+        <div style="position:absolute;left:14%;top:53%;width:66%;height:3px;background:#0d74b8;transform:rotate(8deg);transform-origin:left center"></div>
+        <div style="position:absolute;left:66%;top:28%;padding:4px 8px;border:1px solid #0d74b8;background:white;color:#0d74b8;font-size:13px">Vbus</div>
+        <div style="position:absolute;left:62%;top:36%;width:78px;height:3px;background:#0d74b8;transform:rotate(110deg);transform-origin:left center"></div>
+        <div style="position:absolute;left:56%;top:53%;width:10px;height:10px;border-radius:10px;background:white;border:2px solid #0d74b8"></div>
+        <div style="position:absolute;left:45%;top:64%;width:10px;height:10px;border-radius:10px;background:#fff;border:2px dashed #0d74b8"></div>
+        <div style="position:absolute;left:47%;top:58%;font-size:12px;color:#667">拖锚点到曲线其他位置</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>拟定交互规则</h3>
+  <div class="options" data-multiselect>
+    <div class="option" data-choice="label-drag" onclick="toggleSelect(this)">
+      <div class="letter">1</div>
+      <div class="content">
+        <h3>变量名可拖动</h3>
+        <p>拖动变量名只改变标签位置；箭头起点随标签边缘自动重算，箭头尖端保持吸附曲线。</p>
+      </div>
+    </div>
+    <div class="option" data-choice="anchor-drag" onclick="toggleSelect(this)">
+      <div class="letter">2</div>
+      <div class="content">
+        <h3>锚点可拖动</h3>
+        <p>拖动箭头尖端时，软件按当前 X 位置重新找该曲线的 Y 值，保持箭头确实指向变量曲线。</p>
+      </div>
+    </div>
+    <div class="option" data-choice="manual-arrow" onclick="toggleSelect(this)">
+      <div class="letter">3</div>
+      <div class="content">
+        <h3>手动箭头独立存在</h3>
+        <p>用户用箭头工具画的“现象标注箭头”不绑定变量曲线，可以自由拖两端、改文字和颜色。</p>
+      </div>
+    </div>
+  </div>
+</div>

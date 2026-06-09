@@ -1,0 +1,101 @@
+<h2>导出图片 / Word 报告模块规划方向</h2>
+<p class="subtitle">先确认产品方向，再拆技术实施。你可以点击一个更接近你想要的方向，也可以在终端补充。</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup" style="margin:0">
+        <div class="mockup-header">A. 保守增强现有预览</div>
+        <div class="mockup-body">
+          <div style="display:flex;gap:8px;margin-bottom:10px;align-items:center">
+            <button class="mock-button">选择</button>
+            <button class="mock-button">文字</button>
+            <button class="mock-button">画笔</button>
+            <button class="mock-button">PNG</button>
+            <button class="mock-button">Word</button>
+          </div>
+          <div class="placeholder" style="height:120px;position:relative">
+            <div style="position:absolute;left:12%;right:8%;top:20%;height:45%;border:1px solid #9aa8b8;background:white"></div>
+            <div style="position:absolute;left:18%;top:48%;width:52%;height:2px;background:#3478d8;transform:rotate(-8deg)"></div>
+            <div style="position:absolute;left:68%;top:28%;padding:3px 6px;background:white;border:1px solid #3478d8;font-size:12px">Vbus</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>A. 保守增强</h3>
+      <p>在当前导出预览上补箭头工具、更多文字样式、Word 导出入口。改动较小，但交互仍受现有大文件结构限制。</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup" style="margin:0">
+        <div class="mockup-header">B. 截图软件式标注台</div>
+        <div class="mockup-body">
+          <div style="display:grid;grid-template-columns:44px 1fr 190px;gap:10px">
+            <div style="display:flex;flex-direction:column;gap:7px">
+              <button class="mock-button">↖</button>
+              <button class="mock-button">T</button>
+              <button class="mock-button">✎</button>
+              <button class="mock-button">▭</button>
+              <button class="mock-button">↶</button>
+            </div>
+            <div class="placeholder" style="height:135px;position:relative;background:#f9fbff">
+              <div style="position:absolute;left:8%;right:6%;top:18%;height:58%;border:1px solid #2b3a50;background:white"></div>
+              <div style="position:absolute;left:14%;top:50%;width:65%;height:2px;background:#d42630;transform:rotate(-13deg)"></div>
+              <div style="position:absolute;left:58%;top:20%;width:54px;height:2px;background:#0d5bd7;transform:rotate(145deg)"></div>
+              <div style="position:absolute;left:51%;top:15%;font-size:12px;color:#0d5bd7">故障点</div>
+              <div style="position:absolute;left:72%;top:50%;padding:2px 5px;border:1px solid #d42630;background:white;font-size:12px">Ia</div>
+            </div>
+            <div style="font-size:12px;display:flex;flex-direction:column;gap:6px">
+              <div class="label">属性</div>
+              <input class="mock-input" value="故障点">
+              <div>颜色 □ □ □ □</div>
+              <div>线宽 ━━━━━</div>
+              <div>字号 Aa Aa Aa</div>
+              <button class="mock-button">导出 PNG</button>
+              <button class="mock-button">导出 Word</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>B. 推荐：截图软件式重做</h3>
+      <p>把导出预览变成独立标注工作台：左侧工具、画布、右侧属性、底部导出。适合箭头、文字、颜色、批量和 Word 报告长期扩展。</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup" style="margin:0">
+        <div class="mockup-header">C. 报告自动化优先</div>
+        <div class="mockup-body">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+            <div class="placeholder" style="height:120px;position:relative">
+              <div style="position:absolute;left:10%;right:8%;top:20%;height:45%;border:1px solid #777;background:white"></div>
+              <div style="position:absolute;left:18%;top:46%;width:55%;height:2px;background:#345;transform:rotate(-6deg)"></div>
+              <div style="position:absolute;left:62%;top:28%;font-size:12px">自动标注</div>
+            </div>
+            <div style="font-size:12px">
+              <div class="label">Word 模板</div>
+              <div style="padding:6px;border:1px solid #ccd4df;background:white;margin-bottom:6px">实验名称 / 数据文件 / 图片 / 光标表</div>
+              <button class="mock-button">一键生成报告</button>
+              <button class="mock-button">批量生成</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>C. 报告优先</h3>
+      <p>重点做“自动导出实验波形 + 自动填充 Word”。手工标注较轻，适合快速减少写报告工作量，但截图软件体验不完整。</p>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>我目前倾向</h3>
+  <p>如果目标是长期替代手工截图和写报告，建议以 B 为主线，再把 C 的 Word 自动化作为同一导出工作台里的输出目标。</p>
+</div>
