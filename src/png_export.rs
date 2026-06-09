@@ -421,13 +421,27 @@ impl Canvas {
     pub fn save_png_with_dpi(&self, path: &Path, dpi: Option<u32>) -> std::io::Result<()> {
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
+        self.write_png_with_dpi(&mut writer, dpi)
+    }
+
+    pub fn encode_png_with_dpi(&self, dpi: Option<u32>) -> std::io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.write_png_with_dpi(&mut bytes, dpi)?;
+        Ok(bytes)
+    }
+
+    fn write_png_with_dpi<W: Write>(
+        &self,
+        writer: &mut W,
+        dpi: Option<u32>,
+    ) -> std::io::Result<()> {
         writer.write_all(b"\x89PNG\r\n\x1A\n")?;
 
         let mut ihdr = Vec::with_capacity(13);
         ihdr.extend_from_slice(&(self.width as u32).to_be_bytes());
         ihdr.extend_from_slice(&(self.height as u32).to_be_bytes());
         ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
-        write_chunk(&mut writer, b"IHDR", &ihdr)?;
+        write_chunk(writer, b"IHDR", &ihdr)?;
 
         if let Some(dpi) = dpi.filter(|dpi| *dpi > 0) {
             let pixels_per_meter = ((dpi as f64) / 0.0254).round() as u32;
@@ -435,7 +449,7 @@ impl Canvas {
             phys.extend_from_slice(&pixels_per_meter.to_be_bytes());
             phys.extend_from_slice(&pixels_per_meter.to_be_bytes());
             phys.push(1);
-            write_chunk(&mut writer, b"pHYs", &phys)?;
+            write_chunk(writer, b"pHYs", &phys)?;
         }
 
         let mut raw = Vec::with_capacity((self.width * 4 + 1) * self.height);
@@ -444,8 +458,8 @@ impl Canvas {
             raw.extend_from_slice(row);
         }
         let compressed = zlib_store(&raw);
-        write_chunk(&mut writer, b"IDAT", &compressed)?;
-        write_chunk(&mut writer, b"IEND", &[])?;
+        write_chunk(writer, b"IDAT", &compressed)?;
+        write_chunk(writer, b"IEND", &[])?;
         writer.flush()
     }
 
@@ -617,6 +631,23 @@ fn zlib_store(data: &[u8]) -> Vec<u8> {
     }
     out.extend_from_slice(&adler32(data).to_be_bytes());
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn png_canvas_can_encode_to_memory_with_dpi() {
+        let mut canvas = Canvas::new(16, 12, Rgba::rgb(255, 255, 255));
+        canvas.line(0, 0, 15, 11, Rgba::rgb(0, 0, 0), 1);
+
+        let bytes = canvas.encode_png_with_dpi(Some(300)).unwrap();
+
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1A\n"));
+        assert!(bytes.windows(4).any(|chunk| chunk == b"pHYs"));
+        assert!(bytes.windows(4).any(|chunk| chunk == b"IEND"));
+    }
 }
 
 fn adler32(data: &[u8]) -> u32 {

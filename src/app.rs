@@ -1174,10 +1174,28 @@ struct ExportInkDrag {
     undo_recorded: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct ExportArrowAnnotation {
+    start: [i32; 2],
+    end: [i32; 2],
+    color: Color32,
+    width: i32,
+    head_size: f32,
+    line_style: ExportArrowLineStyle,
+}
+
+#[derive(Clone, Debug)]
+struct ExportArrowDrag {
+    arrow_index: Option<usize>,
+    before_state: ExportPreviewEditState,
+    undo_recorded: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ExportPreviewTool {
     Select,
     Text,
+    Arrow,
     Brush,
     Eraser,
 }
@@ -1189,6 +1207,7 @@ struct ExportPreviewEditState {
     label_anchor_x: Vec<Option<f64>>,
     text_annotations: Vec<ExportTextAnnotation>,
     ink_strokes: Vec<ExportInkStroke>,
+    arrow_annotations: Vec<ExportArrowAnnotation>,
     arrow_size: f32,
     arrow_color_style: ExportArrowColorStyle,
     style_preset: ExportStylePreset,
@@ -1383,6 +1402,7 @@ pub struct ScopeApp {
     export_preview_undo_stack: Vec<ExportPreviewEditState>,
     export_preview_redo_stack: Vec<ExportPreviewEditState>,
     export_text_annotations: Vec<ExportTextAnnotation>,
+    export_arrow_annotations: Vec<ExportArrowAnnotation>,
     batch_export_windows: Vec<BatchExportTimeWindow>,
     batch_export_dataset_mode: BatchExportDatasetMode,
     batch_export_pane_mode: BatchExportPaneMode,
@@ -1390,6 +1410,7 @@ pub struct ScopeApp {
     export_preview_tool: ExportPreviewTool,
     export_ink_strokes: Vec<ExportInkStroke>,
     export_ink_drag: Option<ExportInkDrag>,
+    export_arrow_drag: Option<ExportArrowDrag>,
     export_brush_color: Color32,
     export_brush_width: i32,
     wheel_zoom_sensitivity: f64,
@@ -1953,6 +1974,7 @@ impl ScopeApp {
             export_preview_undo_stack: Vec::new(),
             export_preview_redo_stack: Vec::new(),
             export_text_annotations: Vec::new(),
+            export_arrow_annotations: Vec::new(),
             batch_export_windows: Vec::new(),
             batch_export_dataset_mode: BatchExportDatasetMode::Combined,
             batch_export_pane_mode: BatchExportPaneMode::Current,
@@ -1960,6 +1982,7 @@ impl ScopeApp {
             export_preview_tool: ExportPreviewTool::Select,
             export_ink_strokes: Vec::new(),
             export_ink_drag: None,
+            export_arrow_drag: None,
             export_brush_color: Color32::from_rgb(220, 20, 38),
             export_brush_width: 4,
             wheel_zoom_sensitivity: DEFAULT_WHEEL_ZOOM_SENSITIVITY,
@@ -5086,6 +5109,18 @@ impl ScopeApp {
         format!("{stem}_waveform.svg")
     }
 
+    fn default_waveform_docx_name(&self) -> String {
+        let stem = self
+            .loaded_path
+            .as_ref()
+            .and_then(|path| path.file_stem())
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.trim().is_empty())
+            .or_else(|| self.meta().map(|meta| meta.source_name.as_str()))
+            .unwrap_or("waveform");
+        format!("{stem}_waveform_report.docx")
+    }
+
     fn write_current_waveform_png(
         &self,
         path: &Path,
@@ -5104,6 +5139,99 @@ impl ScopeApp {
     ) -> Result<(), String> {
         let canvas = self.render_current_waveform_svg(selections)?;
         canvas.save_svg(path).map_err(|error| error.to_string())
+    }
+
+    fn export_report_source_name(&self) -> String {
+        self.loaded_path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| self.meta().map(|meta| meta.source_name.as_str()))
+            .unwrap_or("waveform")
+            .to_owned()
+    }
+
+    fn export_report_sample_rate(&self) -> Option<String> {
+        self.sample_rate_hz
+            .is_finite()
+            .then(|| format!("{:.3} Hz", self.sample_rate_hz))
+    }
+
+    fn export_cursor_table_for_report(
+        &self,
+        selections: &PlotSelections,
+    ) -> Option<crate::word_export::CursorTable> {
+        if !self.export_cursor_table_enabled || !(self.show_cursor_a || self.show_cursor_b) {
+            return None;
+        }
+        let labels = self.current_export_curve_labels(selections);
+        if labels.is_empty() {
+            return None;
+        }
+
+        let mut headers = vec![self.tr("变量", "Variable").to_owned()];
+        if self.show_cursor_a {
+            headers.push("Y@X1".to_owned());
+        }
+        if self.show_cursor_b {
+            headers.push("Y@X2".to_owned());
+        }
+        if self.show_cursor_a && self.show_cursor_b {
+            headers.push("ΔY".to_owned());
+        }
+
+        let value_columns = headers.len().saturating_sub(1);
+        let rows = labels
+            .into_iter()
+            .map(|label| {
+                let mut row = vec![label.name];
+                row.extend(std::iter::repeat("--".to_owned()).take(value_columns));
+                row
+            })
+            .collect();
+        Some(crate::word_export::CursorTable { headers, rows })
+    }
+
+    fn build_word_report_figure(
+        &self,
+        caption: String,
+        selections: &PlotSelections,
+    ) -> Result<crate::word_export::WordReportFigure, String> {
+        let canvas = self.render_current_waveform_canvas(selections)?;
+        let size = canvas.size();
+        let png = canvas
+            .encode_png_with_dpi(Some(self.export_dpi_value()))
+            .map_err(|error| error.to_string())?;
+        Ok(crate::word_export::WordReportFigure {
+            caption,
+            png,
+            width_px: size[0],
+            height_px: size[1],
+            cursor_table: self.export_cursor_table_for_report(selections),
+        })
+    }
+
+    fn build_word_report(
+        &self,
+        figures: Vec<crate::word_export::WordReportFigure>,
+        range_summary: String,
+    ) -> crate::word_export::WordReport {
+        let exported_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| format!("Unix {}", duration.as_secs()))
+            .unwrap_or_else(|_| "Unknown".to_owned());
+        let source_name = self.export_report_source_name();
+        crate::word_export::WordReport {
+            title: "实验波形报告".to_owned(),
+            experiment_name: source_name.clone(),
+            source_name,
+            exported_at,
+            sample_rate: self.export_report_sample_rate(),
+            time_range_summary: range_summary,
+            include_cursor_tables: self.export_cursor_table_enabled,
+            figures,
+        }
     }
 
     fn render_current_waveform_canvas(
@@ -5201,6 +5329,7 @@ impl ScopeApp {
             );
         }
         self.draw_export_text_annotations(&mut canvas);
+        self.draw_export_arrow_annotations(&mut canvas);
         self.draw_export_ink_strokes(&mut canvas);
 
         Ok((canvas, label_layout))
@@ -5293,6 +5422,7 @@ impl ScopeApp {
             );
         }
         self.draw_export_text_annotations(&mut canvas);
+        self.draw_export_arrow_annotations(&mut canvas);
         self.draw_export_ink_strokes(&mut canvas);
 
         Ok(canvas)
@@ -5530,6 +5660,7 @@ impl ScopeApp {
             label_anchor_x: self.export_label_anchor_x.clone(),
             text_annotations: self.export_text_annotations.clone(),
             ink_strokes: self.export_ink_strokes.clone(),
+            arrow_annotations: self.export_arrow_annotations.clone(),
             arrow_size: self.export_arrow_size,
             arrow_color_style: self.export_arrow_color_style,
             style_preset: ExportStylePreset::Screenshot,
@@ -5554,6 +5685,7 @@ impl ScopeApp {
         self.export_label_anchor_x = state.label_anchor_x;
         self.export_text_annotations = state.text_annotations;
         self.export_ink_strokes = state.ink_strokes;
+        self.export_arrow_annotations = state.arrow_annotations;
         self.export_arrow_size = state.arrow_size;
         self.export_arrow_color_style = state.arrow_color_style;
         let _ = state.style_preset;
@@ -5572,6 +5704,7 @@ impl ScopeApp {
         self.export_cursor_table_enabled = state.cursor_table_enabled;
         self.export_preview_drag = None;
         self.export_preview_anchor_drag = None;
+        self.export_arrow_drag = None;
         self.export_preview_dirty = true;
     }
 
@@ -5642,7 +5775,10 @@ impl ScopeApp {
         }
 
         let mut open = self.show_batch_export;
-        egui::Window::new(self.tr("批量导出波形 PNG", "Batch Export Waveform PNG"))
+        egui::Window::new(self.tr(
+            "批量导出波形 / Word",
+            "Batch Export Waveform / Word",
+        ))
             .open(&mut open)
             .default_width(760.0)
             .resizable(true)
@@ -5758,6 +5894,12 @@ impl ScopeApp {
                         .clicked()
                     {
                         self.run_batch_waveform_png_export();
+                    }
+                    if ui
+                        .button(self.tr("选择文件并导出 Word", "Choose File and Export Word"))
+                        .clicked()
+                    {
+                        self.run_batch_waveform_word_export();
                     }
                     if let Some(summary) = &self.batch_export_last_summary {
                         ui.label(summary);
@@ -5935,6 +6077,7 @@ impl ScopeApp {
 
                 let select_tool_label = self.tr("选择", "Select").to_owned();
                 let text_tool_label = self.tr("文字", "Text").to_owned();
+                let arrow_tool_label = self.tr("箭头", "Arrow").to_owned();
                 let brush_tool_label = self.tr("画笔", "Brush").to_owned();
                 let eraser_tool_label = self.tr("橡皮", "Eraser").to_owned();
                 let pen_width_label = self.tr("笔宽", "Pen").to_owned();
@@ -5954,6 +6097,11 @@ impl ScopeApp {
                         self.export_preview_tool = ExportPreviewTool::Text;
                         ctx.request_repaint();
                     }
+                    ui.selectable_value(
+                        &mut self.export_preview_tool,
+                        ExportPreviewTool::Arrow,
+                        arrow_tool_label.as_str(),
+                    );
                     ui.selectable_value(
                         &mut self.export_preview_tool,
                         ExportPreviewTool::Brush,
@@ -6073,6 +6221,9 @@ impl ScopeApp {
                     if ui.button(self.tr("保存 SVG", "Save SVG")).clicked() {
                         self.save_export_preview_svg();
                     }
+                    if ui.button(self.tr("导出 Word", "Export Word")).clicked() {
+                        self.save_export_preview_word();
+                    }
                     if self.export_preview_size != [0, 0] {
                         let dpi = self.export_dpi_value() as f32;
                         ui.label(format!(
@@ -6121,6 +6272,7 @@ impl ScopeApp {
             self.export_preview_drag = None;
             self.export_preview_anchor_drag = None;
             self.export_preview_text_drag = None;
+            self.export_arrow_drag = None;
             self.export_preview_edit_label_index = None;
             self.export_preview_edit_label_focus_pending = false;
             self.export_preview_edit_text_index = None;
@@ -6135,6 +6287,10 @@ impl ScopeApp {
         ctx: &egui::Context,
     ) {
         if scale <= 0.0 {
+            return;
+        }
+        if self.export_preview_tool == ExportPreviewTool::Arrow {
+            self.export_preview_arrow_interactions(ui, image_rect, scale, ctx);
             return;
         }
         if matches!(
@@ -6324,6 +6480,71 @@ impl ScopeApp {
         self.export_preview_text_interactions(ui, image_rect, scale, ctx);
     }
 
+    fn export_preview_arrow_interactions(
+        &mut self,
+        ui: &mut egui::Ui,
+        image_rect: egui::Rect,
+        scale: f32,
+        ctx: &egui::Context,
+    ) {
+        let id = ui.id().with("export_preview_arrow_tool");
+        let response = ui.interact(image_rect, id, egui::Sense::click_and_drag());
+        if response.hovered() {
+            ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::Crosshair);
+        }
+        if response.drag_started_by(PointerButton::Primary) {
+            let Some(pointer_pos) = response.interact_pointer_pos() else {
+                return;
+            };
+            let canvas_pos = Self::preview_pos_to_canvas(image_rect, scale, pointer_pos);
+            let before = self.export_preview_state();
+            self.export_arrow_annotations.push(ExportArrowAnnotation {
+                start: canvas_pos,
+                end: canvas_pos,
+                color: self.export_brush_color,
+                width: self.export_brush_width.clamp(1, 32),
+                head_size: self.export_arrow_size,
+                line_style: self.export_arrow_line_style,
+            });
+            self.export_arrow_drag = Some(ExportArrowDrag {
+                arrow_index: self.export_arrow_annotations.len().checked_sub(1),
+                before_state: before,
+                undo_recorded: false,
+            });
+        }
+        if response.dragged_by(PointerButton::Primary) {
+            let Some(pointer_pos) = response.interact_pointer_pos() else {
+                return;
+            };
+            let canvas_pos = Self::preview_pos_to_canvas(image_rect, scale, pointer_pos);
+            let before = self.export_arrow_drag.as_mut().and_then(|drag| {
+                if !drag.undo_recorded {
+                    drag.undo_recorded = true;
+                    Some(drag.before_state.clone())
+                } else {
+                    None
+                }
+            });
+            if let Some(index) = self
+                .export_arrow_drag
+                .as_ref()
+                .and_then(|drag| drag.arrow_index)
+            {
+                if let Some(arrow) = self.export_arrow_annotations.get_mut(index) {
+                    arrow.end = canvas_pos;
+                }
+            }
+            if let Some(before) = before {
+                self.push_export_preview_undo(before);
+            }
+            self.mark_export_preview_dirty();
+            ctx.request_repaint();
+        }
+        if response.drag_stopped_by(PointerButton::Primary) {
+            self.export_arrow_drag = None;
+        }
+    }
+
     fn export_preview_ink_interactions(
         &mut self,
         ui: &mut egui::Ui,
@@ -6390,7 +6611,7 @@ impl ScopeApp {
                     self.export_ink_strokes
                         .retain(|stroke| !Self::stroke_near_point(stroke, canvas_pos, radius));
                 }
-                ExportPreviewTool::Select | ExportPreviewTool::Text => {}
+                ExportPreviewTool::Select | ExportPreviewTool::Text | ExportPreviewTool::Arrow => {}
             }
             if let Some(drag) = self.export_ink_drag.as_mut() {
                 if !drag.undo_recorded {
@@ -6758,6 +6979,49 @@ impl ScopeApp {
         }
     }
 
+    fn save_export_preview_word(&mut self) {
+        let selections = self.current_plot_selections();
+        let Some(mut path) = rfd::FileDialog::new()
+            .add_filter(self.tr("Word 报告", "Word report"), &["docx"])
+            .set_file_name(self.default_waveform_docx_name())
+            .save_file()
+        else {
+            return;
+        };
+        if path.extension().is_none() {
+            path.set_extension("docx");
+        }
+
+        let range = match self.export_time_range() {
+            Ok((start, end)) => format!("{start:.6}s - {end:.6}s"),
+            Err(error) => {
+                self.export_preview_error = Some(error);
+                return;
+            }
+        };
+        let figure =
+            match self.build_word_report_figure(format!("图 1：当前波形 {range}"), &selections) {
+                Ok(figure) => figure,
+                Err(error) => {
+                    self.export_preview_error = Some(error.clone());
+                    self.last_error = Some(match self.language {
+                        Language::Zh => format!("导出 Word 报告失败: {error}"),
+                        Language::En => format!("Failed to export Word report: {error}"),
+                    });
+                    return;
+                }
+            };
+        let report = self.build_word_report(vec![figure], range);
+        if let Err(error) = crate::word_export::write_word_report(&path, &report) {
+            let message = error.to_string();
+            self.export_preview_error = Some(message.clone());
+            self.last_error = Some(match self.language {
+                Language::Zh => format!("导出 Word 报告失败: {message}"),
+                Language::En => format!("Failed to export Word report: {message}"),
+            });
+        }
+    }
+
     fn add_export_text_annotation_at(&mut self, position: [i32; 2]) {
         let before = self.export_preview_state();
         let scale = Self::effective_export_label_scale(self.export_label_scale);
@@ -6800,6 +7064,22 @@ impl ScopeApp {
                 Self::export_color(annotation.color),
                 annotation.scale,
                 TextStyle::Outline,
+            );
+        }
+    }
+
+    fn draw_export_arrow_annotations<C: WaveformCanvas>(&self, canvas: &mut C) {
+        for arrow in &self.export_arrow_annotations {
+            canvas.arrow(
+                arrow.start[0],
+                arrow.start[1],
+                arrow.end[0],
+                arrow.end[1],
+                Self::export_color(arrow.color),
+                arrow.head_size
+                    .clamp(MIN_EXPORT_ARROW_SIZE, MAX_EXPORT_ARROW_SIZE),
+                arrow.width.max(1),
+                arrow.line_style.stroke_style(),
             );
         }
     }
@@ -6935,6 +7215,144 @@ impl ScopeApp {
                 Language::Zh => format!("批量导出部分失败:\n{}", errors.join("\n")),
                 Language::En => format!("Batch export partially failed:\n{}", errors.join("\n")),
             });
+        }
+    }
+
+    fn enabled_batch_export_windows(&self) -> Vec<(usize, f64, f64)> {
+        self.batch_export_windows
+            .iter()
+            .enumerate()
+            .filter(|(_, window)| window.enabled)
+            .map(|(index, window)| {
+                (
+                    index + 1,
+                    window.start.min(window.end),
+                    window.start.max(window.end),
+                )
+            })
+            .collect()
+    }
+
+    fn run_batch_waveform_word_export(&mut self) {
+        let windows = self.enabled_batch_export_windows();
+        if windows.is_empty() {
+            self.batch_export_last_summary = Some(
+                self.tr(
+                    "请至少启用一个时间窗口。",
+                    "Enable at least one time window.",
+                )
+                .to_owned(),
+            );
+            return;
+        }
+        if windows
+            .iter()
+            .any(|(_, start, end)| !start.is_finite() || !end.is_finite() || end <= start)
+        {
+            self.batch_export_last_summary = Some(
+                self.tr("时间窗口无效。", "One or more time windows are invalid.")
+                    .to_owned(),
+            );
+            return;
+        }
+
+        let Some(mut path) = rfd::FileDialog::new()
+            .add_filter(self.tr("Word 报告", "Word report"), &["docx"])
+            .set_file_name(self.default_waveform_docx_name())
+            .save_file()
+        else {
+            return;
+        };
+        if path.extension().is_none() {
+            path.set_extension("docx");
+        }
+
+        let saved_time_range_mode = self.export_time_range_mode;
+        let saved_manual_start = self.export_manual_start;
+        let saved_manual_end = self.export_manual_end;
+        let saved_pane_scope = self.export_pane_scope;
+        let saved_active_pane = self.active_scope_pane;
+        let saved_label_overrides = self.export_label_overrides.clone();
+        let saved_label_positions = self.export_label_positions.clone();
+        let saved_label_anchor_x = self.export_label_anchor_x.clone();
+
+        self.export_time_range_mode = ExportTimeRangeMode::Manual;
+        self.export_label_overrides.clear();
+        self.export_label_positions.clear();
+        self.export_label_anchor_x.clear();
+
+        let source_pane_count = self.scope_layout_rows.clamp(1, MAX_SCOPE_LAYOUT_ROWS)
+            * self.scope_layout_cols.clamp(1, MAX_SCOPE_LAYOUT_COLS);
+        let pane_jobs = self.batch_export_pane_jobs(source_pane_count);
+        let dataset_jobs = self.batch_export_dataset_jobs();
+        let mut figures = Vec::new();
+        let mut build_error = None;
+
+        'build: for (window_index, start, end) in windows {
+            self.export_manual_start = start;
+            self.export_manual_end = end;
+            for (dataset_slug, selections) in &dataset_jobs {
+                if Self::plot_selection_curve_count(selections) == 0 {
+                    continue;
+                }
+                for (pane_slug, pane_scope, active_pane) in &pane_jobs {
+                    self.export_pane_scope = *pane_scope;
+                    self.active_scope_pane =
+                        (*active_pane).min(source_pane_count.saturating_sub(1));
+                    let caption = format!(
+                        "图 {}：窗口 #{window_index} {start:.6}s - {end:.6}s {dataset_slug} {pane_slug}",
+                        figures.len() + 1
+                    );
+                    match self.build_word_report_figure(caption, selections) {
+                        Ok(figure) => figures.push(figure),
+                        Err(error) => {
+                            build_error = Some(error);
+                            break 'build;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.export_time_range_mode = saved_time_range_mode;
+        self.export_manual_start = saved_manual_start;
+        self.export_manual_end = saved_manual_end;
+        self.export_pane_scope = saved_pane_scope;
+        self.active_scope_pane = saved_active_pane;
+        self.export_label_overrides = saved_label_overrides;
+        self.export_label_positions = saved_label_positions;
+        self.export_label_anchor_x = saved_label_anchor_x;
+
+        if let Some(error) = build_error {
+            self.batch_export_last_summary = Some(match self.language {
+                Language::Zh => format!("Word 导出失败: {error}"),
+                Language::En => format!("Word export failed: {error}"),
+            });
+            return;
+        }
+        if figures.is_empty() {
+            self.batch_export_last_summary = Some(
+                self.tr("没有可导出的波形图。", "No figures to export.")
+                    .to_owned(),
+            );
+            return;
+        }
+
+        let figure_count = figures.len();
+        let report = self.build_word_report(figures, format!("{figure_count} 个窗口"));
+        match crate::word_export::write_word_report(&path, &report) {
+            Ok(()) => {
+                self.batch_export_last_summary = Some(match self.language {
+                    Language::Zh => format!("已导出 Word 报告，共 {figure_count} 张图。"),
+                    Language::En => format!("Exported Word report with {figure_count} figures."),
+                });
+            }
+            Err(error) => {
+                self.batch_export_last_summary = Some(match self.language {
+                    Language::Zh => format!("Word 导出失败: {error}"),
+                    Language::En => format!("Word export failed: {error}"),
+                });
+            }
         }
     }
 
@@ -12756,13 +13174,15 @@ impl ScopeApp {
                         ui.label("测量：右侧表格显示 X1-X2 区间内已选通道的 Y1、Y2、dY、最大值和最小值，结果使用通道变比后的值。");
 
                         ui.separator();
-                        ui.heading("波形图片导出");
-                        ui.label("导出波形图片 PNG：从顶部菜单打开当前示波器视图的导出预览，不会直接保存文件。预览中保留当前波形、光标、X 轴坐标、变量标注和可选的光标数据表。");
-                        ui.label("导出预览工具栏：选择工具可在整张导出图内拖动变量名和箭头锚点；双击变量名可在原位置直接编辑；文字工具会进入放置模式，点击预览图选择文字位置后再编辑内容；画笔可手写标注；橡皮可擦除画笔笔迹。");
-                        ui.label("撤销/重做：拖动变量名、移动锚点、改变量名、改箭头样式、添加文字、画笔和橡皮操作都可撤销或重做。");
-                        ui.label("箭头与标注：可在预览窗口设置箭头大小、实线/虚线/点线/粗箭头/双线箭头、标注颜色、变量名字号和字体。变量名和文字标注字号支持 1-8 档。箭头尖默认吸附并指向曲线。");
+                        ui.heading("波形图片与报告导出");
+                        ui.label("导出波形图片 PNG：从顶部菜单打开当前示波器视图的导出标注台，不会直接保存文件。预览中保留当前波形、光标、X 轴坐标、变量标注和可选的光标数据表。");
+                        ui.label("导出标注台提供选择、文字、箭头、画笔、橡皮、撤销和重做。变量名箭头会自动吸附曲线，拖动变量名时箭头会跟随变化。");
+                        ui.label("文字工具会进入放置模式，点击预览图选择文字位置后再编辑内容；箭头工具可自由标注故障点和实验现象；画笔可手写标注；橡皮可擦除画笔笔迹。");
+                        ui.label("撤销/重做：拖动变量名、移动锚点、改变量名、改箭头样式、添加文字、添加箭头、画笔和橡皮操作都可撤销或重做。");
+                        ui.label("箭头与标注：可在预览窗口设置箭头大小、实线/虚线/点线/粗箭头/双线箭头、标注颜色、变量名字号和字体。变量名和文字标注字号支持 1-8 档。变量箭头尖默认吸附并指向曲线。");
                         ui.label("导出设置：在选项中可设置分辨率、DPI、导出子窗口范围、时间范围和是否显示光标数据表；DPI 支持预设，也可手动输入数值。导出风格固定为示波器截图风格。");
-                        ui.label("批量导出波形 PNG：在选项中勾选“批量导出波形 PNG”打开批量导出窗口，可按当前视图、X1-X2 区间或手动时间窗口批量保存 PNG。批量导出会沿用当前分辨率、DPI、箭头和标注设置。");
+                        ui.label("批量导出波形 / Word：在选项中打开批量导出窗口，可按当前视图、X1-X2 区间或手动时间窗口批量保存 PNG，或把多张已标注波形图写入同一个 Word 报告。");
+                        ui.label("Word 报告使用内置简洁模板，光标数据表可在导出设置中选择显示或隐藏。第一版不导入外部 Word 模板。");
 
                         ui.separator();
                         ui.heading("FFT 和 THD");
@@ -12816,13 +13236,15 @@ impl ScopeApp {
                         ui.label("Left-click the plot to move the nearest cursor. Drag with the left button to zoom a time range. Right-click for the cursor menu; right-drag pans the current view.");
 
                         ui.separator();
-                        ui.heading("Waveform Image Export");
-                        ui.label("Export Waveform PNG opens an export preview for the current scope view instead of saving immediately. The preview keeps waveform traces, cursors, X-axis cursor labels, variable annotations, and the optional cursor data table.");
-                        ui.label("Preview toolbar: Select drags variable labels anywhere within the exported image and adjusts arrow anchors; double-click a variable label to edit it in place; Text enters placement mode so you can click the preview image to choose where the new note is inserted; Brush draws freehand marks; Eraser removes brush strokes.");
-                        ui.label("Undo and redo cover label moves, anchor moves, label edits, arrow style changes, text notes, brush strokes, and eraser actions.");
+                        ui.heading("Waveform Image and Report Export");
+                        ui.label("Export Waveform PNG opens an annotation workspace for the current scope view instead of saving immediately. The preview keeps waveform traces, cursors, X-axis cursor labels, variable annotations, and the optional cursor data table.");
+                        ui.label("The export workspace provides select, text, arrow, brush, eraser, undo, and redo tools. Variable arrows stay attached to curves and update as labels move.");
+                        ui.label("Text enters placement mode; Arrow creates free experiment notes such as fault points; Brush draws freehand marks; Eraser removes brush strokes.");
+                        ui.label("Undo and redo cover label moves, anchor moves, label edits, arrow style changes, text notes, manual arrows, brush strokes, and eraser actions.");
                         ui.label("Arrows and labels can be configured in the preview: arrow size, solid/dashed/dotted/thick/double arrows, annotation color, variable label size, and label font. Variable labels and text notes support size levels 1-8. Arrow tips stay snapped to the curve by default.");
                         ui.label("Export settings in Options control resolution, DPI, scope pane range, time range, and the cursor data table. DPI can use presets or a custom typed value. The image style is fixed to the oscilloscope screenshot style.");
-                        ui.label("Batch Export Waveform PNG is opened from the checkbox in Options. It can save PNGs for the current view, X1-X2, or manual time windows, and uses the current resolution, DPI, arrow, and label settings.");
+                        ui.label("Batch Export Waveform / Word can save PNGs for the current view, X1-X2, or manual time windows, or write multiple annotated waveform images into one Word report.");
+                        ui.label("Word report export uses the built-in simple template. Cursor data tables can be shown or hidden from export settings. External Word templates are not imported in this version.");
 
                         ui.separator();
                         ui.heading("FFT and THD");
@@ -12890,7 +13312,7 @@ impl ScopeApp {
                 ui.heading(self.t(UiText::ImageExportLabels));
                 let mut batch_export_checked = self.show_batch_export;
                 let batch_export_label =
-                    self.tr("批量导出波形 PNG", "Batch Export Waveform PNG");
+                    self.tr("批量导出波形 / Word", "Batch Export Waveform / Word");
                 if ui
                     .checkbox(&mut batch_export_checked, batch_export_label)
                     .changed()

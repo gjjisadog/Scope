@@ -1,10 +1,12 @@
 mod app;
 mod data;
+mod export_annotation;
 mod fft;
 mod png_export;
 mod svg_export;
 mod transforms;
 mod vscode_bridge;
+mod word_export;
 
 #[cfg(test)]
 mod perf_tests;
