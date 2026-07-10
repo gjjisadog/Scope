@@ -632,7 +632,6 @@ mod tests {
     fn recording_bypasses_a_backpressured_display_queue() {
         let simulator = SimulatorHandle::spawn(SimulatorConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
-            accelerated: true,
             ..SimulatorConfig::default()
         })
         .unwrap();

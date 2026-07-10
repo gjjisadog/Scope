@@ -45,7 +45,7 @@ Normal/Single 触发命中后，中央波形显示完整 pre/post capture；`Arm
 - `Connect` 失败：确认模拟器显示 `listening on 127.0.0.1:19090`，或串口未被其他程序占用。
 - 一直停在 Handshaking：检查 DSP 是否按顺序返回非零 session_id 的 HELLO_ACK 与 CHANNEL_TABLE，并使用 SCP1 CRC32C。
 - Configure 被拒绝：采样率不得超过设备 `tick_hz`，批量不得超过 `max_batch_samples`，至少选择一个且只能选择通道表内的通道。
-- 3 秒后断开：设备必须持续发送有效帧或响应每秒 PING；CRC 错误帧不计作有效心跳。
+- 3 秒后断开：客户端与设备都应每秒主动发送 PING 并回送同 nonce 的 PONG；CRC 错误帧不计作有效心跳。
 - 波形有断点：查看 Host drops、Sequence gaps、Device drops 和 CRC 统计；客户端不会跨 gap 画连线。
 - 录波意外中断：重新打开 `.scope` 会扫描并恢复最后一个完整记录；中间 CRC 损坏仍会拒绝，避免静默展示错误数据。
 

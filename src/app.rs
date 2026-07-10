@@ -20592,6 +20592,64 @@ mod tests {
     }
 
     #[test]
+    fn opens_scope_recording_through_the_application_dispatch_path() {
+        use scope_analyzer::live::{
+            protocol::{
+                ChannelDescriptor, ChannelKind, ChannelTable, Frame, Message, SampleBatch,
+                WireFormat, MSG_SAMPLE_BATCH,
+            },
+            recording::{RecordingMetadata, ScopeWriter},
+        };
+
+        let dir = unique_test_dir("scope_dispatch");
+        let path = dir.join("capture.scope");
+        let metadata = RecordingMetadata {
+            device_id: "app-test".to_owned(),
+            firmware_name: "test".to_owned(),
+            tick_hz: 1_000,
+            channel_table: ChannelTable {
+                revision: 1,
+                channels: vec![ChannelDescriptor {
+                    channel_id: 0,
+                    kind: ChannelKind::Analog,
+                    wire_format: WireFormat::I16,
+                    scale: 0.5,
+                    offset: 1.0,
+                    unit: "V".to_owned(),
+                    name: "DSP-A".to_owned(),
+                }],
+            },
+            sample_rate_hz: 10,
+            batch_samples: 2,
+            channel_mask: 1,
+            client_version: "app-test".to_owned(),
+        };
+        let payload = Message::SampleBatch(SampleBatch {
+            channel_table_revision: 1,
+            first_sample_index: 0,
+            sample_period_ticks: 100,
+            sample_count: 2,
+            channel_ids: vec![0],
+            sample_data: [2_i16.to_le_bytes(), 4_i16.to_le_bytes()].concat(),
+        })
+        .encode_payload()
+        .unwrap();
+        let frame = Frame::new(MSG_SAMPLE_BATCH, 0, 1, 7, 0, payload);
+        let mut writer = ScopeWriter::create(&path, metadata).unwrap();
+        writer.write_sample_frame(&frame).unwrap();
+        writer.finish().unwrap();
+
+        let opened = ScopeApp::open_waveform_file_with_cancel(&path, 48_000.0, None).unwrap();
+
+        assert_eq!(opened.kind, SourceKind::Scope);
+        assert_eq!(opened.source.metadata().source_name, "capture.scope");
+        assert_eq!(opened.source.metadata().channels[0].name, "DSP-A");
+        let block = opened.source.read_range(0.0, 0.1, &[0], 10).unwrap();
+        assert_eq!(block.channels[0], vec![2.0, 3.0]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn opens_indexed_adata_ddata_pair_without_sequence_column_and_merges_first_three_bits() {
         let dir = unique_test_dir("indexed_pair");
         let analog_path = dir.join("Tab1_ADATA.csv");

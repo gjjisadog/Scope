@@ -1379,6 +1379,26 @@ mod tests {
     }
 
     #[test]
+    fn decoder_rejects_oversized_candidate_and_resynchronizes_to_next_frame() {
+        let mut oversized = vec![0_u8; FRAME_HEADER_LEN];
+        oversized[..4].copy_from_slice(&FRAME_MAGIC);
+        oversized[4] = PROTOCOL_VERSION;
+        oversized[5] = MSG_SAMPLE_BATCH;
+        oversized[12..16].copy_from_slice(&((MAX_PAYLOAD_LEN as u32) + 1).to_le_bytes());
+        let valid = Frame::new(MSG_PING, 0, 42, 7, 0, 9_u64.to_le_bytes().to_vec())
+            .encode()
+            .unwrap();
+        oversized.extend_from_slice(&valid);
+        let mut decoder = FrameDecoder::default();
+
+        decoder.push(&oversized);
+
+        assert_eq!(decoder.drain_frames(), vec![Frame::decode(&valid).unwrap()]);
+        assert_eq!(decoder.stats().malformed_headers, 1);
+        assert!(decoder.stats().discarded_bytes >= FRAME_HEADER_LEN as u64);
+    }
+
+    #[test]
     fn hello_message_round_trips() {
         let message = Message::Hello(Hello {
             client_capabilities: 0b111,

@@ -1046,6 +1046,23 @@ mod tests {
         )
     }
 
+    fn append_raw_record(path: &Path, record_type: u8, timestamp_ticks: u64, payload: &[u8]) {
+        let mut header = Vec::with_capacity(16);
+        header.push(record_type);
+        header.push(0);
+        header.extend_from_slice(&0_u16.to_le_bytes());
+        header.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        header.extend_from_slice(&timestamp_ticks.to_le_bytes());
+        let mut body = header.clone();
+        body.extend_from_slice(payload);
+        let checksum = crc32c(&body);
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(&RECORD_MAGIC).unwrap();
+        file.write_all(&body).unwrap();
+        file.write_all(&checksum.to_le_bytes()).unwrap();
+        file.flush().unwrap();
+    }
+
     fn trigger_capture() -> TriggerCapture {
         TriggerCapture {
             channel_ids: vec![0],
@@ -1108,6 +1125,65 @@ mod tests {
     }
 
     #[test]
+    fn scope_data_source_preserves_requested_order_for_reordered_wire_channels() {
+        let path = unique_path("channel_order");
+        let mut recording_metadata = metadata();
+        recording_metadata
+            .channel_table
+            .channels
+            .push(ChannelDescriptor {
+                channel_id: 2,
+                kind: ChannelKind::Analog,
+                wire_format: WireFormat::I16,
+                scale: 0.1,
+                offset: 0.0,
+                unit: "A".to_owned(),
+                name: "Ib".to_owned(),
+            });
+        recording_metadata.channel_mask = 0b101;
+        recording_metadata.batch_samples = 3;
+        let mut sample_data = Vec::new();
+        for (id_2, id_0) in [(20_i16, 1_i16), (40, 3), (60, 5)] {
+            sample_data.extend_from_slice(&id_2.to_le_bytes());
+            sample_data.extend_from_slice(&id_0.to_le_bytes());
+        }
+        let message = Message::SampleBatch(SampleBatch {
+            channel_table_revision: 1,
+            first_sample_index: 0,
+            sample_period_ticks: 100,
+            sample_count: 3,
+            channel_ids: vec![2, 0],
+            sample_data,
+        });
+        let frame = Frame::new(
+            MSG_SAMPLE_BATCH,
+            0,
+            1,
+            7,
+            0,
+            message.encode_payload().unwrap(),
+        );
+        let mut writer = ScopeWriter::create(&path, recording_metadata).unwrap();
+        writer.write_sample_frame(&frame).unwrap();
+        writer.finish().unwrap();
+
+        let source = ScopeRecordingDataSource::open(&path).unwrap();
+        assert_eq!(
+            source
+                .metadata()
+                .channels
+                .iter()
+                .map(|channel| channel.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Ua", "Ib"]
+        );
+        let block = source.read_range(0.0, 0.2, &[1, 0], 10).unwrap();
+        assert_eq!(block.channels[0], vec![2.0, 4.0, 6.0]);
+        assert_eq!(block.channels[1], vec![1.0, 3.0, 5.0]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn recording_recovers_a_truncated_final_record() {
         let path = unique_path("truncated");
         let mut writer = ScopeWriter::create(&path, metadata()).unwrap();
@@ -1161,6 +1237,44 @@ mod tests {
         assert!(matches!(
             ScopeRecording::open(&path),
             Err(RecordingError::InvalidFormat(message)) if message.contains("CRC")
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recording_rejects_oversized_metadata_before_allocating_it() {
+        let path = unique_path("oversized_metadata");
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&FILE_MAGIC).unwrap();
+        file.write_all(&FILE_VERSION.to_le_bytes()).unwrap();
+        file.write_all(&FILE_HEADER_LEN.to_le_bytes()).unwrap();
+        file.write_all(&((MAX_METADATA_LEN + 1) as u32).to_le_bytes())
+            .unwrap();
+        file.write_all(&0_u64.to_le_bytes()).unwrap();
+        file.write_all(&0_u32.to_le_bytes()).unwrap();
+        file.write_all(&0_u32.to_le_bytes()).unwrap();
+        drop(file);
+
+        assert!(matches!(
+            ScopeRecording::open(&path),
+            Err(RecordingError::InvalidFormat(message)) if message.contains("metadata length")
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recording_rejects_invalid_embedded_sample_batch_with_valid_crcs() {
+        let path = unique_path("invalid_sample_batch");
+        drop(ScopeWriter::create(&path, metadata()).unwrap());
+        let mut frame = sample_frame(1, 0, 0, &[1, 2]);
+        frame.payload[16..18].copy_from_slice(&3_u16.to_le_bytes());
+        let encoded = frame.encode().unwrap();
+        append_raw_record(&path, RECORD_SAMPLE_FRAME, 0, &encoded);
+
+        assert!(matches!(
+            ScopeRecording::open(&path),
+            Err(RecordingError::Protocol(ProtocolError::InvalidPayload(message)))
+                if message.contains("sample data length mismatch")
         ));
         let _ = std::fs::remove_file(path);
     }

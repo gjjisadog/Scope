@@ -6,7 +6,7 @@ use std::{
         Arc, Mutex,
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use thiserror::Error;
@@ -90,6 +90,8 @@ pub struct SimulatorStats {
     pub start_requests: u64,
     pub stop_requests: u64,
     pub ping_requests: u64,
+    pub pings_sent: u64,
+    pub pongs_received: u64,
     pub emitted_batches: u64,
 }
 
@@ -195,6 +197,8 @@ fn serve_client(
     let mut first_sample_index = 0_u64;
     let mut emitted_batches = 0_u64;
     let table = simulator_channel_table();
+    let mut last_ping = Instant::now();
+    let mut ping_nonce = 1_u64;
 
     while !stop.load(Ordering::Relaxed) {
         match stream.read(&mut read_buffer) {
@@ -285,6 +289,9 @@ fn serve_client(
                             });
                             send_message(&mut stream, &mut out_sequence, Message::Pong(nonce), 0)?;
                         }
+                        Message::Pong(_) => update_stats(stats, |stats| {
+                            stats.pongs_received = stats.pongs_received.saturating_add(1)
+                        }),
                         _ => {}
                     }
                 }
@@ -295,6 +302,15 @@ fn serve_client(
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) => {}
             Err(error) => return Err(error.into()),
+        }
+
+        if last_ping.elapsed() >= Duration::from_secs(1) {
+            send_message(&mut stream, &mut out_sequence, Message::Ping(ping_nonce), 0)?;
+            ping_nonce = ping_nonce.wrapping_add(1);
+            last_ping = Instant::now();
+            update_stats(stats, |stats| {
+                stats.pings_sent = stats.pings_sent.saturating_add(1)
+            });
         }
 
         if state == DeviceState::Streaming {
@@ -332,7 +348,7 @@ fn serve_client(
                     f64::from(configured.batch_samples) / f64::from(configured.sample_rate_hz),
                 ));
             } else {
-                thread::sleep(Duration::from_millis(1));
+                thread::yield_now();
             }
         }
     }

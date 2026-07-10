@@ -557,7 +557,15 @@ fn worker_loop(
                     stats.device_tx_overruns = u64::from(status.tx_overruns);
                     let _ = data_tx.try_send(SessionEvent::Stats(stats));
                 }
-                Message::Pong(_) | Message::Ping(_) => {}
+                Message::Ping(nonce) => {
+                    write_message(
+                        &mut transport,
+                        &mut out_sequence,
+                        session_id,
+                        Message::Pong(nonce),
+                    )?;
+                }
+                Message::Pong(_) => {}
                 _ => {}
             }
         }
@@ -927,5 +935,36 @@ mod tests {
 
         assert_eq!(simulator.stats().connections, 2);
         assert_eq!(simulator.stats().hello_requests, 2);
+    }
+
+    #[test]
+    fn client_and_device_exchange_bidirectional_heartbeats() {
+        let simulator = SimulatorHandle::spawn(SimulatorConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            ..SimulatorConfig::default()
+        })
+        .unwrap();
+        let session = LiveSession::connect(TransportConfig::Tcp {
+            address: simulator.address().to_string(),
+        })
+        .unwrap();
+        wait_for(&session, Duration::from_secs(2), |event| {
+            matches!(event, SessionEvent::State(ConnectionState::Ready))
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while (simulator.stats().ping_requests == 0
+            || simulator.stats().pings_sent == 0
+            || simulator.stats().pongs_received == 0)
+            && Instant::now() < deadline
+        {
+            let _ = session.recv_timeout(Duration::from_millis(50));
+        }
+
+        let stats = simulator.stats();
+        assert!(stats.ping_requests > 0, "device must receive client PING");
+        assert!(stats.pings_sent > 0, "device must initiate PING");
+        assert!(stats.pongs_received > 0, "client must answer device PING");
+        session.disconnect().unwrap();
     }
 }

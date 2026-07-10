@@ -10,7 +10,7 @@ SCP1 是 DSP 与 Scope Analyzer 之间的双向二进制字节流协议。TCP �
 - 串口：8 数据位、无校验、1 停止位、无流控；波特率由用户配置。
 - 接收端必须支持拆包、粘包和 magic 重同步。
 - 单帧 payload 最大 1 MiB；通道数 1..64；单批样点数 1..4096。
-- 空闲连接每秒发送一次 PING；客户端连续 3 秒收不到有效帧即判定失联。
+- 会话建立后客户端与 DSP 双方都必须每秒发送一次 PING，并立即用相同 nonce 回复 PONG；客户端连续 3 秒收不到任何有效帧即判定失联。
 
 ## 2. 帧格式
 
@@ -124,7 +124,7 @@ sample_rate_hz=20000;batch_samples=64;channel_mask=0x000000000000000f
 
 ### PING / PONG (`0x14` / `0x15`)
 
-`u64 nonce`。PONG 必须原样返回收到的 nonce。
+`u64 nonce`。双方均主动发送 PING；PONG 必须原样返回收到的 nonce。心跳与采样并行，Streaming 状态也不能停止心跳。
 
 ### SAMPLE_BATCH (`0x20`)
 

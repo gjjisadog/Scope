@@ -4,7 +4,7 @@
 
 ## 当前里程碑
 
-里程碑 9：完成性复审与 V1 互操作/运行时缺口补齐。
+里程碑 10：V1 完成性审计、全量发布门禁与分支交付。
 
 ## 已完成内容
 
@@ -64,6 +64,10 @@
 - 触发 UI 已补齐 Auto timeout 样点数、命中样点/超时标记和统一重新布防；Normal/Single 使用完整 pre/post capture 冻结显示，倍率只影响绘图不改变工程值触发判定。
 - 链路统计已补齐 CRC、discarded bytes、unknown messages、device drops/overruns；录波统计显示已写 SampleFrame/Gap/Trigger、总记录和 pending，并在结束录波后保留最终值。
 - 实时快照的 `max_points` 现在是所有 gap segment 共享的总预算；多段历史不再各自使用完整预算。触发完成后继续消费同一 SAMPLE_BATCH 的剩余样点，保留下一次 pre-trigger 历史。
+- 客户端与模拟器现已在会话建立后双向每秒主动发送 PING，并分别回复同 nonce 的 PONG；Streaming 状态不暂停心跳，3 秒有效帧超时规则保持不变。
+- 模拟器 `--accelerated` 已改为不做定时 sleep 的加速时钟，只通过 `yield_now` 让出线程；按墙钟演示仍使用默认实时模式。
+- 补齐 `.scope` 防御性与集成验证：超限元数据在分配前拒绝、内外 CRC 正确但 SAMPLE_BATCH 内容非法仍拒绝、回放保持调用方请求的通道顺序，桌面应用扩展名分派实际返回独立 `ScopeRecordingDataSource`。
+- SCP1 增量解析器新增超大 payload 候选后的重同步验证，非法候选不会阻塞其后的有效帧。
 
 ## 测试结果
 
@@ -121,6 +125,16 @@
 - `cargo +1.87.0 test --lib live::buffer::tests`：4/4 通过；`cargo +1.87.0 test --lib live::trigger::tests`：6/6 通过。
 - `cargo +1.87.0 test --lib live::state::tests`：5/5 通过，包括 Normal capture 冻结显示、倍率计算和重布防清除 capture。
 - `cargo +1.87.0 test --bin scope_analyzer app::tests::scope_app_live_state_defaults_to_offline_workspace`：通过，完整桌面测试目标编译成功。
+- 双向心跳 TDD RED：测试因模拟器缺少主动 PING/PONG 计数而编译失败；实现后客户端主动心跳、设备主动心跳及双方响应均通过 TCP loopback 验证。
+- `.scope` 新增超限元数据、非法内嵌 SAMPLE_BATCH、重排 wire channel/请求顺序测试；协议新增超大候选帧重同步测试，目标测试全部通过。
+- `cargo +1.87.0 test --bin scope_analyzer opens_scope_recording_through_the_application_dispatch_path`：1/1 通过，验证 `.scope` 主应用分派、元数据和工程值读取。
+- 无睡眠加速模式首次使 700 ms UI 背压测试超过模拟器 500 ms TCP 写超时；该测试改用墙钟实时模式来隔离“显示队列满但采集/录波继续”这一目标后通过，加速模式仍由其他 loopback/故障测试覆盖。
+- `cargo +1.87.0 test --lib live::`：53/53 通过。
+- 最终 `cargo +1.87.0 fmt --all --check`：通过。
+- 最终 `cargo +1.87.0 clippy --all-targets --quiet`：退出码 0；仅保留 vendor eframe 和既有离线模块警告，新增实时模块无 clippy 警告。
+- 最终 `cargo +1.87.0 test --quiet`：library 77/77、桌面客户端 112/112（另 5 个显式 ignored）、DSP 模拟器 1/1、doc tests 0，全部普通测试通过。
+- 最终 `cargo +1.87.0 test --quiet -- --ignored`：5/5 性能/LibreOffice 兼容性测试通过。
+- 最终 `cargo +1.87.0 build --release --bin scope_analyzer --bin scope_dsp_simulator`：通过，0.8.0 客户端和模拟器 release 二进制均生成成功。
 
 ## 未验证内容
 
@@ -131,9 +145,9 @@
 
 ## 后续任务
 
-1. 执行完整普通/ignored 测试、clippy 和 release 双二进制构建。
-2. 复核版本、协议、`.scope`、现有离线功能和 Git 交付状态。
-3. 正常推送功能分支；硬件/Windows 专项继续保持未验证。
+1. 在具备目标 DSP 板卡和固件后执行串口板级互操作、吞吐、断线和长时间录波测试。
+2. 在 Windows 构建机运行 `scripts/release-check.ps1`、离线 MSI/ZIP 打包及安装后串口枚举验证。
+3. 修复或升级现有 macOS 原生窗口依赖后补做人工 UI 点击验收；此项不能由自动化测试替代。
 
 ## 硬件实测状态
 
