@@ -331,6 +331,29 @@ pub struct AsyncScopeRecorder {
     worker: Option<JoinHandle<()>>,
 }
 
+#[derive(Clone)]
+pub struct RecordingIngress {
+    command_tx: Sender<RecordingCommand>,
+}
+
+impl RecordingIngress {
+    pub fn try_write_sample_frame(&self, frame: Frame) -> Result<(), RecordingError> {
+        self.try_send(RecordingCommand::SampleFrame(frame))
+    }
+
+    pub fn try_write_gap(&self, gap: LiveGap, timestamp_ticks: u64) -> Result<(), RecordingError> {
+        self.try_send(RecordingCommand::Gap(gap, timestamp_ticks))
+    }
+
+    fn try_send(&self, command: RecordingCommand) -> Result<(), RecordingError> {
+        match self.command_tx.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(RecordingError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => Err(RecordingError::WorkerStopped),
+        }
+    }
+}
+
 impl AsyncScopeRecorder {
     pub fn create(path: &Path, metadata: RecordingMetadata) -> Result<Self, RecordingError> {
         Self::create_with_capacity(path, metadata, RECORDING_QUEUE_CAPACITY)
@@ -362,6 +385,16 @@ impl AsyncScopeRecorder {
 
     pub fn try_write_sample_frame(&mut self, frame: Frame) -> Result<(), RecordingError> {
         self.try_send(RecordingCommand::SampleFrame(frame))
+    }
+
+    pub fn ingress(&self) -> Result<RecordingIngress, RecordingError> {
+        Ok(RecordingIngress {
+            command_tx: self
+                .command_tx
+                .as_ref()
+                .ok_or(RecordingError::WorkerStopped)?
+                .clone(),
+        })
     }
 
     pub fn try_write_gap(
@@ -1265,6 +1298,23 @@ mod tests {
         assert!(matches!(error, RecordingError::WorkerFailed(_)));
         assert!(!recorder.is_accepting());
         recorder.abort().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recording_ingress_can_enqueue_from_the_acquisition_worker() {
+        let path = unique_path("ingress");
+        let recorder = AsyncScopeRecorder::create(&path, metadata()).unwrap();
+        let ingress = recorder.ingress().unwrap();
+
+        ingress
+            .try_write_sample_frame(sample_frame(1, 0, 0, &[1, 2]))
+            .unwrap();
+        drop(ingress);
+        recorder.finish().unwrap();
+
+        let recording = ScopeRecording::open(&path).unwrap();
+        assert_eq!(recording.sample_records().len(), 1);
         let _ = std::fs::remove_file(path);
     }
 }

@@ -5,7 +5,7 @@ use std::{
 
 use super::{
     buffer::{LiveBuffer, LiveSnapshot},
-    protocol::{ChannelTable, Configure, Frame, HelloAck, ResultCode},
+    protocol::{validate_configure_for_device, ChannelTable, Configure, HelloAck, ResultCode},
     recording::{AsyncScopeRecorder, RecordingMetadata, RecordingStats},
     session::{ConnectionState, LiveSession, SessionEvent, SessionStats},
     transport::TransportConfig,
@@ -26,6 +26,7 @@ pub struct LiveScopeState {
     pub hello_ack: Option<HelloAck>,
     pub channel_table: Option<ChannelTable>,
     pub acquisition: Configure,
+    pub configuration_applied: bool,
     pub history_seconds: u32,
     pub buffer: Option<LiveBuffer>,
     pub trigger: TriggerEngine,
@@ -55,6 +56,7 @@ impl Default for LiveScopeState {
                 batch_samples: 100,
                 channel_mask: u64::MAX,
             },
+            configuration_applied: false,
             history_seconds: 10,
             buffer: None,
             trigger: TriggerEngine::new(TriggerConfig::default())
@@ -80,6 +82,11 @@ impl LiveScopeState {
             return Err("live session is already connected".to_owned());
         }
         self.last_error = None;
+        self.hello_ack = None;
+        self.channel_table = None;
+        self.buffer = None;
+        self.configuration_applied = false;
+        self.stats = SessionStats::default();
         self.workspace_mode = WorkspaceMode::Live;
         self.connection_state = ConnectionState::Connecting;
         self.session = Some(LiveSession::connect(self.transport.clone()).map_err(error_string)?);
@@ -98,17 +105,28 @@ impl LiveScopeState {
     }
 
     pub fn configure(&mut self, configure: Configure) -> Result<(), String> {
+        let hello = self
+            .hello_ack
+            .as_ref()
+            .ok_or_else(|| "device handshake is not complete".to_owned())?;
+        let table = self
+            .channel_table
+            .as_ref()
+            .ok_or_else(|| "device channel table is not available".to_owned())?;
+        validate_configure_for_device(&configure, hello, table).map_err(error_string)?;
         let session = self
             .session
             .as_ref()
             .ok_or_else(|| "live session is not connected".to_owned())?;
         session.configure(configure.clone()).map_err(error_string)?;
-        self.acquisition = configure;
-        self.rebuild_buffer()?;
+        self.configuration_applied = false;
         Ok(())
     }
 
     pub fn start(&self) -> Result<(), String> {
+        if !self.configuration_applied || self.connection_state != ConnectionState::Ready {
+            return Err("live acquisition has not been configured successfully".to_owned());
+        }
         self.session
             .as_ref()
             .ok_or_else(|| "live session is not connected".to_owned())?
@@ -117,6 +135,9 @@ impl LiveScopeState {
     }
 
     pub fn stop(&self) -> Result<(), String> {
+        if self.connection_state != ConnectionState::Streaming {
+            return Err("live acquisition is not streaming".to_owned());
+        }
         self.session
             .as_ref()
             .ok_or_else(|| "live session is not connected".to_owned())?
@@ -127,6 +148,9 @@ impl LiveScopeState {
     pub fn start_recording(&mut self, path: &Path) -> Result<(), String> {
         if self.recording.is_some() {
             return Err("recording is already active".to_owned());
+        }
+        if !self.configuration_applied {
+            return Err("live acquisition has not been configured successfully".to_owned());
         }
         let hello = self
             .hello_ack
@@ -146,12 +170,25 @@ impl LiveScopeState {
             channel_mask: self.acquisition.channel_mask,
             client_version: env!("CARGO_PKG_VERSION").to_owned(),
         };
-        self.recording = Some(AsyncScopeRecorder::create(path, metadata).map_err(error_string)?);
+        let recorder = AsyncScopeRecorder::create(path, metadata).map_err(error_string)?;
+        let ingress = recorder.ingress().map_err(error_string)?;
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| "live session is not connected".to_owned())?;
+        if let Err(error) = session.set_recording(Some(ingress)) {
+            let _ = recorder.abort();
+            return Err(error_string(error));
+        }
+        self.recording = Some(recorder);
         self.recording_path = Some(path.to_path_buf());
         Ok(())
     }
 
     pub fn stop_recording(&mut self) -> Result<(), String> {
+        if let Some(session) = &self.session {
+            session.set_recording(None).map_err(error_string)?;
+        }
         let writer = self
             .recording
             .take()
@@ -226,7 +263,15 @@ impl LiveScopeState {
 
     fn handle_event(&mut self, event: SessionEvent) -> Result<(), String> {
         match event {
-            SessionEvent::State(state) => self.connection_state = state,
+            SessionEvent::State(state) => {
+                self.connection_state = state;
+                if state == ConnectionState::Disconnected && self.recording.take().is_some() {
+                    self.last_error = Some(
+                        "live connection ended during recording; the recoverable recording prefix was preserved"
+                            .to_owned(),
+                    );
+                }
+            }
             SessionEvent::HelloAck(hello) => self.hello_ack = Some(hello),
             SessionEvent::ChannelTable(table) => {
                 for channel in &table.channels {
@@ -238,6 +283,11 @@ impl LiveScopeState {
                         .or_insert_with(|| default_channel_color(channel.channel_id));
                 }
                 self.channel_table = Some(table);
+                self.configuration_applied = false;
+            }
+            SessionEvent::Configured(configure) => {
+                self.acquisition = configure;
+                self.configuration_applied = true;
                 self.rebuild_buffer()?;
             }
             SessionEvent::CommandResult(result) => {
@@ -249,13 +299,6 @@ impl LiveScopeState {
                 }
             }
             SessionEvent::Batch(batch) => {
-                if let Some(writer) = &mut self.recording {
-                    let frame = Frame::decode(&batch.raw_frame).map_err(error_string)?;
-                    if let Err(error) = writer.try_write_sample_frame(frame) {
-                        self.recording.take();
-                        return Err(error_string(error));
-                    }
-                }
                 if let Some(capture) = self.trigger.feed(&batch).map_err(error_string)? {
                     if let Some(writer) = &mut self.recording {
                         if let Err(error) =
@@ -278,20 +321,21 @@ impl LiveScopeState {
                 if let Some(buffer) = &mut self.buffer {
                     buffer.push_gap(gap.start_sample_index, gap.missing_samples, gap.reason);
                 }
-                if let Some(writer) = &mut self.recording {
-                    if let Err(error) = writer.try_write_gap(gap, 0) {
-                        self.recording.take();
-                        return Err(error_string(error));
-                    }
-                }
             }
             SessionEvent::Stats(stats) => self.stats = stats,
+            SessionEvent::RecordingError(error) => {
+                self.recording.take();
+                self.last_error = Some(error);
+            }
             SessionEvent::Error(error) => self.last_error = Some(error),
         }
         Ok(())
     }
 
     fn rebuild_buffer(&mut self) -> Result<(), String> {
+        if !self.configuration_applied {
+            return Ok(());
+        }
         let Some(table) = &self.channel_table else {
             return Ok(());
         };
@@ -421,6 +465,9 @@ mod tests {
                 channel_mask: 0b1111,
             })
             .unwrap();
+        wait_until(&mut state, |state| {
+            state.configuration_applied && state.acquisition.batch_samples == 10
+        });
         state.start_recording(&path).unwrap();
         state.start().unwrap();
         wait_until(&mut state, |state| {
@@ -454,6 +501,143 @@ mod tests {
         assert!(block.channels[1]
             .iter()
             .all(|value| *value == 0.0 || *value == 1.0));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn configuration_rejects_channels_not_advertised_by_the_device() {
+        let simulator = SimulatorHandle::spawn(SimulatorConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            ..SimulatorConfig::default()
+        })
+        .unwrap();
+        let mut state = LiveScopeState::default();
+        state.transport = TransportConfig::Tcp {
+            address: simulator.address().to_string(),
+        };
+        state.connect().unwrap();
+        wait_until(&mut state, |state| {
+            state.connection_state == ConnectionState::Ready
+        });
+
+        let result = state.configure(Configure {
+            sample_rate_hz: 10_000,
+            batch_samples: 10,
+            channel_mask: 1 << 60,
+        });
+
+        assert!(result.is_err());
+        assert!(!state.configuration_applied);
+        state.disconnect().unwrap();
+    }
+
+    #[test]
+    fn recording_bypasses_a_backpressured_display_queue() {
+        let simulator = SimulatorHandle::spawn(SimulatorConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            accelerated: true,
+            ..SimulatorConfig::default()
+        })
+        .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "scope_live_backpressure_{}_{}.scope",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut state = LiveScopeState::default();
+        state.transport = TransportConfig::Tcp {
+            address: simulator.address().to_string(),
+        };
+        state.connect().unwrap();
+        wait_until(&mut state, |state| {
+            state.connection_state == ConnectionState::Ready
+        });
+        state
+            .configure(Configure {
+                sample_rate_hz: 10_000,
+                batch_samples: 10,
+                channel_mask: 0b1111,
+            })
+            .unwrap();
+        wait_until(&mut state, |state| state.configuration_applied);
+        state.start_recording(&path).unwrap();
+        state.start().unwrap();
+        wait_until(&mut state, |state| {
+            state.connection_state == ConnectionState::Streaming
+        });
+
+        std::thread::sleep(Duration::from_millis(700));
+        state.stop().unwrap();
+        wait_until(&mut state, |state| {
+            state.connection_state == ConnectionState::Ready
+        });
+        state.stop_recording().unwrap();
+        let displayed_samples = state
+            .buffer
+            .as_ref()
+            .map(|buffer| buffer.len())
+            .unwrap_or(0);
+        state.disconnect().unwrap();
+
+        let source = ScopeRecordingDataSource::open(&path).unwrap();
+        assert!(source.metadata().sample_count > displayed_samples as u64);
+        assert!(source.metadata().sample_count >= 2_000);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn unexpected_disconnect_stops_recording_and_preserves_a_recoverable_prefix() {
+        let simulator = SimulatorHandle::spawn(SimulatorConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            accelerated: true,
+            disconnect_after: Some(10),
+            ..SimulatorConfig::default()
+        })
+        .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "scope_live_disconnect_{}_{}.scope",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut state = LiveScopeState::default();
+        state.transport = TransportConfig::Tcp {
+            address: simulator.address().to_string(),
+        };
+        state.connect().unwrap();
+        wait_until(&mut state, |state| {
+            state.connection_state == ConnectionState::Ready
+        });
+        state
+            .configure(Configure {
+                sample_rate_hz: 10_000,
+                batch_samples: 10,
+                channel_mask: 0b1111,
+            })
+            .unwrap();
+        wait_until(&mut state, |state| state.configuration_applied);
+        state.start_recording(&path).unwrap();
+        state.start().unwrap();
+
+        wait_until(&mut state, |state| {
+            state.connection_state == ConnectionState::Disconnected
+        });
+        assert!(!state.is_recording());
+        assert!(state
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("recoverable")));
+        std::thread::sleep(Duration::from_millis(100));
+
+        let recording = crate::live::recording::ScopeRecording::open(&path).unwrap();
+        assert!(!recording.clean_end());
+        assert!(recording.recovered_tail());
+        assert!(!recording.sample_records().is_empty());
         let _ = std::fs::remove_file(path);
     }
 }

@@ -180,7 +180,9 @@ Trigger 记录 payload 固定 48 字节，所有多字节字段仍为 little-end
 
 Trigger 记录头的 `timestamp_ticks` 是触发样点时间。干净录波的 Index 必须逐项匹配已扫描 SampleFrame 的首样点索引、时间戳和 payload 文件偏移；即使 Index 自身 CRC 有效，内容不一致也属于文件损坏。
 
-客户端使用独立的 128 项有界录波队列。写盘不在 egui/UI 线程执行；队列满或 writer 失败会立即终止本次录波并保留可顺序恢复的有效前缀，不能继续写出带 SessionEnd 的“伪完整”文件。
+客户端使用独立的 128 项有界录波队列。采集 worker 在协议、session_id、revision、样点布局和单调索引全部验证后，先把原始 SCP1 帧送入录波 ingress，再尝试送入可丢弃的显示队列。因此 UI 暂停消费或显示背压不会造成录波缺帧。写盘不在 egui/UI 线程执行；队列满或 writer 失败会立即终止本次录波并保留可顺序恢复的有效前缀，不能继续写出带 SessionEnd 的“伪完整”文件。
+
+控制/错误事件与高频 Batch/Stats 使用独立有界通道，显示数据队列饱和不得阻塞 STOP、Disconnect 或错误上报。Streaming 状态下正常断开前客户端发送 STOP；析构路径不执行无时限 join。异常断线期间的录波停止并保留可恢复前缀。
 
 ## 8. 参考实现与一致性测试
 

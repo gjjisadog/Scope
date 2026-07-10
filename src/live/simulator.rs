@@ -3,7 +3,7 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -12,9 +12,10 @@ use std::{
 use thiserror::Error;
 
 use super::protocol::{
-    ChannelDescriptor, ChannelKind, ChannelTable, CommandResult, Configure, DeviceState, Frame,
-    FrameDecoder, HelloAck, Message, ResultCode, SampleBatch, Status, WireFormat, MAX_PAYLOAD_LEN,
-    MSG_CONFIGURE, MSG_HELLO, MSG_PING, MSG_START, MSG_STOP,
+    encode_configure_result_detail, validate_configure_for_device, ChannelDescriptor, ChannelKind,
+    ChannelTable, CommandResult, Configure, DeviceState, Frame, FrameDecoder, HelloAck, Message,
+    ResultCode, SampleBatch, Status, WireFormat, MAX_PAYLOAD_LEN, MSG_CONFIGURE, MSG_HELLO,
+    MSG_PING, MSG_START, MSG_STOP,
 };
 
 const SIMULATOR_TICK_HZ: u64 = 1_000_000;
@@ -77,7 +78,19 @@ impl SimulatorConfig {
 pub struct SimulatorHandle {
     address: SocketAddr,
     stop: Arc<AtomicBool>,
+    stats: Arc<Mutex<SimulatorStats>>,
     worker: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SimulatorStats {
+    pub connections: u64,
+    pub hello_requests: u64,
+    pub configure_requests: u64,
+    pub start_requests: u64,
+    pub stop_requests: u64,
+    pub ping_requests: u64,
+    pub emitted_batches: u64,
 }
 
 impl SimulatorHandle {
@@ -88,18 +101,25 @@ impl SimulatorHandle {
         let address = listener.local_addr()?;
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
+        let stats = Arc::new(Mutex::new(SimulatorStats::default()));
+        let worker_stats = Arc::clone(&stats);
         let worker = thread::Builder::new()
             .name("scope-dsp-simulator".to_owned())
-            .spawn(move || run_listener(listener, config, worker_stop))?;
+            .spawn(move || run_listener(listener, config, worker_stop, worker_stats))?;
         Ok(Self {
             address,
             stop,
+            stats,
             worker: Some(worker),
         })
     }
 
     pub fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    pub fn stats(&self) -> SimulatorStats {
+        self.stats.lock().map(|stats| *stats).unwrap_or_default()
     }
 
     pub fn stop(mut self) {
@@ -129,14 +149,22 @@ pub enum SimulatorError {
     Io(#[from] std::io::Error),
 }
 
-fn run_listener(listener: TcpListener, config: SimulatorConfig, stop: Arc<AtomicBool>) {
+fn run_listener(
+    listener: TcpListener,
+    config: SimulatorConfig,
+    stop: Arc<AtomicBool>,
+    stats: Arc<Mutex<SimulatorStats>>,
+) {
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                let _ = serve_client(stream, &config, &stop);
+                update_stats(&stats, |stats| {
+                    stats.connections = stats.connections.saturating_add(1)
+                });
+                let _ = serve_client(stream, &config, &stop, &stats);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(5));
@@ -150,6 +178,7 @@ fn serve_client(
     mut stream: TcpStream,
     config: &SimulatorConfig,
     stop: &AtomicBool,
+    stats: &Mutex<SimulatorStats>,
 ) -> Result<(), SimulatorError> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_millis(5)))?;
@@ -179,18 +208,14 @@ fn serve_client(
                     };
                     match message {
                         Message::Hello(_) if frame.message_type == MSG_HELLO => {
+                            update_stats(stats, |stats| {
+                                stats.hello_requests = stats.hello_requests.saturating_add(1)
+                            });
+                            let hello = simulator_hello_ack(&table);
                             send_message(
                                 &mut stream,
                                 &mut out_sequence,
-                                Message::HelloAck(HelloAck {
-                                    device_capabilities: 0,
-                                    max_payload: MAX_PAYLOAD_LEN as u32,
-                                    tick_hz: SIMULATOR_TICK_HZ,
-                                    channel_count: table.channels.len() as u16,
-                                    max_batch_samples: 4096,
-                                    device_id: *b"SCOPE-SIM-V1----",
-                                    firmware_name: "scope-dsp-simulator".to_owned(),
-                                }),
+                                Message::HelloAck(hello),
                                 0,
                             )?;
                             send_message(
@@ -201,16 +226,39 @@ fn serve_client(
                             )?;
                         }
                         Message::Configure(request) if frame.message_type == MSG_CONFIGURE => {
-                            configured = request;
-                            state = DeviceState::Configured;
-                            send_result(
-                                &mut stream,
-                                &mut out_sequence,
-                                frame.sequence,
-                                ResultCode::Ok,
-                            )?;
+                            update_stats(stats, |stats| {
+                                stats.configure_requests =
+                                    stats.configure_requests.saturating_add(1)
+                            });
+                            match validate_configure_for_device(
+                                &request,
+                                &simulator_hello_ack(&table),
+                                &table,
+                            ) {
+                                Ok(()) => {
+                                    configured = request;
+                                    state = DeviceState::Configured;
+                                    send_result_with_detail(
+                                        &mut stream,
+                                        &mut out_sequence,
+                                        frame.sequence,
+                                        ResultCode::Ok,
+                                        encode_configure_result_detail(&configured),
+                                    )?;
+                                }
+                                Err(error) => send_result_with_detail(
+                                    &mut stream,
+                                    &mut out_sequence,
+                                    frame.sequence,
+                                    ResultCode::InvalidArgument,
+                                    error.to_string(),
+                                )?,
+                            }
                         }
                         Message::Start if frame.message_type == MSG_START => {
+                            update_stats(stats, |stats| {
+                                stats.start_requests = stats.start_requests.saturating_add(1)
+                            });
                             let result = if state == DeviceState::Configured {
                                 state = DeviceState::Streaming;
                                 ResultCode::Ok
@@ -220,6 +268,9 @@ fn serve_client(
                             send_result(&mut stream, &mut out_sequence, frame.sequence, result)?;
                         }
                         Message::Stop if frame.message_type == MSG_STOP => {
+                            update_stats(stats, |stats| {
+                                stats.stop_requests = stats.stop_requests.saturating_add(1)
+                            });
                             let result = if state == DeviceState::Streaming {
                                 state = DeviceState::Configured;
                                 ResultCode::Ok
@@ -229,6 +280,9 @@ fn serve_client(
                             send_result(&mut stream, &mut out_sequence, frame.sequence, result)?;
                         }
                         Message::Ping(nonce) if frame.message_type == MSG_PING => {
+                            update_stats(stats, |stats| {
+                                stats.ping_requests = stats.ping_requests.saturating_add(1)
+                            });
                             send_message(&mut stream, &mut out_sequence, Message::Pong(nonce), 0)?;
                         }
                         _ => {}
@@ -245,6 +299,9 @@ fn serve_client(
 
         if state == DeviceState::Streaming {
             emitted_batches = emitted_batches.saturating_add(1);
+            update_stats(stats, |stats| {
+                stats.emitted_batches = stats.emitted_batches.saturating_add(1)
+            });
             if config.disconnect_after == Some(emitted_batches) {
                 break;
             }
@@ -299,6 +356,18 @@ fn simulator_channel_table() -> ChannelTable {
                 name: "Digital".to_owned(),
             },
         ],
+    }
+}
+
+fn simulator_hello_ack(table: &ChannelTable) -> HelloAck {
+    HelloAck {
+        device_capabilities: 0,
+        max_payload: MAX_PAYLOAD_LEN as u32,
+        tick_hz: SIMULATOR_TICK_HZ,
+        channel_count: table.channels.len() as u16,
+        max_batch_samples: 4096,
+        device_id: *b"SCOPE-SIM-V1----",
+        firmware_name: "scope-dsp-simulator".to_owned(),
     }
 }
 
@@ -405,20 +474,42 @@ fn send_result(
     request_sequence: u32,
     result_code: ResultCode,
 ) -> Result<(), SimulatorError> {
+    send_result_with_detail(
+        stream,
+        sequence,
+        request_sequence,
+        result_code,
+        if result_code == ResultCode::Ok {
+            "ok".to_owned()
+        } else {
+            "invalid state".to_owned()
+        },
+    )
+}
+
+fn send_result_with_detail(
+    stream: &mut TcpStream,
+    sequence: &mut u32,
+    request_sequence: u32,
+    result_code: ResultCode,
+    detail: String,
+) -> Result<(), SimulatorError> {
     send_message(
         stream,
         sequence,
         Message::CommandResult(CommandResult {
             request_sequence,
             result_code,
-            detail: if result_code == ResultCode::Ok {
-                "ok".to_owned()
-            } else {
-                "invalid state".to_owned()
-            },
+            detail,
         }),
         0,
     )
+}
+
+fn update_stats(stats: &Mutex<SimulatorStats>, update: impl FnOnce(&mut SimulatorStats)) {
+    if let Ok(mut stats) = stats.lock() {
+        update(&mut stats);
+    }
 }
 
 fn send_message(

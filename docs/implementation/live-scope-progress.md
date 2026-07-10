@@ -52,6 +52,13 @@
 - Trigger 记录升级为固定 48 字节完整记录，包含 mode、edge、源通道、level、hysteresis、pre/post、Auto timeout、触发样点和超时标志。
 - 干净文件打开时会逐项核对 Index 与实际 SampleFrame 索引/时间戳/文件偏移；有效 CRC 但内容不一致的 Index 也会拒绝。
 - `LiveScopeState` 已接入异步录波统计、pending 数量和 worker 故障轮询；显式结束录波仍等待 Index/SessionEnd 与 `sync_all` 完成，应用异常退出则不无限等待并由恢复扫描处理。
+- 采集 worker 现在通过可克隆 `RecordingIngress` 在显示队列之前录制已验证原始帧；显示背压只影响实时画面，不再造成 `.scope` 缺帧。
+- 会话控制事件与高频 Batch/Stats 分离为两个有界通道，样点 gap 不再以阻塞发送卡住 Disconnect；命令/控制通道均有 100 ms 上限。
+- CONFIGURE 成功会解析设备返回的实际采样率、批量与 mask，再次对 HELLO_ACK/CHANNEL_TABLE 校验后发布 `Configured`；客户端只在该事件后允许 Start/录波并重建缓冲。
+- 模拟器会拒绝超出 tick、最大批量、payload 或通道表的配置；新增连接/命令/批次统计用于验证状态机。
+- Streaming 正常断开会先发送 STOP；显式 Disconnect join worker，Drop 只发非阻塞 Disconnect 并 detach，避免串口驱动或满队列造成应用退出无限等待。
+- 新增 CRC/malformed/discarded/unknown/device drop/tx overrun 统计；坏 CRC 帧只计数，不会到达 Batch 消费者。
+- 异常断线会立即结束录波状态、保留未写 SessionEnd 的可恢复文件前缀并在 UI 错误区说明。
 
 ## 测试结果
 
@@ -102,6 +109,9 @@
 - 异步录波 TDD RED：`AsyncScopeRecorder`、QueueFull/WorkerFailed 和统计 API 缺失；实现后正常完成、确定性队列溢出、worker 故障传播 3 个测试通过。
 - `cargo +1.87.0 test --lib live::recording::tests`：8/8 通过。
 - `cargo +1.87.0 test --lib live::state::tests::simulator_acquisition_records_and_replays`：通过，异步 writer 至少落盘 3 帧后完成客户端—模拟器—回放闭环。
+- 会话 TDD RED：Configured 实际参数事件、CRC 统计、模拟器命令统计和 STOP 断开证据均缺失；实现后全部目标测试通过。
+- `cargo +1.87.0 test --lib live::session::tests`：8/8 通过，覆盖配置协商、非法 mask、坏 CRC、丢帧、STOP、满显示队列有界断开和重新连接。
+- `cargo +1.87.0 test --lib live::state::tests`：4/4 通过，包括显示队列 700 ms 不消费时录波样点仍显著多于显示样点，以及异常断线可恢复录波。
 
 ## 未验证内容
 
@@ -112,8 +122,8 @@
 
 ## 后续任务
 
-1. 补齐会话关闭、状态机、背压、重连与协商参数应用。
-2. 补齐倍率、Auto 超时、触发冻结和录波统计 UI。
+1. 补齐倍率、Auto 超时、触发冻结和录波/链路统计 UI。
+2. 复查缓冲总点预算、触发跨 batch 连续处理和操作说明。
 3. 重新执行完整发布验证并正常推送功能分支。
 
 ## 硬件实测状态
