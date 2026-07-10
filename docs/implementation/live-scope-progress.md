@@ -4,7 +4,7 @@
 
 ## 当前里程碑
 
-里程碑 7：0.8.0 版本同步、SCP1 固件协议与用户操作文档。
+里程碑 8：跨平台测试基线修复与发布前全量回归。
 
 ## 已完成内容
 
@@ -42,6 +42,8 @@
 - 已将重大功能版本从 0.7.1 同步升级到 0.8.0，覆盖 Cargo manifest/lock、Windows PowerShell 打包、WiX Product Version 和 README 产物名。
 - 已发布 `docs/protocols/scp1-live-scope-v1.md`：冻结帧布局、CRC32C、消息方向、握手/状态机、所有 payload、采样交织方式、gap 和错误处理要求。
 - README 已加入实时工作区、模拟器、TCP/串口、触发、录波与回放操作说明，并明确真实硬件尚未验证。
+- 已修复最近文件标签在非 Windows 主机读取反斜杠路径时不截取文件名的问题。
+- 已把 Mesa helper、窗口 maximized 和导出光标表测试改为平台路径/builder 真实语义/字体度量不变量，消除测试对 Windows 路径解析和特定系统字体像素值的错误假设。
 
 ## 测试结果
 
@@ -54,7 +56,7 @@
   - `app::tests::recent_file_label_keeps_menu_compact`
   - `tests::mesa_renderer_uses_isolated_helper_executable`
   - `tests::scope_window_starts_resizable_with_taskbar_friendly_bounds`
-- 当前不能声明仓库全量测试通过；实时功能尚无生产代码或新增测试。
+- 上述 4 个基线失败已在里程碑 8 按平台语义修正；当前全量非 ignored 测试通过。
 - 里程碑 1 TDD RED：测试因 `Frame`/`crc32c` 缺失失败；实现后 2 个测试通过。
 - 里程碑 1 TDD RED：流式测试因 `FrameDecoder` 缺失失败；实现后协议测试 3/3 通过。
 - `cargo +1.87.0 fmt --all --check`：通过。
@@ -80,6 +82,8 @@
 - 已实际启动 `scope_dsp_simulator --accelerated`，监听 `127.0.0.1:19090`；桌面 `scope_analyzer` 也成功启动且无启动期错误。
 - 里程碑 7 TDD RED：版本同步测试期望 0.8.0，首次运行在 `CARGO_PKG_VERSION=0.7.1` 失败；同步所有版本位置后通过。
 - `cargo +1.87.0 test --lib release_tests::live_scope_release_version_is_synchronized`：1/1 通过。
+- 回归修复前稳定复现原基线 4 个失败；逐项修正后 4 个目标测试均单独通过。
+- `cargo +1.87.0 test --quiet`：全部通过；library 51/51、桌面客户端 111/111（另 5 个显式 ignored）、模拟器 1/1、doc tests 0。
 
 ## 未验证内容
 
@@ -90,8 +94,8 @@
 
 ## 后续任务
 
-1. 处理或隔离 macOS 基线的 4 个失败测试，完成全量回归。
-2. 验证 release 构建并正常推送功能分支。
+1. 执行 fmt、clippy、release 构建和最终全量测试。
+2. 正常推送功能分支。
 
 ## 硬件实测状态
 
@@ -99,7 +103,5 @@
 
 ## 已知限制
 
-- 当前仓库基线在 macOS 上已有 4 个失败测试，详见“测试结果”。
 - Rust 1.97.0 会因更严格的浮点类型推断在现有 `src/app.rs` 中编译失败；Rust 1.87.0 能执行基线测试。
-- 仓库没有现成的实时采集协议、串口模块、触发模块或 `.scope` 格式。
 - 当前已完成无硬件依赖的客户端—模拟器闭环和 egui 实时工作区；真实 DSP 串口硬件实测尚未完成。

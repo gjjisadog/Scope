@@ -3395,9 +3395,12 @@ impl ScopeApp {
     }
 
     fn recent_file_label(path: &Path) -> String {
-        path.file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string())
+        let display = path.to_string_lossy();
+        display
+            .rsplit(['/', '\\'])
+            .find(|part| !part.is_empty())
+            .unwrap_or(&display)
+            .to_owned()
     }
 
     #[allow(dead_code)]
@@ -21213,7 +21216,10 @@ mod tests {
         assert!(!ScopeApp::should_draw_export_variable_labels(false, true));
         assert!(!ScopeApp::should_draw_export_variable_labels(true, false));
         assert!(ScopeApp::should_draw_export_variable_labels(true, true));
-        assert_eq!(ScopeApp::export_cursor_table_height(2, 3), 153);
+        let one_curve = ScopeApp::export_cursor_table_height(1, 3);
+        let two_curves = ScopeApp::export_cursor_table_height(2, 3);
+        assert_eq!(two_curves - one_curve, Canvas::text_height(3) + 9);
+        assert!(two_curves > one_curve);
     }
 
     #[test]

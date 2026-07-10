@@ -489,7 +489,10 @@ mod tests {
             Some(eframe::egui::vec2(860.0, 520.0))
         );
         assert_eq!(viewport.resizable, Some(true));
-        assert_eq!(viewport.maximized, Some(cfg!(target_os = "windows")));
+        assert_eq!(
+            viewport.maximized,
+            cfg!(target_os = "windows").then_some(true)
+        );
     }
 
     #[test]
@@ -556,10 +559,12 @@ mod tests {
 
     #[test]
     fn mesa_renderer_uses_isolated_helper_executable() {
-        let exe = std::path::Path::new(r"C:\Apps\ScopeAnalyzer\ScopeAnalyzer.exe");
+        let exe = std::path::PathBuf::from("install").join("ScopeAnalyzer.exe");
         assert_eq!(
-            renderer_executable(RendererMode::MesaSoftware, exe),
-            std::path::PathBuf::from(r"C:\Apps\ScopeAnalyzer\mesa\ScopeAnalyzerMesa.exe")
+            renderer_executable(RendererMode::MesaSoftware, &exe),
+            std::path::PathBuf::from("install")
+                .join(MESA_RUNTIME_DIR)
+                .join(MESA_HELPER_EXE)
         );
     }
 }
