@@ -1,7 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
-mod data;
 mod export_annotation;
 mod fft;
 mod png_export;
@@ -10,6 +9,8 @@ mod svg_export;
 mod transforms;
 mod vscode_bridge;
 mod word_export;
+
+pub(crate) use scope_analyzer::data;
 
 #[cfg(test)]
 mod perf_tests;
