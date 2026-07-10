@@ -32,11 +32,22 @@ Windows 离线波形分析工具。界面按软件示波器方式组织，支持
 cargo run --release --bin scope_dsp_simulator -- --listen 127.0.0.1:19090
 ```
 
-再启动客户端，顶部切换到 `Live/实时`，保留默认地址 `127.0.0.1:19090`，依次点击 `Connect/连接`、`Configure/应用采集` 和 `Start/开始`。实时工作区可设置采样率、每帧点数、显示历史、通道颜色与可见性，以及 Auto/Normal/Single、上升/下降/双边沿软件触发。
+再启动客户端，顶部切换到 `Live/实时`，保留默认地址 `127.0.0.1:19090`，依次点击 `Connect/连接`、选择采集通道、`Configure/应用采集` 和 `Start/开始`。Configure 成功前 Start 与 Record 不可用；设备返回的实际采样率、批量和通道 mask 会再次校验后生效。实时工作区可设置采样率、每帧点数、显示历史、采集/显示通道、颜色、显示倍率，以及 Auto/Normal/Single、上升/下降/双边沿软件触发。
 
-`Record/录波` 将经过协议校验的采样帧、gap 和触发事件写入 `.scope`。完成录波后可用 `Open recording/打开录波` 进入离线工作区，并继续使用既有光标、测量、FFT、序分量和导出功能。显示暂停只冻结画面，不停止采集或录波；使用 `Stop/停止` 才会停止设备数据流。
+`Record/录波` 将经过协议校验的采样帧、gap 和完整触发配置写入 `.scope`。采集线程先写独立有界录波队列，再尝试更新画面，因此显示队列背压不会造成录波缺帧。完成录波后可用 `Open recording/打开录波` 进入离线工作区，并继续使用既有光标、测量、FFT、序分量和导出功能。显示暂停只冻结画面，不停止采集或录波；使用 `Stop/停止` 才会停止设备数据流。
+
+Normal/Single 触发命中后，中央波形显示完整 pre/post capture；`Arm/重新布防` 清除上一次冻结 capture。Auto 模式未命中边沿时按 `Auto timeout` 样点数生成明确标记的超时 capture。右侧同时显示 CRC、协议错误、主机显示丢批、设备丢样/发送溢出，以及录波已写/排队记录数。
 
 串口模式使用 8-N-1、无流控；波特率在实时工具栏中配置。DSP 固件需要实现 [SCP1 V1 协议](docs/protocols/scp1-live-scope-v1.md)。当前模拟器闭环已经自动测试，真实 DSP 板卡和 Windows 串口仍需按目标硬件实测。
+
+### 实时连接排查
+
+- `Connect` 失败：确认模拟器显示 `listening on 127.0.0.1:19090`，或串口未被其他程序占用。
+- 一直停在 Handshaking：检查 DSP 是否按顺序返回非零 session_id 的 HELLO_ACK 与 CHANNEL_TABLE，并使用 SCP1 CRC32C。
+- Configure 被拒绝：采样率不得超过设备 `tick_hz`，批量不得超过 `max_batch_samples`，至少选择一个且只能选择通道表内的通道。
+- 3 秒后断开：设备必须持续发送有效帧或响应每秒 PING；CRC 错误帧不计作有效心跳。
+- 波形有断点：查看 Host drops、Sequence gaps、Device drops 和 CRC 统计；客户端不会跨 gap 画连线。
+- 录波意外中断：重新打开 `.scope` 会扫描并恢复最后一个完整记录；中间 CRC 损坏仍会拒绝，避免静默展示错误数据。
 
 ## 当前支持的数据格式
 

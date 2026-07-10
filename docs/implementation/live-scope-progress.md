@@ -59,6 +59,11 @@
 - Streaming 正常断开会先发送 STOP；显式 Disconnect join worker，Drop 只发非阻塞 Disconnect 并 detach，避免串口驱动或满队列造成应用退出无限等待。
 - 新增 CRC/malformed/discarded/unknown/device drop/tx overrun 统计；坏 CRC 帧只计数，不会到达 Batch 消费者。
 - 异常断线会立即结束录波状态、保留未写 SessionEnd 的可恢复文件前缀并在 UI 错误区说明。
+- 修正默认 UI 采集 mask：收到 CHANNEL_TABLE 后自动收敛到设备已知通道，默认参数可直接 Configure；用户可分别控制“是否采集”和“是否显示”。
+- 实时通道 UI 已补齐每通道显示倍率；串口提供 7 个设计预设并保留手工正整数波特率输入。
+- 触发 UI 已补齐 Auto timeout 样点数、命中样点/超时标记和统一重新布防；Normal/Single 使用完整 pre/post capture 冻结显示，倍率只影响绘图不改变工程值触发判定。
+- 链路统计已补齐 CRC、discarded bytes、unknown messages、device drops/overruns；录波统计显示已写 SampleFrame/Gap/Trigger、总记录和 pending，并在结束录波后保留最终值。
+- 实时快照的 `max_points` 现在是所有 gap segment 共享的总预算；多段历史不再各自使用完整预算。触发完成后继续消费同一 SAMPLE_BATCH 的剩余样点，保留下一次 pre-trigger 历史。
 
 ## 测试结果
 
@@ -94,7 +99,7 @@
 - `cargo +1.87.0 test --bin scope_analyzer app::tests::scope_app_live_state_defaults_to_offline_workspace`：1/1 通过。
 - `cargo +1.87.0 clippy --all-targets --quiet`：退出码 0；仅有 vendor eframe 和既有离线应用警告。
 - `cargo +1.87.0 test --no-run`：通过，library、桌面客户端和模拟器全部测试目标编译成功。
-- 已实际启动 `scope_dsp_simulator --accelerated`，监听 `127.0.0.1:19090`；桌面 `scope_analyzer` 也成功启动且无启动期错误。
+- 已实际启动 `scope_dsp_simulator --accelerated` 并监听 `127.0.0.1:19090`。桌面二进制能进入 renderer launcher，但本机窗口渲染状态见“未验证内容”，不再以进程存在推断 UI 成功。
 - 里程碑 7 TDD RED：版本同步测试期望 0.8.0，首次运行在 `CARGO_PKG_VERSION=0.7.1` 失败；同步所有版本位置后通过。
 - `cargo +1.87.0 test --lib release_tests::live_scope_release_version_is_synchronized`：1/1 通过。
 - 回归修复前稳定复现原基线 4 个失败；逐项修正后 4 个目标测试均单独通过。
@@ -112,19 +117,23 @@
 - 会话 TDD RED：Configured 实际参数事件、CRC 统计、模拟器命令统计和 STOP 断开证据均缺失；实现后全部目标测试通过。
 - `cargo +1.87.0 test --lib live::session::tests`：8/8 通过，覆盖配置协商、非法 mask、坏 CRC、丢帧、STOP、满显示队列有界断开和重新连接。
 - `cargo +1.87.0 test --lib live::state::tests`：4/4 通过，包括显示队列 700 ms 不消费时录波样点仍显著多于显示样点，以及异常断线可恢复录波。
+- 显示/触发 TDD RED：跨 gap snapshot 超出总预算、Normal capture 后丢弃批次尾部、默认 mask 保持 `u64::MAX`；修正后三个目标测试通过。
+- `cargo +1.87.0 test --lib live::buffer::tests`：4/4 通过；`cargo +1.87.0 test --lib live::trigger::tests`：6/6 通过。
+- `cargo +1.87.0 test --lib live::state::tests`：5/5 通过，包括 Normal capture 冻结显示、倍率计算和重布防清除 capture。
+- `cargo +1.87.0 test --bin scope_analyzer app::tests::scope_app_live_state_defaults_to_offline_workspace`：通过，完整桌面测试目标编译成功。
 
 ## 未验证内容
 
 - 尚未验证 DSP 实物串口通信。
 - 尚未验证 Windows 串口枚举、连接、断线恢复与安装包运行。
 - 尚未运行 Windows `scripts/release-check.ps1` 和离线安装包构建。
-- 未完成人工点击桌面 UI 的运行验证：当前开发二进制没有 macOS `.app` 包装，辅助功能层无法识别其窗口；已有编译、单元测试、端到端 session/录波测试及两个进程启动证据。
+- 未完成人工点击桌面 UI 的运行验证。已在忽略的 `target/ScopeAnalyzerDev.app` 创建开发包装并实际启动；当前 macOS 在进入 egui 前由既有 `icrate 0.0.4` 对 `NSScreen` 的 Objective-C 返回类型编码检查触发 non-unwinding abort，glow/wgpu 路径均相同。该平台问题与实时模块无关，但不能据此宣称窗口交互已验证。
 
 ## 后续任务
 
-1. 补齐倍率、Auto 超时、触发冻结和录波/链路统计 UI。
-2. 复查缓冲总点预算、触发跨 batch 连续处理和操作说明。
-3. 重新执行完整发布验证并正常推送功能分支。
+1. 执行完整普通/ignored 测试、clippy 和 release 双二进制构建。
+2. 复核版本、协议、`.scope`、现有离线功能和 Git 交付状态。
+3. 正常推送功能分支；硬件/Windows 专项继续保持未验证。
 
 ## 硬件实测状态
 

@@ -4,12 +4,12 @@ use std::{
 };
 
 use super::{
-    buffer::{LiveBuffer, LiveSnapshot},
+    buffer::{LiveBuffer, LiveSnapshot, SnapshotSegment},
     protocol::{validate_configure_for_device, ChannelTable, Configure, HelloAck, ResultCode},
     recording::{AsyncScopeRecorder, RecordingMetadata, RecordingStats},
     session::{ConnectionState, LiveSession, SessionEvent, SessionStats},
     transport::TransportConfig,
-    trigger::{TriggerCapture, TriggerConfig, TriggerEngine},
+    trigger::{TriggerCapture, TriggerConfig, TriggerEngine, TriggerMode},
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -34,8 +34,10 @@ pub struct LiveScopeState {
     pub stats: SessionStats,
     pub last_error: Option<String>,
     pub recording_path: Option<PathBuf>,
+    pub last_recording_stats: RecordingStats,
     pub channel_visibility: BTreeMap<u16, bool>,
     pub channel_colors: BTreeMap<u16, [u8; 4]>,
+    pub channel_scales: BTreeMap<u16, f32>,
     pub display_paused: bool,
     pub frozen_snapshot: Option<LiveSnapshot>,
     pub serial_ports: Vec<String>,
@@ -65,8 +67,10 @@ impl Default for LiveScopeState {
             stats: SessionStats::default(),
             last_error: None,
             recording_path: None,
+            last_recording_stats: RecordingStats::default(),
             channel_visibility: BTreeMap::new(),
             channel_colors: BTreeMap::new(),
+            channel_scales: BTreeMap::new(),
             display_paused: false,
             frozen_snapshot: None,
             serial_ports: Vec::new(),
@@ -181,6 +185,7 @@ impl LiveScopeState {
             return Err(error_string(error));
         }
         self.recording = Some(recorder);
+        self.last_recording_stats = RecordingStats::default();
         self.recording_path = Some(path.to_path_buf());
         Ok(())
     }
@@ -193,7 +198,8 @@ impl LiveScopeState {
             .recording
             .take()
             .ok_or_else(|| "recording is not active".to_owned())?;
-        writer.finish().map_err(error_string)
+        self.last_recording_stats = writer.finish().map_err(error_string)?;
+        Ok(())
     }
 
     pub fn is_recording(&self) -> bool {
@@ -206,7 +212,7 @@ impl LiveScopeState {
         self.recording
             .as_ref()
             .map(AsyncScopeRecorder::stats)
-            .unwrap_or_default()
+            .unwrap_or(self.last_recording_stats)
     }
 
     pub fn recording_pending_records(&self) -> usize {
@@ -224,7 +230,7 @@ impl LiveScopeState {
 
     pub fn set_display_paused(&mut self, paused: bool) {
         if paused && !self.display_paused {
-            self.frozen_snapshot = self.snapshot(8_000);
+            self.frozen_snapshot = self.current_unpaused_snapshot(8_000);
         } else if !paused {
             self.frozen_snapshot = None;
         }
@@ -235,8 +241,78 @@ impl LiveScopeState {
         if self.display_paused {
             self.frozen_snapshot.clone()
         } else {
-            self.snapshot(max_points)
+            self.current_unpaused_snapshot(max_points)
         }
+    }
+
+    pub fn scaled_display_value(&self, channel_id: u16, value: f32) -> f32 {
+        value * self.channel_scales.get(&channel_id).copied().unwrap_or(1.0)
+    }
+
+    pub fn arm_trigger(&mut self) {
+        self.last_capture = None;
+        self.trigger.arm();
+    }
+
+    pub fn set_trigger_config(&mut self, config: TriggerConfig) -> Result<(), String> {
+        self.trigger.set_config(config).map_err(error_string)?;
+        self.last_capture = None;
+        Ok(())
+    }
+
+    fn current_unpaused_snapshot(&self, max_points: usize) -> Option<LiveSnapshot> {
+        if self.trigger.config().mode != TriggerMode::Auto {
+            if let Some(capture) = &self.last_capture {
+                return self.trigger_capture_snapshot(capture, max_points);
+            }
+        }
+        self.snapshot(max_points)
+    }
+
+    fn trigger_capture_snapshot(
+        &self,
+        capture: &TriggerCapture,
+        max_points: usize,
+    ) -> Option<LiveSnapshot> {
+        let tick_hz = self.hello_ack.as_ref()?.tick_hz;
+        if max_points == 0 || capture.timestamps.is_empty() {
+            return Some(LiveSnapshot {
+                channel_ids: capture.channel_ids.clone(),
+                segments: Vec::new(),
+            });
+        }
+        let mut selected = std::collections::BTreeSet::new();
+        if capture.timestamps.len() <= max_points {
+            selected.extend(0..capture.timestamps.len());
+        } else if max_points == 1 {
+            selected.insert(capture.trigger_position.min(capture.timestamps.len() - 1));
+        } else {
+            selected.insert(capture.trigger_position.min(capture.timestamps.len() - 1));
+            if selected.len() < max_points {
+                selected.insert(0);
+            }
+            if selected.len() < max_points {
+                selected.insert(capture.timestamps.len() - 1);
+            }
+            let remaining = max_points.saturating_sub(selected.len());
+            for offset in 0..remaining {
+                selected.insert((offset + 1) * (capture.timestamps.len() - 1) / (remaining + 1));
+            }
+        }
+        Some(LiveSnapshot {
+            channel_ids: capture.channel_ids.clone(),
+            segments: vec![SnapshotSegment {
+                times: selected
+                    .iter()
+                    .map(|index| capture.timestamps[*index] as f64 / tick_hz as f64)
+                    .collect(),
+                channels: capture
+                    .channels
+                    .iter()
+                    .map(|channel| selected.iter().map(|index| channel[*index]).collect())
+                    .collect(),
+            }],
+        })
     }
 
     pub fn poll(&mut self) {
@@ -245,6 +321,9 @@ impl LiveScopeState {
             .as_mut()
             .and_then(AsyncScopeRecorder::poll_error);
         if let Some(error) = recording_error {
+            if let Some(recording) = &self.recording {
+                self.last_recording_stats = recording.stats();
+            }
             self.recording.take();
             self.last_error = Some(error.to_string());
         }
@@ -265,7 +344,9 @@ impl LiveScopeState {
         match event {
             SessionEvent::State(state) => {
                 self.connection_state = state;
-                if state == ConnectionState::Disconnected && self.recording.take().is_some() {
+                if state == ConnectionState::Disconnected && self.recording.is_some() {
+                    self.last_recording_stats = self.recording_stats();
+                    self.recording.take();
                     self.last_error = Some(
                         "live connection ended during recording; the recoverable recording prefix was preserved"
                             .to_owned(),
@@ -274,6 +355,17 @@ impl LiveScopeState {
             }
             SessionEvent::HelloAck(hello) => self.hello_ack = Some(hello),
             SessionEvent::ChannelTable(table) => {
+                let known_mask = table
+                    .channels
+                    .iter()
+                    .fold(0_u64, |mask, channel| mask | (1_u64 << channel.channel_id));
+                let retained_mask = self.acquisition.channel_mask & known_mask;
+                self.acquisition.channel_mask =
+                    if retained_mask == 0 || self.acquisition.channel_mask == u64::MAX {
+                        known_mask
+                    } else {
+                        retained_mask
+                    };
                 for channel in &table.channels {
                     self.channel_visibility
                         .entry(channel.channel_id)
@@ -281,6 +373,7 @@ impl LiveScopeState {
                     self.channel_colors
                         .entry(channel.channel_id)
                         .or_insert_with(|| default_channel_color(channel.channel_id));
+                    self.channel_scales.entry(channel.channel_id).or_insert(1.0);
                 }
                 self.channel_table = Some(table);
                 self.configuration_applied = false;
@@ -324,6 +417,7 @@ impl LiveScopeState {
             }
             SessionEvent::Stats(stats) => self.stats = stats,
             SessionEvent::RecordingError(error) => {
+                self.last_recording_stats = self.recording_stats();
                 self.recording.take();
                 self.last_error = Some(error);
             }
@@ -485,6 +579,7 @@ mod tests {
             state.connection_state == ConnectionState::Ready
         });
         state.stop_recording().unwrap();
+        assert!(state.recording_stats().sample_frames >= 3);
         state.disconnect().unwrap();
 
         let source = ScopeRecordingDataSource::open(&path).unwrap();
@@ -519,6 +614,8 @@ mod tests {
         wait_until(&mut state, |state| {
             state.connection_state == ConnectionState::Ready
         });
+        assert_eq!(state.acquisition.channel_mask, 0b1111);
+        assert_eq!(state.channel_scales.get(&0), Some(&1.0));
 
         let result = state.configure(Configure {
             sample_rate_hz: 10_000,
@@ -639,5 +736,45 @@ mod tests {
         assert!(recording.recovered_tail());
         assert!(!recording.sample_records().is_empty());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn normal_trigger_capture_drives_display_until_rearmed() {
+        let mut state = LiveScopeState::default();
+        state.hello_ack = Some(crate::live::protocol::HelloAck {
+            device_capabilities: 0,
+            max_payload: 1024,
+            tick_hz: 1_000,
+            channel_count: 1,
+            max_batch_samples: 10,
+            device_id: [0; 16],
+            firmware_name: "test".to_owned(),
+        });
+        state
+            .trigger
+            .set_config(crate::live::trigger::TriggerConfig {
+                mode: crate::live::trigger::TriggerMode::Normal,
+                source_channel: 0,
+                ..crate::live::trigger::TriggerConfig::default()
+            })
+            .unwrap();
+        state.last_capture = Some(crate::live::trigger::TriggerCapture {
+            channel_ids: vec![0],
+            sample_indices: vec![10, 11, 12],
+            timestamps: vec![100, 101, 102],
+            channels: vec![vec![-1.0, 0.0, 1.0]],
+            trigger_position: 1,
+            auto_timeout: false,
+        });
+        state.channel_scales.insert(0, 2.0);
+
+        let snapshot = state.display_snapshot(100).unwrap();
+
+        assert_eq!(snapshot.segments.len(), 1);
+        assert_eq!(snapshot.segments[0].times, vec![0.1, 0.101, 0.102]);
+        assert_eq!(state.scaled_display_value(0, 1.5), 3.0);
+        state.arm_trigger();
+        assert!(state.last_capture.is_none());
+        assert!(state.trigger.is_armed());
     }
 }

@@ -179,6 +179,7 @@ impl TriggerEngine {
             )
             .ok_or_else(|| TriggerError::InvalidBatch("timestamp overflow".to_owned()))?;
 
+        let mut first_capture = None;
         for sample_offset in 0..sample_count {
             let offset = u64::try_from(sample_offset)
                 .map_err(|_| TriggerError::InvalidBatch("sample offset overflow".to_owned()))?;
@@ -192,10 +193,15 @@ impl TriggerEngine {
                     .collect(),
             };
             if let Some(capture) = self.push_point(point, source_position, &batch.channel_ids)? {
-                return Ok(Some(capture));
+                if first_capture.is_none() {
+                    first_capture = Some(capture);
+                }
+                if !self.armed {
+                    break;
+                }
             }
         }
-        Ok(None)
+        Ok(first_capture)
     }
 
     fn push_point(
@@ -436,5 +442,24 @@ mod tests {
         let capture = trigger.feed(&batch(0, &[1.0, -1.0])).unwrap().unwrap();
 
         assert_eq!(capture.sample_indices, vec![1]);
+    }
+
+    #[test]
+    fn normal_trigger_keeps_remainder_of_a_batch_as_next_pretrigger_history() {
+        let mut trigger = TriggerEngine::new(TriggerConfig {
+            mode: TriggerMode::Normal,
+            pre_samples: 2,
+            post_samples: 0,
+            ..config(TriggerMode::Normal)
+        })
+        .unwrap();
+
+        let first = trigger.feed(&batch(0, &[-1.0, 1.0, 5.0, 6.0])).unwrap();
+        let second = trigger.feed(&batch(4, &[-1.0, 1.0])).unwrap().unwrap();
+
+        assert!(first.is_some());
+        assert_eq!(second.sample_indices, vec![3, 4, 5]);
+        assert_eq!(second.channels[0], vec![6.0, -1.0, 1.0]);
+        assert_eq!(second.trigger_position, 2);
     }
 }

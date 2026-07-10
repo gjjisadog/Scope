@@ -439,7 +439,7 @@ impl AsyncScopeRecorder {
         self.stats.lock().map(|stats| *stats).unwrap_or_default()
     }
 
-    pub fn finish(mut self) -> Result<(), RecordingError> {
+    pub fn finish(mut self) -> Result<RecordingStats, RecordingError> {
         let command_tx = self
             .command_tx
             .take()
@@ -449,12 +449,12 @@ impl AsyncScopeRecorder {
             .send(RecordingCommand::Finish(result_tx))
             .map_err(|_| self.worker_error_or_stopped())?;
         drop(command_tx);
-        let result = result_rx
+        result_rx
             .recv()
             .map_err(|_| self.worker_error_or_stopped())?
-            .map_err(RecordingError::WorkerFailed);
+            .map_err(RecordingError::WorkerFailed)?;
         self.join_worker()?;
-        result
+        Ok(self.stats())
     }
 
     pub fn abort(mut self) -> Result<(), RecordingError> {

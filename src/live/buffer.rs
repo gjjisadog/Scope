@@ -230,10 +230,27 @@ impl LiveBuffer {
             }
         }
         ranges.push(start..self.len());
-        let segments = ranges
-            .into_iter()
-            .map(|range| self.snapshot_range(range, max_points))
-            .collect();
+        if ranges.len() > max_points {
+            ranges = ranges.split_off(ranges.len() - max_points);
+        }
+        let mut remaining_budget = max_points;
+        let mut remaining_samples = ranges.iter().map(std::ops::Range::len).sum::<usize>();
+        let range_count = ranges.len();
+        let mut segments = Vec::with_capacity(range_count);
+        for (index, range) in ranges.into_iter().enumerate() {
+            let remaining_ranges = range_count - index;
+            let reserved_for_others = remaining_ranges.saturating_sub(1);
+            let proportional = range
+                .len()
+                .saturating_mul(remaining_budget)
+                .div_ceil(remaining_samples.max(1));
+            let budget = proportional
+                .max(1)
+                .min(remaining_budget.saturating_sub(reserved_for_others).max(1));
+            remaining_budget = remaining_budget.saturating_sub(budget);
+            remaining_samples = remaining_samples.saturating_sub(range.len());
+            segments.push(self.snapshot_range(range, budget));
+        }
         LiveSnapshot {
             channel_ids: self.channel_ids.clone(),
             segments,
@@ -259,7 +276,7 @@ impl LiveBuffer {
 
     fn snapshot_range(&self, range: std::ops::Range<usize>, max_points: usize) -> SnapshotSegment {
         let selected = if range.len() <= max_points {
-            range.collect::<Vec<_>>()
+            range.clone().collect::<Vec<_>>()
         } else {
             let bin_count = (max_points / 2).max(1);
             let bin_size = range.len().div_ceil(bin_count);
@@ -285,6 +302,7 @@ impl LiveBuffer {
             }
             selected.into_iter().collect()
         };
+        let selected = self.limit_selected_to_budget(selected, &range, max_points);
         SnapshotSegment {
             times: selected
                 .iter()
@@ -296,6 +314,50 @@ impl LiveBuffer {
                 .map(|channel| selected.iter().map(|&index| channel[index]).collect())
                 .collect(),
         }
+    }
+
+    fn limit_selected_to_budget(
+        &self,
+        selected: Vec<usize>,
+        range: &std::ops::Range<usize>,
+        max_points: usize,
+    ) -> Vec<usize> {
+        if selected.len() <= max_points {
+            return selected;
+        }
+        let mut kept = BTreeSet::new();
+        if max_points == 1 {
+            return vec![range.end - 1];
+        }
+        kept.insert(range.start);
+        kept.insert(range.end - 1);
+        for channel in &self.channels {
+            if kept.len() >= max_points {
+                break;
+            }
+            let mut minimum = range.start;
+            let mut maximum = range.start;
+            for index in range.start + 1..range.end {
+                if channel[index].total_cmp(&channel[minimum]).is_lt() {
+                    minimum = index;
+                }
+                if channel[index].total_cmp(&channel[maximum]).is_gt() {
+                    maximum = index;
+                }
+            }
+            kept.insert(minimum);
+            if kept.len() < max_points {
+                kept.insert(maximum);
+            }
+        }
+        if kept.len() < max_points {
+            let remaining = max_points - kept.len();
+            for offset in 0..remaining {
+                let position = (offset + 1) * (selected.len() - 1) / (remaining + 1);
+                kept.insert(selected[position]);
+            }
+        }
+        kept.into_iter().take(max_points).collect()
     }
 }
 
@@ -365,5 +427,33 @@ mod tests {
             Err(LiveBufferError::InvalidBatch(_))
         ));
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn snapshot_budget_is_shared_across_gap_segments() {
+        let mut buffer = LiveBuffer::new(vec![0], 20, 1_000_000).unwrap();
+        buffer
+            .push_batch(batch(0, 0, &[0.0, 1.0, 2.0, 3.0, 4.0]))
+            .unwrap();
+        buffer.push_gap(5, 5, GapReason::SampleIndexLoss);
+        buffer
+            .push_batch(batch(10, 100, &[5.0, 6.0, 7.0, 8.0, 9.0]))
+            .unwrap();
+
+        let snapshot = buffer.snapshot(4);
+
+        assert_eq!(snapshot.segments.len(), 2);
+        assert!(snapshot
+            .segments
+            .iter()
+            .all(|segment| !segment.times.is_empty()));
+        assert!(
+            snapshot
+                .segments
+                .iter()
+                .map(|segment| segment.times.len())
+                .sum::<usize>()
+                <= 4
+        );
     }
 }
