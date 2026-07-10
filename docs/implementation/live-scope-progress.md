@@ -4,7 +4,7 @@
 
 ## 当前里程碑
 
-里程碑 6：实时工作区 UI、`.scope` 打开入口与桌面程序组合接入。
+里程碑 7：0.8.0 版本同步、SCP1 固件协议与用户操作文档。
 
 ## 已完成内容
 
@@ -39,6 +39,9 @@
 - 已实现离线/实时工作区切换；实时工作区包含 TCP/串口连接、采集配置、Start/Stop、暂停显示、通道可见性/颜色、触发配置、实时统计和分段波形显示。
 - 已实现 `.scope` 文件对话框入口；录波回放通过独立 `ScopeRecordingDataSource` 进入既有离线分析工作区。
 - 已把已连接时的界面刷新节流为约 60 Hz；采集线程和协议处理不在 egui 绘制线程中阻塞。
+- 已将重大功能版本从 0.7.1 同步升级到 0.8.0，覆盖 Cargo manifest/lock、Windows PowerShell 打包、WiX Product Version 和 README 产物名。
+- 已发布 `docs/protocols/scp1-live-scope-v1.md`：冻结帧布局、CRC32C、消息方向、握手/状态机、所有 payload、采样交织方式、gap 和错误处理要求。
+- README 已加入实时工作区、模拟器、TCP/串口、触发、录波与回放操作说明，并明确真实硬件尚未验证。
 
 ## 测试结果
 
@@ -75,6 +78,8 @@
 - `cargo +1.87.0 clippy --all-targets --quiet`：退出码 0；仅有 vendor eframe 和既有离线应用警告。
 - `cargo +1.87.0 test --no-run`：通过，library、桌面客户端和模拟器全部测试目标编译成功。
 - 已实际启动 `scope_dsp_simulator --accelerated`，监听 `127.0.0.1:19090`；桌面 `scope_analyzer` 也成功启动且无启动期错误。
+- 里程碑 7 TDD RED：版本同步测试期望 0.8.0，首次运行在 `CARGO_PKG_VERSION=0.7.1` 失败；同步所有版本位置后通过。
+- `cargo +1.87.0 test --lib release_tests::live_scope_release_version_is_synchronized`：1/1 通过。
 
 ## 未验证内容
 
@@ -85,9 +90,8 @@
 
 ## 后续任务
 
-1. 同步 0.8.0 版本，补充协议/操作文档和发布检查。
-2. 处理或隔离 macOS 基线的 4 个失败测试，完成全量回归。
-3. 验证 release 构建并正常推送功能分支。
+1. 处理或隔离 macOS 基线的 4 个失败测试，完成全量回归。
+2. 验证 release 构建并正常推送功能分支。
 
 ## 硬件实测状态
 

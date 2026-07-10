@@ -11,6 +11,8 @@ Configuration import/export is intentionally split so one file type cannot overw
 
 Windows 离线波形分析工具。界面按软件示波器方式组织，支持多 CSV 数据组叠加、通道勾选与分栏显示、双光标测量、选区 FFT/THD、三相正负序分析、变量名导入导出、浅色/深色主题和中英文界面。
 
+0.8.0 新增 DSP 实时软件示波器：TCP/串口 SCP1 采集、软件触发、有界实时缓冲、`.scope` 录波与离线回放，以及可独立运行的确定性 DSP 模拟器。原有离线分析、FFT、导出、配置和打包流程保持不变。
+
 完整交互说明也集成在软件顶部 `Help` 菜单中。
 
 ## 快速开始
@@ -21,6 +23,20 @@ Windows 离线波形分析工具。界面按软件示波器方式组织，支持
 4. 导入成功的 CSV 会加入 `Recent Files`，列表保存为程序目录下的 `scope-recent-files.json`。
 
 顶部 `Names` 菜单只导入/导出变量显示名。导出的默认文件名是 `scope-names.json`，文件内容只包含 `display_names`；通道显示状态、颜色、线宽、倍率、FFT 设置、快捷键、语言和主题不会随变量名文件导入导出。
+
+## DSP 实时示波器
+
+无硬件时可先启动内置 TCP 模拟器：
+
+```bash
+cargo run --release --bin scope_dsp_simulator -- --listen 127.0.0.1:19090
+```
+
+再启动客户端，顶部切换到 `Live/实时`，保留默认地址 `127.0.0.1:19090`，依次点击 `Connect/连接`、`Configure/应用采集` 和 `Start/开始`。实时工作区可设置采样率、每帧点数、显示历史、通道颜色与可见性，以及 Auto/Normal/Single、上升/下降/双边沿软件触发。
+
+`Record/录波` 将经过协议校验的采样帧、gap 和触发事件写入 `.scope`。完成录波后可用 `Open recording/打开录波` 进入离线工作区，并继续使用既有光标、测量、FFT、序分量和导出功能。显示暂停只冻结画面，不停止采集或录波；使用 `Stop/停止` 才会停止设备数据流。
+
+串口模式使用 8-N-1、无流控；波特率在实时工具栏中配置。DSP 固件需要实现 [SCP1 V1 协议](docs/protocols/scp1-live-scope-v1.md)。当前模拟器闭环已经自动测试，真实 DSP 板卡和 Windows 串口仍需按目标硬件实测。
 
 ## 当前支持的数据格式
 
@@ -173,8 +189,8 @@ experiments.
 
 产物在：
 
-- `dist/ScopeAnalyzer-0.7.1-win-x64.zip`
-- `dist/ScopeAnalyzer-0.7.1-win-x64.msi`
+- `dist/ScopeAnalyzer-0.8.0-win-x64.zip`
+- `dist/ScopeAnalyzer-0.8.0-win-x64.msi`
 
 ## 启动渲染器和云桌面兜底
 
