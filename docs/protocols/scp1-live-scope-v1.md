@@ -159,7 +159,30 @@ state：0=Idle，1=Configured，2=Streaming。
 - 客户端 UI 队列背压造成的丢批次必须生成 HostBackpressure gap，不允许用连线掩盖缺口。
 - DSP 自身丢样应体现在 `first_sample_index` 跳变及 STATUS 计数中。
 
-## 7. 参考实现与一致性测试
+## 7. `.scope` V1 触发与异步写入约束
+
+Trigger 记录 payload 固定 48 字节，所有多字节字段仍为 little-endian：
+
+| 偏移 | 长度 | 字段 |
+| ---: | ---: | --- |
+| 0 | 1 | trigger record version，固定 1 |
+| 1 | 1 | mode：0 Auto、1 Normal、2 Single |
+| 2 | 1 | edge：0 Rising、1 Falling、2 Either |
+| 3 | 1 | auto_timeout：0/1 |
+| 4 | 2 | source_channel |
+| 6 | 2 | reserved，固定 0 |
+| 8 | 8 | trigger_sample_index |
+| 16 | 4 | level (`f32`) |
+| 20 | 4 | hysteresis (`f32`) |
+| 24 | 8 | pre_samples |
+| 32 | 8 | post_samples |
+| 40 | 8 | auto_timeout_samples |
+
+Trigger 记录头的 `timestamp_ticks` 是触发样点时间。干净录波的 Index 必须逐项匹配已扫描 SampleFrame 的首样点索引、时间戳和 payload 文件偏移；即使 Index 自身 CRC 有效，内容不一致也属于文件损坏。
+
+客户端使用独立的 128 项有界录波队列。写盘不在 egui/UI 线程执行；队列满或 writer 失败会立即终止本次录波并保留可顺序恢复的有效前缀，不能继续写出带 SessionEnd 的“伪完整”文件。
+
+## 8. 参考实现与一致性测试
 
 - Rust codec：`src/live/protocol.rs`
 - 采集状态机：`src/live/session.rs`

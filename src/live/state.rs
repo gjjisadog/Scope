@@ -6,7 +6,7 @@ use std::{
 use super::{
     buffer::{LiveBuffer, LiveSnapshot},
     protocol::{ChannelTable, Configure, Frame, HelloAck, ResultCode},
-    recording::{RecordingMetadata, ScopeWriter},
+    recording::{AsyncScopeRecorder, RecordingMetadata, RecordingStats},
     session::{ConnectionState, LiveSession, SessionEvent, SessionStats},
     transport::TransportConfig,
     trigger::{TriggerCapture, TriggerConfig, TriggerEngine},
@@ -39,7 +39,7 @@ pub struct LiveScopeState {
     pub frozen_snapshot: Option<LiveSnapshot>,
     pub serial_ports: Vec<String>,
     session: Option<LiveSession>,
-    recording: Option<ScopeWriter>,
+    recording: Option<AsyncScopeRecorder>,
 }
 
 impl Default for LiveScopeState {
@@ -146,7 +146,7 @@ impl LiveScopeState {
             channel_mask: self.acquisition.channel_mask,
             client_version: env!("CARGO_PKG_VERSION").to_owned(),
         };
-        self.recording = Some(ScopeWriter::create(path, metadata).map_err(error_string)?);
+        self.recording = Some(AsyncScopeRecorder::create(path, metadata).map_err(error_string)?);
         self.recording_path = Some(path.to_path_buf());
         Ok(())
     }
@@ -160,7 +160,23 @@ impl LiveScopeState {
     }
 
     pub fn is_recording(&self) -> bool {
-        self.recording.is_some()
+        self.recording
+            .as_ref()
+            .is_some_and(AsyncScopeRecorder::is_accepting)
+    }
+
+    pub fn recording_stats(&self) -> RecordingStats {
+        self.recording
+            .as_ref()
+            .map(AsyncScopeRecorder::stats)
+            .unwrap_or_default()
+    }
+
+    pub fn recording_pending_records(&self) -> usize {
+        self.recording
+            .as_ref()
+            .map(AsyncScopeRecorder::pending_records)
+            .unwrap_or(0)
     }
 
     pub fn snapshot(&self, max_points: usize) -> Option<LiveSnapshot> {
@@ -187,6 +203,14 @@ impl LiveScopeState {
     }
 
     pub fn poll(&mut self) {
+        let recording_error = self
+            .recording
+            .as_mut()
+            .and_then(AsyncScopeRecorder::poll_error);
+        if let Some(error) = recording_error {
+            self.recording.take();
+            self.last_error = Some(error.to_string());
+        }
         let mut events = Vec::new();
         if let Some(session) = &self.session {
             while let Ok(event) = session.try_recv() {
@@ -227,11 +251,19 @@ impl LiveScopeState {
             SessionEvent::Batch(batch) => {
                 if let Some(writer) = &mut self.recording {
                     let frame = Frame::decode(&batch.raw_frame).map_err(error_string)?;
-                    writer.write_sample_frame(&frame).map_err(error_string)?;
+                    if let Err(error) = writer.try_write_sample_frame(frame) {
+                        self.recording.take();
+                        return Err(error_string(error));
+                    }
                 }
                 if let Some(capture) = self.trigger.feed(&batch).map_err(error_string)? {
                     if let Some(writer) = &mut self.recording {
-                        writer.write_trigger(&capture).map_err(error_string)?;
+                        if let Err(error) =
+                            writer.try_write_trigger(capture.clone(), self.trigger.config().clone())
+                        {
+                            self.recording.take();
+                            return Err(error_string(error));
+                        }
                     }
                     self.last_capture = Some(capture);
                 }
@@ -247,7 +279,10 @@ impl LiveScopeState {
                     buffer.push_gap(gap.start_sample_index, gap.missing_samples, gap.reason);
                 }
                 if let Some(writer) = &mut self.recording {
-                    writer.write_gap(gap, 0).map_err(error_string)?;
+                    if let Err(error) = writer.try_write_gap(gap, 0) {
+                        self.recording.take();
+                        return Err(error_string(error));
+                    }
                 }
             }
             SessionEvent::Stats(stats) => self.stats = stats,
@@ -298,9 +333,7 @@ impl LiveScopeState {
 
 impl Drop for LiveScopeState {
     fn drop(&mut self) {
-        if let Some(writer) = self.recording.take() {
-            let _ = writer.finish();
-        }
+        self.recording.take();
         if let Some(session) = self.session.take() {
             let _ = session.disconnect();
         }
@@ -396,6 +429,10 @@ mod tests {
                 .as_ref()
                 .is_some_and(|buffer| buffer.len() >= 30)
         });
+        wait_until(&mut state, |state| {
+            state.recording_stats().sample_frames >= 3
+        });
+        assert!(state.recording_pending_records() <= 128);
         state.stop().unwrap();
         wait_until(&mut state, |state| {
             state.connection_state == ConnectionState::Ready

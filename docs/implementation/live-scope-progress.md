@@ -48,6 +48,10 @@
 - 完成性复审发现初版 CHANNEL_TABLE 字符串长度排列与冻结设计不一致、协议文档缺少固件 golden frame、配置未对设备协商上限做统一校验；已以新测试先复现并修正。
 - CHANNEL_TABLE descriptor 已冻结为“固定字段、unit/name 两个长度、unit/name 两段字节”的布局；PING 完整 golden frame 和 CRC 已写入固件协议文档。
 - 已新增设备约束校验和 CONFIGURE 成功 detail 的规范编码/解码，覆盖 tick_hz、最大批量、通道 mask 和协商 payload 上限。
+- 已将录波从 UI `poll` 同步文件写入改为独立 128 项有界 writer 线程；队列满、worker 写入失败和 worker panic 均有显式错误，录波立即停止且只保留可恢复前缀。
+- Trigger 记录升级为固定 48 字节完整记录，包含 mode、edge、源通道、level、hysteresis、pre/post、Auto timeout、触发样点和超时标志。
+- 干净文件打开时会逐项核对 Index 与实际 SampleFrame 索引/时间戳/文件偏移；有效 CRC 但内容不一致的 Index 也会拒绝。
+- `LiveScopeState` 已接入异步录波统计、pending 数量和 worker 故障轮询；显式结束录波仍等待 Index/SessionEnd 与 `sync_all` 完成，应用异常退出则不无限等待并由恢复扫描处理。
 
 ## 测试结果
 
@@ -94,6 +98,10 @@
 - 最终 `cargo +1.87.0 build --release --bins`：通过，生成 release 客户端与 DSP 模拟器二进制。
 - 里程碑 9 TDD RED：CHANNEL_TABLE golden layout 测试实际得到 `unit_len, unit, name_len, name`，与冻结设计不符；调整 codec 后通过。
 - `cargo +1.87.0 test --lib live::protocol::tests`：15/15 通过，包括完整帧 golden bytes、descriptor golden bytes 和设备配置协商约束。
+- 录波 TDD RED：Trigger 完整配置 API/读取结果和 Index 内容一致性均缺失；实现后两个目标测试通过。
+- 异步录波 TDD RED：`AsyncScopeRecorder`、QueueFull/WorkerFailed 和统计 API 缺失；实现后正常完成、确定性队列溢出、worker 故障传播 3 个测试通过。
+- `cargo +1.87.0 test --lib live::recording::tests`：8/8 通过。
+- `cargo +1.87.0 test --lib live::state::tests::simulator_acquisition_records_and_replays`：通过，异步 writer 至少落盘 3 帧后完成客户端—模拟器—回放闭环。
 
 ## 未验证内容
 
@@ -104,8 +112,8 @@
 
 ## 后续任务
 
-1. 实现独立有界录波线程、完整 Trigger/Index 记录和写入故障传播。
-2. 补齐会话关闭、状态机、背压、重连与 UI 操作面缺口。
+1. 补齐会话关闭、状态机、背压、重连与协商参数应用。
+2. 补齐倍率、Auto 超时、触发冻结和录波统计 UI。
 3. 重新执行完整发布验证并正常推送功能分支。
 
 ## 硬件实测状态

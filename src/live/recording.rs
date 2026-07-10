@@ -2,16 +2,19 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    thread::{self, JoinHandle},
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{
     buffer::{GapReason, LiveGap},
     protocol::{crc32c, decode_sample_frame, ChannelTable, Frame, ProtocolError},
-    trigger::TriggerCapture,
+    trigger::{TriggerCapture, TriggerConfig, TriggerEdge, TriggerEngine, TriggerMode},
 };
 
 const FILE_MAGIC: [u8; 8] = *b"SCOPEV1\0";
@@ -27,6 +30,9 @@ const RECORD_GAP: u8 = 2;
 const RECORD_TRIGGER: u8 = 3;
 const RECORD_SESSION_END: u8 = 4;
 const RECORD_INDEX: u8 = 5;
+const TRIGGER_RECORD_VERSION: u8 = 1;
+const TRIGGER_RECORD_LEN: usize = 48;
+const RECORDING_QUEUE_CAPACITY: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RecordingMetadata {
@@ -71,6 +77,21 @@ pub struct SampleRecordIndex {
     pub sample_count: u16,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct TriggerRecord {
+    pub timestamp_ticks: u64,
+    pub trigger_sample_index: u64,
+    pub config: TriggerConfig,
+    pub auto_timeout: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StoredIndexEntry {
+    first_sample_index: u64,
+    timestamp_ticks: u64,
+    payload_offset: u64,
+}
+
 impl SampleRecordIndex {
     pub fn last_timestamp_ticks(&self) -> Result<u64, RecordingError> {
         let offset = u64::from(self.sample_period_ticks)
@@ -92,6 +113,14 @@ pub enum RecordingError {
     Protocol(#[from] ProtocolError),
     #[error("invalid scope recording: {0}")]
     InvalidFormat(String),
+    #[error("scope recording queue is full; recording stopped")]
+    QueueFull,
+    #[error("scope recording worker stopped unexpectedly")]
+    WorkerStopped,
+    #[error("scope recording worker failed: {0}")]
+    WorkerFailed(String),
+    #[error("scope recording worker panicked")]
+    WorkerPanicked,
 }
 
 pub struct ScopeWriter {
@@ -167,7 +196,11 @@ impl ScopeWriter {
         Ok(())
     }
 
-    pub fn write_trigger(&mut self, capture: &TriggerCapture) -> Result<(), RecordingError> {
+    pub fn write_trigger(
+        &mut self,
+        capture: &TriggerCapture,
+        config: &TriggerConfig,
+    ) -> Result<(), RecordingError> {
         let trigger_index = capture
             .sample_indices
             .get(capture.trigger_position)
@@ -178,9 +211,39 @@ impl ScopeWriter {
             .get(capture.trigger_position)
             .copied()
             .ok_or_else(|| format_error_value("trigger timestamp is out of range"))?;
-        let mut payload = Vec::with_capacity(9);
-        payload.extend_from_slice(&trigger_index.to_le_bytes());
+        if !capture.channel_ids.contains(&config.source_channel) {
+            return format_error("trigger source channel is absent from capture");
+        }
+        if capture.auto_timeout && config.mode != TriggerMode::Auto {
+            return format_error("non-Auto trigger capture is marked as an auto timeout");
+        }
+        TriggerEngine::new(config.clone())
+            .map_err(|error| format_error_value(error.to_string()))?;
+        let mut payload = Vec::with_capacity(TRIGGER_RECORD_LEN);
+        payload.push(TRIGGER_RECORD_VERSION);
+        payload.push(trigger_mode_code(config.mode));
+        payload.push(trigger_edge_code(config.edge));
         payload.push(u8::from(capture.auto_timeout));
+        payload.extend_from_slice(&config.source_channel.to_le_bytes());
+        payload.extend_from_slice(&0_u16.to_le_bytes());
+        payload.extend_from_slice(&trigger_index.to_le_bytes());
+        payload.extend_from_slice(&config.level.to_le_bytes());
+        payload.extend_from_slice(&config.hysteresis.to_le_bytes());
+        payload.extend_from_slice(
+            &u64::try_from(config.pre_samples)
+                .map_err(|_| format_error_value("trigger pre_samples does not fit u64"))?
+                .to_le_bytes(),
+        );
+        payload.extend_from_slice(
+            &u64::try_from(config.post_samples)
+                .map_err(|_| format_error_value("trigger post_samples does not fit u64"))?
+                .to_le_bytes(),
+        );
+        payload.extend_from_slice(
+            &u64::try_from(config.auto_timeout_samples)
+                .map_err(|_| format_error_value("trigger auto timeout does not fit u64"))?
+                .to_le_bytes(),
+        );
         self.write_record(RECORD_TRIGGER, 0, timestamp, &payload)?;
         Ok(())
     }
@@ -242,11 +305,259 @@ impl Drop for ScopeWriter {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecordingStats {
+    pub written_records: u64,
+    pub sample_frames: u64,
+    pub gap_records: u64,
+    pub trigger_records: u64,
+}
+
+enum RecordingCommand {
+    SampleFrame(Frame),
+    Gap(LiveGap, u64),
+    Trigger(TriggerCapture, TriggerConfig),
+    Finish(Sender<Result<(), String>>),
+    #[cfg(test)]
+    Pause(Sender<()>, Receiver<()>),
+    #[cfg(test)]
+    FailForTest,
+}
+
+pub struct AsyncScopeRecorder {
+    command_tx: Option<Sender<RecordingCommand>>,
+    error_rx: Receiver<String>,
+    stats: Arc<Mutex<RecordingStats>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl AsyncScopeRecorder {
+    pub fn create(path: &Path, metadata: RecordingMetadata) -> Result<Self, RecordingError> {
+        Self::create_with_capacity(path, metadata, RECORDING_QUEUE_CAPACITY)
+    }
+
+    fn create_with_capacity(
+        path: &Path,
+        metadata: RecordingMetadata,
+        capacity: usize,
+    ) -> Result<Self, RecordingError> {
+        if capacity == 0 {
+            return format_error("recording queue capacity must be greater than zero");
+        }
+        let writer = ScopeWriter::create(path, metadata)?;
+        let (command_tx, command_rx) = bounded(capacity);
+        let (error_tx, error_rx) = bounded(1);
+        let stats = Arc::new(Mutex::new(RecordingStats::default()));
+        let worker_stats = Arc::clone(&stats);
+        let worker = thread::Builder::new()
+            .name("scope-recording-writer".to_owned())
+            .spawn(move || recording_worker(writer, command_rx, error_tx, worker_stats))?;
+        Ok(Self {
+            command_tx: Some(command_tx),
+            error_rx,
+            stats,
+            worker: Some(worker),
+        })
+    }
+
+    pub fn try_write_sample_frame(&mut self, frame: Frame) -> Result<(), RecordingError> {
+        self.try_send(RecordingCommand::SampleFrame(frame))
+    }
+
+    pub fn try_write_gap(
+        &mut self,
+        gap: LiveGap,
+        timestamp_ticks: u64,
+    ) -> Result<(), RecordingError> {
+        self.try_send(RecordingCommand::Gap(gap, timestamp_ticks))
+    }
+
+    pub fn try_write_trigger(
+        &mut self,
+        capture: TriggerCapture,
+        config: TriggerConfig,
+    ) -> Result<(), RecordingError> {
+        self.try_send(RecordingCommand::Trigger(capture, config))
+    }
+
+    pub fn poll_error(&mut self) -> Option<RecordingError> {
+        match self.error_rx.try_recv() {
+            Ok(error) => {
+                self.command_tx.take();
+                Some(RecordingError::WorkerFailed(error))
+            }
+            Err(crossbeam_channel::TryRecvError::Disconnected) if self.worker_finished() => {
+                self.command_tx.take();
+                Some(RecordingError::WorkerStopped)
+            }
+            Err(_) => None,
+        }
+    }
+
+    pub fn is_accepting(&self) -> bool {
+        self.command_tx.is_some() && !self.worker_finished()
+    }
+
+    pub fn pending_records(&self) -> usize {
+        self.command_tx.as_ref().map(Sender::len).unwrap_or(0)
+    }
+
+    pub fn stats(&self) -> RecordingStats {
+        self.stats.lock().map(|stats| *stats).unwrap_or_default()
+    }
+
+    pub fn finish(mut self) -> Result<(), RecordingError> {
+        let command_tx = self
+            .command_tx
+            .take()
+            .ok_or(RecordingError::WorkerStopped)?;
+        let (result_tx, result_rx) = bounded(1);
+        command_tx
+            .send(RecordingCommand::Finish(result_tx))
+            .map_err(|_| self.worker_error_or_stopped())?;
+        drop(command_tx);
+        let result = result_rx
+            .recv()
+            .map_err(|_| self.worker_error_or_stopped())?
+            .map_err(RecordingError::WorkerFailed);
+        self.join_worker()?;
+        result
+    }
+
+    pub fn abort(mut self) -> Result<(), RecordingError> {
+        self.command_tx.take();
+        self.join_worker()
+    }
+
+    fn try_send(&mut self, command: RecordingCommand) -> Result<(), RecordingError> {
+        if let Some(error) = self.poll_error() {
+            return Err(error);
+        }
+        let sender = self
+            .command_tx
+            .as_ref()
+            .ok_or(RecordingError::WorkerStopped)?;
+        match sender.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                self.command_tx.take();
+                Err(RecordingError::QueueFull)
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.command_tx.take();
+                Err(self.worker_error_or_stopped())
+            }
+        }
+    }
+
+    fn worker_finished(&self) -> bool {
+        self.worker.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+
+    fn worker_error_or_stopped(&self) -> RecordingError {
+        self.error_rx
+            .try_recv()
+            .map(RecordingError::WorkerFailed)
+            .unwrap_or(RecordingError::WorkerStopped)
+    }
+
+    fn join_worker(&mut self) -> Result<(), RecordingError> {
+        if let Some(worker) = self.worker.take() {
+            worker.join().map_err(|_| RecordingError::WorkerPanicked)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn pause_worker_for_test(&self) -> Sender<()> {
+        let (ready_tx, ready_rx) = bounded(0);
+        let (release_tx, release_rx) = bounded(0);
+        self.command_tx
+            .as_ref()
+            .expect("recorder accepts commands")
+            .send(RecordingCommand::Pause(ready_tx, release_rx))
+            .unwrap();
+        ready_rx.recv().unwrap();
+        release_tx
+    }
+
+    #[cfg(test)]
+    fn fail_worker_for_test(&self) {
+        self.command_tx
+            .as_ref()
+            .expect("recorder accepts commands")
+            .send(RecordingCommand::FailForTest)
+            .unwrap();
+    }
+}
+
+impl Drop for AsyncScopeRecorder {
+    fn drop(&mut self) {
+        self.command_tx.take();
+        // Dropping a JoinHandle detaches the worker. This keeps application shutdown bounded;
+        // the worker owns the file and flushes its recoverable prefix when it observes disconnect.
+        self.worker.take();
+    }
+}
+
+fn recording_worker(
+    mut writer: ScopeWriter,
+    command_rx: Receiver<RecordingCommand>,
+    error_tx: Sender<String>,
+    stats: Arc<Mutex<RecordingStats>>,
+) {
+    while let Ok(command) = command_rx.recv() {
+        let result = match command {
+            RecordingCommand::SampleFrame(frame) => writer.write_sample_frame(&frame).map(|()| 1),
+            RecordingCommand::Gap(gap, timestamp_ticks) => {
+                writer.write_gap(gap, timestamp_ticks).map(|()| 2)
+            }
+            RecordingCommand::Trigger(capture, config) => {
+                writer.write_trigger(&capture, &config).map(|()| 3)
+            }
+            RecordingCommand::Finish(result_tx) => {
+                let result = writer.finish().map_err(|error| error.to_string());
+                let _ = result_tx.send(result);
+                return;
+            }
+            #[cfg(test)]
+            RecordingCommand::Pause(ready_tx, release_rx) => {
+                let _ = ready_tx.send(());
+                let _ = release_rx.recv();
+                continue;
+            }
+            #[cfg(test)]
+            RecordingCommand::FailForTest => {
+                let _ = error_tx.send("injected writer failure".to_owned());
+                return;
+            }
+        };
+        match result {
+            Ok(record_type) => {
+                if let Ok(mut stats) = stats.lock() {
+                    stats.written_records = stats.written_records.saturating_add(1);
+                    match record_type {
+                        1 => stats.sample_frames = stats.sample_frames.saturating_add(1),
+                        2 => stats.gap_records = stats.gap_records.saturating_add(1),
+                        3 => stats.trigger_records = stats.trigger_records.saturating_add(1),
+                        _ => {}
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = error_tx.send(error.to_string());
+                return;
+            }
+        }
+    }
+}
+
 pub struct ScopeRecording {
     path: PathBuf,
     metadata: RecordingMetadata,
     sample_records: Vec<SampleRecordIndex>,
     gaps: Vec<LiveGap>,
+    triggers: Vec<TriggerRecord>,
     clean_end: bool,
     recovered_tail: bool,
 }
@@ -257,6 +568,8 @@ impl ScopeRecording {
         let metadata = read_file_header(&mut file)?;
         let mut sample_records = Vec::new();
         let mut gaps = Vec::new();
+        let mut triggers = Vec::new();
+        let mut stored_index: Option<Vec<StoredIndexEntry>> = None;
         let mut clean_end = false;
         let mut recovered_tail = false;
         loop {
@@ -335,12 +648,21 @@ impl ScopeRecording {
                     });
                 }
                 RECORD_GAP => gaps.push(decode_gap(&payload)?),
-                RECORD_TRIGGER => validate_trigger_record(&payload)?,
-                RECORD_INDEX => validate_index(&payload)?,
+                RECORD_TRIGGER => triggers.push(decode_trigger_record(timestamp_ticks, &payload)?),
+                RECORD_INDEX => {
+                    if stored_index.is_some() {
+                        return format_error("duplicate index record");
+                    }
+                    stored_index = Some(decode_index(&payload)?);
+                }
                 RECORD_SESSION_END => {
                     if !payload.is_empty() || timestamp_ticks != 0 {
                         return format_error("invalid SessionEnd record");
                     }
+                    let index = stored_index
+                        .as_deref()
+                        .ok_or_else(|| format_error_value("SessionEnd is missing index record"))?;
+                    validate_index_matches_records(index, &sample_records)?;
                     clean_end = true;
                     break;
                 }
@@ -352,6 +674,7 @@ impl ScopeRecording {
             metadata,
             sample_records,
             gaps,
+            triggers,
             clean_end,
             recovered_tail,
         })
@@ -371,6 +694,10 @@ impl ScopeRecording {
 
     pub fn gaps(&self) -> &[LiveGap] {
         &self.gaps
+    }
+
+    pub fn triggers(&self) -> &[TriggerRecord] {
+        &self.triggers
     }
 
     pub fn clean_end(&self) -> bool {
@@ -449,7 +776,7 @@ fn encode_index(index: &[SampleRecordIndex]) -> Result<Vec<u8>, RecordingError> 
     Ok(payload)
 }
 
-fn validate_index(payload: &[u8]) -> Result<(), RecordingError> {
+fn decode_index(payload: &[u8]) -> Result<Vec<StoredIndexEntry>, RecordingError> {
     if payload.len() < 4 {
         return format_error("truncated index record");
     }
@@ -460,6 +787,32 @@ fn validate_index(payload: &[u8]) -> Result<(), RecordingError> {
         .ok_or_else(|| format_error_value("index length overflow"))?;
     if payload.len() != expected {
         return format_error("index record length mismatch");
+    }
+    let mut entries = Vec::with_capacity(count);
+    for bytes in payload[4..].chunks_exact(24) {
+        entries.push(StoredIndexEntry {
+            first_sample_index: u64::from_le_bytes(bytes[0..8].try_into().expect("fixed slice")),
+            timestamp_ticks: u64::from_le_bytes(bytes[8..16].try_into().expect("fixed slice")),
+            payload_offset: u64::from_le_bytes(bytes[16..24].try_into().expect("fixed slice")),
+        });
+    }
+    Ok(entries)
+}
+
+fn validate_index_matches_records(
+    index: &[StoredIndexEntry],
+    records: &[SampleRecordIndex],
+) -> Result<(), RecordingError> {
+    if index.len() != records.len() {
+        return format_error("index entry count does not match sample records");
+    }
+    for (entry, record) in index.iter().zip(records) {
+        if entry.first_sample_index != record.first_sample_index
+            || entry.timestamp_ticks != record.timestamp_ticks
+            || entry.payload_offset != record.payload_offset
+        {
+            return format_error("index entry does not match sample record");
+        }
     }
     Ok(())
 }
@@ -487,11 +840,81 @@ fn decode_gap(payload: &[u8]) -> Result<LiveGap, RecordingError> {
     })
 }
 
-fn validate_trigger_record(payload: &[u8]) -> Result<(), RecordingError> {
-    if payload.len() != 9 || payload[8] > 1 {
+fn decode_trigger_record(
+    timestamp_ticks: u64,
+    payload: &[u8],
+) -> Result<TriggerRecord, RecordingError> {
+    if payload.len() != TRIGGER_RECORD_LEN
+        || payload[0] != TRIGGER_RECORD_VERSION
+        || payload[3] > 1
+        || payload[6..8] != [0, 0]
+    {
         return format_error("invalid trigger record");
     }
-    Ok(())
+    let config = TriggerConfig {
+        mode: decode_trigger_mode(payload[1])?,
+        edge: decode_trigger_edge(payload[2])?,
+        source_channel: u16::from_le_bytes(payload[4..6].try_into().expect("fixed slice")),
+        level: f32::from_le_bytes(payload[16..20].try_into().expect("fixed slice")),
+        hysteresis: f32::from_le_bytes(payload[20..24].try_into().expect("fixed slice")),
+        pre_samples: usize::try_from(u64::from_le_bytes(
+            payload[24..32].try_into().expect("fixed slice"),
+        ))
+        .map_err(|_| format_error_value("trigger pre_samples does not fit usize"))?,
+        post_samples: usize::try_from(u64::from_le_bytes(
+            payload[32..40].try_into().expect("fixed slice"),
+        ))
+        .map_err(|_| format_error_value("trigger post_samples does not fit usize"))?,
+        auto_timeout_samples: usize::try_from(u64::from_le_bytes(
+            payload[40..48].try_into().expect("fixed slice"),
+        ))
+        .map_err(|_| format_error_value("trigger auto timeout does not fit usize"))?,
+    };
+    TriggerEngine::new(config.clone()).map_err(|error| format_error_value(error.to_string()))?;
+    let auto_timeout = payload[3] != 0;
+    if auto_timeout && config.mode != TriggerMode::Auto {
+        return format_error("non-Auto trigger record is marked as an auto timeout");
+    }
+    Ok(TriggerRecord {
+        timestamp_ticks,
+        trigger_sample_index: u64::from_le_bytes(payload[8..16].try_into().expect("fixed slice")),
+        config,
+        auto_timeout,
+    })
+}
+
+fn trigger_mode_code(mode: TriggerMode) -> u8 {
+    match mode {
+        TriggerMode::Auto => 0,
+        TriggerMode::Normal => 1,
+        TriggerMode::Single => 2,
+    }
+}
+
+fn decode_trigger_mode(value: u8) -> Result<TriggerMode, RecordingError> {
+    match value {
+        0 => Ok(TriggerMode::Auto),
+        1 => Ok(TriggerMode::Normal),
+        2 => Ok(TriggerMode::Single),
+        _ => format_error(format!("unknown trigger mode {value}")),
+    }
+}
+
+fn trigger_edge_code(edge: TriggerEdge) -> u8 {
+    match edge {
+        TriggerEdge::Rising => 0,
+        TriggerEdge::Falling => 1,
+        TriggerEdge::Either => 2,
+    }
+}
+
+fn decode_trigger_edge(value: u8) -> Result<TriggerEdge, RecordingError> {
+    match value {
+        0 => Ok(TriggerEdge::Rising),
+        1 => Ok(TriggerEdge::Falling),
+        2 => Ok(TriggerEdge::Either),
+        _ => format_error(format!("unknown trigger edge {value}")),
+    }
 }
 
 fn gap_reason_code(reason: GapReason) -> u8 {
@@ -528,6 +951,7 @@ mod tests {
                 WireFormat, MSG_SAMPLE_BATCH,
             },
             scope_source::ScopeRecordingDataSource,
+            trigger::{TriggerCapture, TriggerConfig, TriggerEdge, TriggerMode},
         },
     };
 
@@ -587,6 +1011,30 @@ mod tests {
             timestamp,
             message.encode_payload().unwrap(),
         )
+    }
+
+    fn trigger_capture() -> TriggerCapture {
+        TriggerCapture {
+            channel_ids: vec![0],
+            sample_indices: vec![10, 11, 12],
+            timestamps: vec![1_000, 1_100, 1_200],
+            channels: vec![vec![-1.0, 0.5, 1.0]],
+            trigger_position: 1,
+            auto_timeout: false,
+        }
+    }
+
+    fn trigger_config() -> TriggerConfig {
+        TriggerConfig {
+            mode: TriggerMode::Single,
+            edge: TriggerEdge::Rising,
+            source_channel: 0,
+            level: 0.25,
+            hysteresis: 0.1,
+            pre_samples: 1,
+            post_samples: 1,
+            auto_timeout_samples: 500,
+        }
     }
 
     #[test]
@@ -681,6 +1129,142 @@ mod tests {
             ScopeRecording::open(&path),
             Err(RecordingError::InvalidFormat(message)) if message.contains("CRC")
         ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recording_persists_complete_trigger_configuration() {
+        let path = unique_path("trigger");
+        let mut writer = ScopeWriter::create(&path, metadata()).unwrap();
+        writer
+            .write_trigger(&trigger_capture(), &trigger_config())
+            .unwrap();
+        writer.finish().unwrap();
+
+        let recording = ScopeRecording::open(&path).unwrap();
+
+        assert_eq!(
+            recording.triggers(),
+            &[TriggerRecord {
+                timestamp_ticks: 1_100,
+                trigger_sample_index: 11,
+                config: trigger_config(),
+                auto_timeout: false,
+            }]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recording_rejects_a_valid_crc_index_that_disagrees_with_sample_records() {
+        let path = unique_path("bad_index");
+        let mut writer = ScopeWriter::create(&path, metadata()).unwrap();
+        writer
+            .write_sample_frame(&sample_frame(1, 0, 0, &[1, 2]))
+            .unwrap();
+        writer.finish().unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let index_offset = bytes
+            .windows(RECORD_MAGIC.len())
+            .rposition(|window| window == RECORD_MAGIC)
+            .unwrap();
+        assert_eq!(bytes[index_offset + 4], RECORD_SESSION_END);
+        let index_offset = bytes[..index_offset]
+            .windows(RECORD_MAGIC.len())
+            .rposition(|window| window == RECORD_MAGIC)
+            .unwrap();
+        assert_eq!(bytes[index_offset + 4], RECORD_INDEX);
+        let payload_len = u32::from_le_bytes(
+            bytes[index_offset + 8..index_offset + 12]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let payload_start = index_offset + RECORD_HEADER_LEN as usize;
+        bytes[payload_start + 4] ^= 0x01;
+        let crc_start = payload_start + payload_len;
+        let checksum = crc32c(&bytes[index_offset + 4..crc_start]);
+        bytes[crc_start..crc_start + 4].copy_from_slice(&checksum.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        assert!(matches!(
+            ScopeRecording::open(&path),
+            Err(RecordingError::InvalidFormat(message)) if message.contains("index")
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn async_recorder_writes_validated_records_and_finishes_cleanly() {
+        let path = unique_path("async");
+        let mut recorder = AsyncScopeRecorder::create(&path, metadata()).unwrap();
+
+        recorder
+            .try_write_sample_frame(sample_frame(1, 0, 0, &[1, 2]))
+            .unwrap();
+        recorder
+            .try_write_gap(
+                LiveGap {
+                    start_sample_index: 2,
+                    missing_samples: 2,
+                    reason: GapReason::SampleIndexLoss,
+                },
+                200,
+            )
+            .unwrap();
+        recorder
+            .try_write_trigger(trigger_capture(), trigger_config())
+            .unwrap();
+        recorder.finish().unwrap();
+
+        let recording = ScopeRecording::open(&path).unwrap();
+        assert!(recording.clean_end());
+        assert_eq!(recording.sample_records().len(), 1);
+        assert_eq!(recording.gaps().len(), 1);
+        assert_eq!(recording.triggers().len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn async_recorder_queue_overflow_stops_without_writing_a_clean_end() {
+        let path = unique_path("queue_full");
+        let mut recorder = AsyncScopeRecorder::create_with_capacity(&path, metadata(), 1).unwrap();
+        let release = recorder.pause_worker_for_test();
+        recorder
+            .try_write_sample_frame(sample_frame(1, 0, 0, &[1, 2]))
+            .unwrap();
+
+        assert!(matches!(
+            recorder.try_write_sample_frame(sample_frame(2, 2, 200, &[3, 4])),
+            Err(RecordingError::QueueFull)
+        ));
+        drop(release);
+        recorder.abort().unwrap();
+
+        let recording = ScopeRecording::open(&path).unwrap();
+        assert!(!recording.clean_end());
+        assert!(recording.recovered_tail());
+        assert_eq!(recording.sample_records().len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn async_recorder_reports_worker_failure_to_the_owner() {
+        let path = unique_path("worker_failure");
+        let mut recorder = AsyncScopeRecorder::create(&path, metadata()).unwrap();
+        recorder.fail_worker_for_test();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let error = loop {
+            if let Some(error) = recorder.poll_error() {
+                break error;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+
+        assert!(matches!(error, RecordingError::WorkerFailed(_)));
+        assert!(!recorder.is_accepting());
+        recorder.abort().unwrap();
         let _ = std::fs::remove_file(path);
     }
 }
