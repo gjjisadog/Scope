@@ -2,4 +2,8 @@ pub mod buffer;
 pub mod protocol;
 pub mod recording;
 pub mod scope_source;
+pub mod session;
+pub mod simulator;
+pub mod state;
+pub mod transport;
 pub mod trigger;

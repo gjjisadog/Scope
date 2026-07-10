@@ -4,7 +4,7 @@
 
 ## 当前里程碑
 
-里程碑 4：可恢复 `.scope` 录波与离线回放。
+里程碑 5：串口/TCP transport、采集 session 与 DSP 模拟器闭环。
 
 ## 已完成内容
 
@@ -30,6 +30,11 @@
 - 录波只接受通过协议和通道表校验的 SAMPLE_BATCH；干净结束写入索引和结束标记。
 - 已实现顺序扫描恢复：截断的最终记录可恢复，文件中间 CRC 错误会拒绝打开，不静默跳过。
 - 已实现独立 `ScopeRecordingDataSource`，支持范围读取、抽取、min-max 摘要和取消令牌，并复用现有离线分析 trait。
+- 已加入有界 `crossbeam-channel` 和 `serialport`，实现可配置 TCP/串口 transport、串口枚举、8N1/无流控和读写超时。
+- 已实现采集 worker：握手、通道表、配置、Start/Stop、心跳、session_id 校验、采样解码、gap/统计和 3 秒失联检测。
+- UI 事件背压丢弃显示批次时会累计 HostBackpressure gap，不静默跨缺口连接波形。
+- 已实现确定性 TCP DSP 模拟器和独立 CLI，支持实时/加速、采样率、批量大小、seed、周期丢帧/损坏和主动断线。
+- 已实现 `LiveScopeState` 组合层，持有 session、buffer、trigger、recording 和统计；端到端测试完成连接、采集、录波、停止和 DataSource 回放。
 
 ## 测试结果
 
@@ -57,6 +62,10 @@
 - 里程碑 4 TDD RED：录波往返测试因 writer、scanner 和 DataSource 不存在而编译失败；实现后录波测试通过。
 - `cargo +1.87.0 test --lib live::`：23/23 通过，包括截断尾恢复和中间 CRC 损坏拒绝。
 - 里程碑 4 的 `cargo +1.87.0 fmt --all --check` 与 `cargo +1.87.0 clippy --lib --quiet`：退出码 0，仅有 vendor eframe 既有警告。
+- 里程碑 5 TDD RED：TCP session 测试因 transport/simulator/session 类型缺失编译失败；实现后握手与连续采样测试通过。
+- 里程碑 5 TDD RED：组合闭环测试因 `LiveScopeState` 缺失编译失败；实现后客户端—模拟器—录波—回放通过。
+- `cargo +1.87.0 test --lib live::`：27/27 通过，包括丢帧 gap 与端到端录波回放。
+- `cargo +1.87.0 test --bin scope_dsp_simulator`：1/1 通过。
 
 ## 未验证内容
 
@@ -67,8 +76,8 @@
 
 ## 后续任务
 
-1. 实现 TCP/串口 transport、DSP 模拟器和采集 session。
-2. 按 TDD 实施端到端录波闭环和 UI。
+1. 将 `LiveScopeState` 通过单一字段组合进 `ScopeApp`，实现实时工作区 UI。
+2. 增加 `.scope` 打开入口、版本同步、协议/操作文档和完整回归。
 3. 每个可验收里程碑执行测试、更新本文件并独立提交。
 4. 完成全量回归、版本同步和正常推送。
 
@@ -81,4 +90,4 @@
 - 当前仓库基线在 macOS 上已有 4 个失败测试，详见“测试结果”。
 - Rust 1.97.0 会因更严格的浮点类型推断在现有 `src/app.rs` 中编译失败；Rust 1.87.0 能执行基线测试。
 - 仓库没有现成的实时采集协议、串口模块、触发模块或 `.scope` 格式。
-- 当前已完成协议、实时缓冲、软件触发、录波和离线回放；连接会话、模拟器和 UI 尚未实现。
+- 当前已完成无硬件依赖的客户端—模拟器闭环；egui 实时工作区和真实 DSP 串口硬件实测尚未完成。
