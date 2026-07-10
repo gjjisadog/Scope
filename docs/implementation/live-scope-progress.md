@@ -4,7 +4,7 @@
 
 ## 当前里程碑
 
-里程碑 8：跨平台测试基线修复与发布前全量回归。
+里程碑 8 已完成：跨平台测试基线修复与发布前全量回归。
 
 ## 已完成内容
 
@@ -84,6 +84,10 @@
 - `cargo +1.87.0 test --lib release_tests::live_scope_release_version_is_synchronized`：1/1 通过。
 - 回归修复前稳定复现原基线 4 个失败；逐项修正后 4 个目标测试均单独通过。
 - `cargo +1.87.0 test --quiet`：全部通过；library 51/51、桌面客户端 111/111（另 5 个显式 ignored）、模拟器 1/1、doc tests 0。
+- 最终 `cargo +1.87.0 fmt --all --check`：通过。
+- 最终 `cargo +1.87.0 clippy --all-targets --quiet`：退出码 0；保留 vendor eframe 与既有离线模块的非阻断警告，没有新增实时模块警告。
+- 最终 `cargo +1.87.0 test --quiet -- --ignored`：5/5 ignored 性能/兼容性测试通过。
+- 最终 `cargo +1.87.0 build --release --bins`：通过，生成 release 客户端与 DSP 模拟器二进制。
 
 ## 未验证内容
 
@@ -94,8 +98,8 @@
 
 ## 后续任务
 
-1. 执行 fmt、clippy、release 构建和最终全量测试。
-2. 正常推送功能分支。
+1. 正常推送 `feature/live-dsp-scope-v1`。
+2. 获得目标 DSP 板卡和 Windows 测试机后执行硬件/安装包验收。
 
 ## 硬件实测状态
 
