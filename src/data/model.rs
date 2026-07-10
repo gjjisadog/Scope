@@ -1,4 +1,10 @@
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use thiserror::Error;
 
@@ -23,6 +29,43 @@ pub enum DataError {
     #[error("暂不支持该文件格式：{0}")]
     #[allow(dead_code)]
     UnsupportedFormat(String),
+    #[error("Operation cancelled.")]
+    Cancelled,
+}
+
+#[derive(Clone, Debug)]
+pub struct DataCancelToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl DataCancelToken {
+    pub fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+
+    pub fn check(&self) -> DataResult<()> {
+        if self.is_cancelled() {
+            Err(DataError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Default for DataCancelToken {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -57,6 +100,79 @@ impl DatasetMeta {
 pub struct SampleBlock {
     pub times: Vec<f64>,
     pub channels: Vec<Vec<f32>>,
+}
+
+pub fn decimation_stride_for_budget(sample_count: usize, max_points: usize) -> usize {
+    if sample_count <= 1 || max_points <= 1 || sample_count <= max_points {
+        1
+    } else {
+        (sample_count - 1).div_ceil(max_points - 1).max(1)
+    }
+}
+
+pub fn should_keep_decimated_sample(
+    sample_offset: usize,
+    sample_count: usize,
+    max_points: usize,
+    stride: usize,
+) -> bool {
+    if max_points <= 1 {
+        return sample_offset == 0;
+    }
+    sample_offset == 0
+        || sample_offset + 1 == sample_count
+        || sample_offset.is_multiple_of(stride.max(1))
+}
+
+pub fn append_sample_columns(
+    times: &mut Vec<f64>,
+    channel_values: &mut [Vec<f32>],
+    time: f64,
+    values: &[f32],
+) {
+    times.push(time);
+    for (out_index, value) in values.iter().enumerate().take(channel_values.len()) {
+        channel_values[out_index].push(*value);
+    }
+}
+
+pub fn ensure_last_sample_columns(
+    times: &mut Vec<f64>,
+    channel_values: &mut [Vec<f32>],
+    time: Option<f64>,
+    values: Option<&[f32]>,
+    max_points: usize,
+) {
+    if max_points <= 1 {
+        return;
+    }
+    let (Some(time), Some(values)) = (time, values) else {
+        return;
+    };
+    if values.len() < channel_values.len()
+        || times
+            .last()
+            .is_some_and(|last_time| (*last_time - time).abs() <= f64::EPSILON)
+    {
+        return;
+    }
+    let budget = max_points.max(1);
+    if times.len() < budget {
+        append_sample_columns(times, channel_values, time, values);
+        return;
+    }
+    let Some(last_index) = times.len().checked_sub(1) else {
+        return;
+    };
+    times[last_index] = time;
+    for (out_index, value) in values.iter().enumerate().take(channel_values.len()) {
+        if let Some(slot) = channel_values
+            .get_mut(out_index)
+            .and_then(|channel| channel.get_mut(last_index))
+        {
+            *slot = *value;
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -157,6 +273,20 @@ pub trait DataSource: Send + Sync {
         max_points: usize,
     ) -> DataResult<SampleBlock>;
 
+    fn read_range_cancellable(
+        &self,
+        start_time: f64,
+        end_time: f64,
+        channels: &[usize],
+        max_points: usize,
+        cancel: &DataCancelToken,
+    ) -> DataResult<SampleBlock> {
+        cancel.check()?;
+        let block = self.read_range(start_time, end_time, channels, max_points)?;
+        cancel.check()?;
+        Ok(block)
+    }
+
     fn summarize_range(
         &self,
         start_time: f64,
@@ -164,4 +294,67 @@ pub trait DataSource: Send + Sync {
         channels: &[usize],
         target_bins: usize,
     ) -> DataResult<RangeSummary>;
+
+    fn summarize_range_cancellable(
+        &self,
+        start_time: f64,
+        end_time: f64,
+        channels: &[usize],
+        target_bins: usize,
+        cancel: &DataCancelToken,
+    ) -> DataResult<RangeSummary> {
+        cancel.check()?;
+        let summary = self.summarize_range(start_time, end_time, channels, target_bins)?;
+        cancel.check()?;
+        Ok(summary)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decimation_stride_for_budget, should_keep_decimated_sample, DataCancelToken};
+
+    #[test]
+    fn cloned_data_cancel_token_observes_cancellation() {
+        let token = DataCancelToken::new();
+        let cloned = token.clone();
+
+        assert!(!token.is_cancelled());
+
+        cloned.cancel();
+
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn decimation_keeps_first_and_last_within_budget() {
+        let sample_count = 10;
+        let max_points = 4;
+        let stride = decimation_stride_for_budget(sample_count, max_points);
+
+        let kept = (0..sample_count)
+            .filter(|offset| {
+                should_keep_decimated_sample(*offset, sample_count, max_points, stride)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(stride, 3);
+        assert_eq!(kept, vec![0, 3, 6, 9]);
+    }
+
+    #[test]
+    fn decimation_single_point_budget_keeps_only_start() {
+        let sample_count = 10;
+        let max_points = 1;
+        let stride = decimation_stride_for_budget(sample_count, max_points);
+
+        let kept = (0..sample_count)
+            .filter(|offset| {
+                should_keep_decimated_sample(*offset, sample_count, max_points, stride)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(stride, 1);
+        assert_eq!(kept, vec![0]);
+    }
 }

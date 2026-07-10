@@ -1,0 +1,83 @@
+<h2>自定义公式计算：新数据应该放在哪里？</h2>
+<p class="subtitle">请先选这个边界。它决定公式结果能否被勾选、测量、导出、复用到其他数据组。</p>
+
+<div class="cards">
+  <div class="card" data-choice="derived-library" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup">
+        <div class="mockup-header">推荐：公式库 + 派生变量</div>
+        <div class="mockup-body">
+          <div class="mock-sidebar">
+            Channels<br>
+            CH1<br>
+            CH2<br>
+            <strong>Formula</strong><br>
+            P = CH1 * CH2<br>
+            RMS = sqrt(...)
+          </div>
+          <div class="mock-content">
+            Formula Editor<br>
+            name: P<br>
+            expression: CH1 * CH2<br>
+            Apply to selected dataset
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>A. 作为新变量进入左侧列表</h3>
+      <p>设定公式后生成派生变量；之后像普通通道一样勾选、换颜色、测量、导出。公式可保存为模板，并对选中的数据组复用。</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="temporary-preview" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup">
+        <div class="mockup-header">轻量：临时预览曲线</div>
+        <div class="mockup-body">
+          <div class="mock-sidebar">
+            Channels<br>
+            CH1<br>
+            CH2
+          </div>
+          <div class="mock-content">
+            Preview only<br>
+            y = CH1 - CH2<br>
+            Draw on plot
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>B. 只作为临时计算曲线</h3>
+      <p>适合快速试算；不污染通道列表，但复用、测量、导出能力会弱一些。</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="materialized-dataset" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup">
+        <div class="mockup-header">重型：生成独立数据组</div>
+        <div class="mockup-body">
+          <div class="mock-sidebar">
+            Dataset A<br>
+            Dataset B<br>
+            <strong>Formula Output</strong>
+          </div>
+          <div class="mock-content">
+            Exportable synthetic dataset<br>
+            CSV-style generated columns
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>C. 生成独立的新数据组</h3>
+      <p>结果像导入的新文件一样存在；最利于后续数据导出，但实现更重，也更容易和原始数据组管理混在一起。</p>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <p><strong>我的初步建议：</strong>选 A。它最贴合“生成新的数据”和“选中数据复用公式计算”，同时能复用当前已有的 PLL/dq0 派生曲线、测量、绘图和导出路径。</p>
+</div>

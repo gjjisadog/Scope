@@ -134,6 +134,19 @@ impl PlotUi {
         self.items.push(Box::new(line));
     }
 
+    /// Add a min/max envelope.
+    pub fn envelope(&mut self, mut envelope: Envelope) {
+        if envelope.high_series.is_empty() && envelope.low_series.is_empty() {
+            return;
+        };
+
+        // Give the stroke an automatic color if no color has been assigned.
+        if envelope.stroke.color == Color32::TRANSPARENT {
+            envelope.stroke.color = self.auto_color();
+        }
+        self.items.push(Box::new(envelope));
+    }
+
     /// Add a polygon. The polygon has to be convex.
     pub fn polygon(&mut self, mut polygon: Polygon) {
         if polygon.series.is_empty() {

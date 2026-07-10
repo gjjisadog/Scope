@@ -1,0 +1,69 @@
+<h2>推荐设计：公式库 + 通用派生变量系统</h2>
+<p class="subtitle">公式结果进入左侧变量列表；公式定义保存，结果按当前窗口和选中数据组重算。</p>
+
+<div class="mockup">
+  <div class="mockup-header">User Flow</div>
+  <div class="mockup-body">
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;align-items:stretch">
+      <div class="placeholder">
+        1. Formula Manager<br>
+        新建/编辑公式<br>
+        name + expression
+      </div>
+      <div class="placeholder">
+        2. Validate + Map<br>
+        名称匹配通道<br>
+        缺失时手动映射
+      </div>
+      <div class="placeholder">
+        3. Derived Channels<br>
+        左侧列表出现结果<br>
+        可勾选/调色/分窗格
+      </div>
+      <div class="placeholder">
+        4. Plot/Measure/Export<br>
+        按窗口计算缓存<br>
+        参与测量和导出
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">Left Panel</div>
+    <div class="mockup-body">
+      <div class="mock-sidebar" style="width:100%">
+        Primary Dataset<br>
+        [x] stVg_0.iA<br>
+        [ ] stVg_0.iB<br>
+        [x] stIg_0.iA<br>
+        <br>
+        Built-in Derived<br>
+        [ ] PLL theta (deg)<br>
+        [ ] dq0.d<br>
+        <br>
+        Formulas<br>
+        [x] P_phaseA = V_A * I_A<br>
+        [ ] I_rms = rms(I_A)
+      </div>
+    </div>
+  </div>
+  <div class="mockup">
+    <div class="mockup-header">Formula Editor</div>
+    <div class="mockup-body">
+      <input class="mock-input" value="P_phaseA">
+      <input class="mock-input" value="stVg_0.iA * stIg_0.iA">
+      <button class="mock-button">Validate</button>
+      <button class="mock-button">Apply to selected datasets</button>
+      <div class="placeholder">
+        Missing in Dataset B:<br>
+        stVg_0.iA -> choose matching channel
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <p><strong>Design principle:</strong> formulas are definitions, not stored samples. Calculation runs through the same background job/cancel/cache pattern already used by plot, measurement, and PLL/dq0.</p>
+</div>

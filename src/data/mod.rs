@@ -17,7 +17,9 @@ pub use csv_source::CsvDataSource;
 pub use dat_source::DatDataSource;
 pub use merged_bits_source::MergedLeadingBitsDataSource;
 pub use model::{
-    ChannelMeta, DataError, DataResult, DataSource, DatasetMeta, RangeSummary, SampleBlock,
+    append_sample_columns, decimation_stride_for_budget, ensure_last_sample_columns,
+    should_keep_decimated_sample, ChannelMeta, DataCancelToken, DataError, DataResult, DataSource,
+    DatasetMeta, RangeSummary, SampleBlock,
 };
 pub use renamed_source::RenamedDataSource;
 pub use text_encoding::csv_reader_from_path_with_headers;

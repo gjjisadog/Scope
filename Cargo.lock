@@ -2495,9 +2495,10 @@ dependencies = [
 
 [[package]]
 name = "scope_analyzer"
-version = "0.6.0"
+version = "0.7.1"
 dependencies = [
  "ab_glyph",
+ "clipboard-win",
  "csv",
  "eframe",
  "egui_plot",

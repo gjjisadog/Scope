@@ -15,7 +15,7 @@ Windows 离线波形分析工具。界面按软件示波器方式组织，支持
 
 ## 快速开始
 
-1. 使用顶部 `Add Data` 菜单选择一个或多个 CSV 文件。
+1. 使用顶部 `Import Data` 菜单选择一个或多个 CSV 文件。
 2. 第一个文件作为主数据，后续文件作为附加数据组按相同通道序号叠加显示。
 3. 软件读取第一行后自动识别云端 `Content` CSV 或本地数值 CSV。
 4. 导入成功的 CSV 会加入 `Recent Files`，列表保存为程序目录下的 `scope-recent-files.json`。
@@ -68,7 +68,7 @@ time,CH1,CH2,CH3
 
 ### 数据组与布局
 
-- `Add Data` 可一次选择多个波形文件，第一组为主数据，附加数据组以虚线叠加。
+- `Import Data` 可一次选择多个波形文件，第一组为主数据，附加数据组以虚线叠加。
 - 菜单中可勾选一个或多个数据组后删除。
 - 左侧变量栏按数据组、模拟量/数字量和变量名组织。
 - 右键数据组可全选/全不选该数据组变量，也可配置该组线型。
@@ -91,16 +91,18 @@ time,CH1,CH2,CH3
 - `Names > Import Names` 只恢复变量显示名。
 - 导入或导出成功的文件会显示在 `Names > Recent Names`，可清空列表。
 - 变量名文件不会覆盖通道可见性、颜色、线宽、倍率、FFT 设置、快捷键、语言或主题。
+- `Config` 中的变量名、显示、快捷键、数据组配置各自导入导出、各自维护最近文件。
+- 配置文件带有类型标识；选错配置类型时会拒绝导入，避免不同配置互相覆盖。
 
-### 波形图片与报告导出
+### 波形图片与 DOCX 导出
 
 - `Export > Export Waveform PNG` 会先打开导出标注台，不会立即保存。
-- 标注台提供选择、文字、箭头、画笔、橡皮、撤销和重做工具。
+- 标注台提供选择、文字、箭头、矩形/椭圆、画笔、橡皮、撤销和恢复工具。
 - 变量名标注会自动生成，箭头默认吸附对应曲线；拖动变量名时箭头会自动变长、缩短和旋转，拖动锚点可改变箭头指向同一曲线的位置。
-- 手动箭头和文字用于标注故障点、实验现象和说明，不绑定变量曲线。
-- 可保存 PNG、SVG，也可导出 Word 报告。
-- 批量导出可按多个时间窗口、数据组和子窗口生成多张 PNG，或把多张已标注波形图写入同一个 Word 报告。
-- Word 报告使用内置简洁模板，光标数据表可选择包含或隐藏；第一版不导入外部 Word 模板。
+- 手动箭头和文字用于标注故障点、现象和说明，不绑定变量曲线。
+- 可保存 PNG、SVG，也可导出 DOCX。
+- 批量导出可按多个时间窗口、数据组和子窗口生成多张 PNG，或把多张已标注波形图写入同一个 DOCX。
+- DOCX 使用内置简洁模板，光标数据表可选择包含或隐藏；第一版不导入外部模板。
 
 ### 光标与缩放
 
@@ -116,7 +118,7 @@ time,CH1,CH2,CH3
 
 ### 测量、FFT 与序分量
 
-- 右侧 `Analysis Dataset` 选择测量和 FFT 使用的数据组。
+- 右侧 `Analysis` 统一选择数据组、分析通道和三相 A/B/C 通道；测量、FFT 和正负序共用该入口。
 - `Measurements` 对 X1/X2 区间内已选通道显示 `Y1`、`Y2`、`dY`、最大值和最小值，结果使用通道倍率后的值。
 - `FFT` 可选择数据组和模拟量通道，分析 X1/X2 之间的选区。
 - FFT/谐波计算会去除直流均值，使用 Hann 窗，并按目标谐波频率做相量投影和窗增益补偿。
@@ -158,13 +160,21 @@ cargo run --release
 在 Windows 机器安装 Rust 稳定版和 WiX Toolset v3 后执行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release-check.ps1
+$env:SCOPE_PACKAGE_OFFLINE=1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -OfflinePackage
 ```
+
+Release machines should preload Mesa in `target/mesa-runtime/x64` with
+`mesa-runtime-manifest.json` or provide `MESA_RUNTIME_DIR`/`third_party/mesa`.
+Bundle ANGLE from `ANGLE_RUNTIME_DIR`, `third_party/angle`, or
+`target/angle-runtime`; `SCOPE_ALLOW_SYSTEM_ANGLE=1` is only for local packaging
+experiments.
 
 产物在：
 
-- `dist/ScopeAnalyzer-0.5.0-win-x64.zip`
-- `dist/ScopeAnalyzer-0.5.0-win-x64.msi`
+- `dist/ScopeAnalyzer-0.7.1-win-x64.zip`
+- `dist/ScopeAnalyzer-0.7.1-win-x64.msi`
 
 ## 启动渲染器和云桌面兜底
 
@@ -179,25 +189,30 @@ powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1
 5. `mesa` / Mesa llvmpipe software OpenGL, isolated in the packaged `mesa`
    directory as the last cloud-desktop fallback.
 
-Packaged builds copy ANGLE runtime DLLs from the build machine when available, so
-installed copies can use the executable directory before falling back to system
-Edge/WebView locations. If every renderer exits during startup, the launcher
-tries the isolated Mesa helper before stopping. Mesa runtime files are resolved
-from `MESA_RUNTIME_DIR`, `third_party/mesa`, `target/mesa-runtime/x64`, or by
-downloading the latest `release-msvc` asset from `pal1000/mesa-dist-win` during
-packaging. Set `SCOPE_SKIP_MESA_DOWNLOAD=1` to package without downloading Mesa.
+Packaged builds bundle ANGLE only from explicit reproducible sources:
+`ANGLE_RUNTIME_DIR`, `third_party/angle`, or `target/angle-runtime`. When ANGLE
+is bundled, packaging writes `angle-runtime-manifest.json` with the copied DLL
+hashes. Set `SCOPE_ALLOW_SYSTEM_ANGLE=1` only for local experiments that should
+probe the build machine's Edge/WebView runtime. If every renderer exits during
+startup, the launcher tries the isolated Mesa helper before stopping. Mesa
+runtime files are resolved
+from `MESA_RUNTIME_DIR`, `third_party/mesa`, or the verified
+`target/mesa-runtime/x64` cache. If no local runtime is available, packaging
+downloads the pinned `pal1000/mesa-dist-win` `26.0.8`
+`mesa3d-26.0.8-release-msvc.7z` asset and verifies SHA256 before extraction.
+The automatic cache writes `mesa-runtime-manifest.json`; CI/release machines can
+preload this cache and set `SCOPE_PACKAGE_OFFLINE=1` or pass `-OfflinePackage`
+to fail instead of downloading. Set `SCOPE_SKIP_MESA_DOWNLOAD=1` to package
+without Mesa.
 
-Packaged builds also include:
+Packaged builds include two startup entries:
 
 - `Start-ScopeAnalyzer.bat`: automatic fallback.
-- `Start-ScopeAnalyzer-OpenGL.bat`: force `SCOPE_RENDERER=glow`.
-- `Start-ScopeAnalyzer-DX12.bat`: force `SCOPE_RENDERER=wgpu`.
-- `Start-ScopeAnalyzer-Software.bat`: force `SCOPE_RENDERER=glow-software`.
 - `Start-ScopeAnalyzer-Mesa.bat`: force the isolated Mesa llvmpipe helper.
 
-云桌面建议优先使用默认启动器。若虚拟显卡仍无法启动，可依次尝试
-`Start-ScopeAnalyzer-Software.bat` 和 `Start-ScopeAnalyzer-Mesa.bat`。Mesa
-主要作为最后兜底，显示效果通常一致，但 CPU 占用和拖拽缩放流畅度可能下降。
+云桌面建议优先使用默认启动器。若虚拟显卡仍无法启动，再使用
+`Start-ScopeAnalyzer-Mesa.bat` 强制 Mesa/llvmpipe 兜底。Mesa 显示效果通常一致，
+但 CPU 占用和拖拽缩放流畅度可能下降。
 
 软件顶部 `Help` 菜单提供：
 

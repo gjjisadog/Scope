@@ -22,6 +22,7 @@ pub struct CanvasRect {
     pub bottom: i32,
 }
 
+#[allow(dead_code)]
 impl CanvasRect {
     pub const fn width(self) -> i32 {
         self.right - self.left
@@ -47,7 +48,14 @@ pub enum AnnotationLineStyle {
     Dotted,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShapeKind {
+    Rectangle,
+    Ellipse,
+}
+
 #[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)]
 pub struct VariableLabelAnnotation {
     pub label_index: usize,
     pub text: String,
@@ -75,6 +83,50 @@ pub struct ArrowAnnotation {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct RectangleAnnotation {
+    pub kind: ShapeKind,
+    pub rect: CanvasRect,
+    pub color: AnnotationColor,
+    pub width: i32,
+    pub line_style: AnnotationLineStyle,
+}
+
+impl RectangleAnnotation {
+    #[allow(dead_code)]
+    pub fn from_corners(
+        start: CanvasPoint,
+        end: CanvasPoint,
+        color: AnnotationColor,
+        width: i32,
+        line_style: AnnotationLineStyle,
+    ) -> Self {
+        Self::from_corners_with_kind(start, end, ShapeKind::Rectangle, color, width, line_style)
+    }
+
+    pub fn from_corners_with_kind(
+        start: CanvasPoint,
+        end: CanvasPoint,
+        kind: ShapeKind,
+        color: AnnotationColor,
+        width: i32,
+        line_style: AnnotationLineStyle,
+    ) -> Self {
+        Self {
+            kind,
+            rect: CanvasRect {
+                left: start.x.min(end.x),
+                top: start.y.min(end.y),
+                right: start.x.max(end.x),
+                bottom: start.y.max(end.y),
+            },
+            color,
+            width: width.max(1),
+            line_style,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct InkStroke {
     pub points: Vec<CanvasPoint>,
     pub color: AnnotationColor,
@@ -82,10 +134,12 @@ pub struct InkStroke {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+#[allow(dead_code)]
 pub struct AnnotationDocument {
     pub variable_labels: Vec<VariableLabelAnnotation>,
     pub text_annotations: Vec<TextAnnotation>,
     pub arrow_annotations: Vec<ArrowAnnotation>,
+    pub rectangle_annotations: Vec<RectangleAnnotation>,
     pub ink_strokes: Vec<InkStroke>,
 }
 
@@ -99,9 +153,13 @@ pub fn clamp_label_position(
     let max_x = (bounds.right - text_width - 5).max(min_x);
     let min_y = bounds.top + 5;
     let max_y = (bounds.bottom - text_height - 5).max(min_y);
-    CanvasPoint::new(position.x.clamp(min_x, max_x), position.y.clamp(min_y, max_y))
+    CanvasPoint::new(
+        position.x.clamp(min_x, max_x),
+        position.y.clamp(min_y, max_y),
+    )
 }
 
+#[allow(dead_code)]
 pub fn arrow_start_for_label(label: CanvasRect, target: CanvasPoint) -> CanvasPoint {
     let center_y = label.top + label.height() / 2;
     if target.x < label.left {
@@ -111,19 +169,14 @@ pub fn arrow_start_for_label(label: CanvasRect, target: CanvasPoint) -> CanvasPo
     }
 }
 
-pub fn point_segment_distance_sq(
-    point: CanvasPoint,
-    start: CanvasPoint,
-    end: CanvasPoint,
-) -> f64 {
+pub fn point_segment_distance_sq(point: CanvasPoint, start: CanvasPoint, end: CanvasPoint) -> f64 {
     let vx = (end.x - start.x) as f64;
     let vy = (end.y - start.y) as f64;
     let wx = (point.x - start.x) as f64;
     let wy = (point.y - start.y) as f64;
     let len_sq = vx * vx + vy * vy;
     if len_sq <= f64::EPSILON {
-        return ((point.x - start.x) as f64).powi(2)
-            + ((point.y - start.y) as f64).powi(2);
+        return ((point.x - start.x) as f64).powi(2) + ((point.y - start.y) as f64).powi(2);
     }
     let t = ((wx * vx + wy * vy) / len_sq).clamp(0.0, 1.0);
     let cx = start.x as f64 + vx * t;
@@ -178,5 +231,44 @@ mod tests {
         let point = CanvasPoint::new(13, 14);
         let start = CanvasPoint::new(10, 10);
         assert_eq!(point_segment_distance_sq(point, start, start), 25.0);
+    }
+
+    #[test]
+    fn rectangle_annotation_normalizes_drag_corners() {
+        let rect = RectangleAnnotation::from_corners(
+            CanvasPoint::new(320, 240),
+            CanvasPoint::new(120, 90),
+            AnnotationColor {
+                r: 220,
+                g: 20,
+                b: 38,
+                a: 255,
+            },
+            4,
+            AnnotationLineStyle::Solid,
+        );
+
+        assert_eq!(
+            rect.rect,
+            CanvasRect {
+                left: 120,
+                top: 90,
+                right: 320,
+                bottom: 240
+            }
+        );
+        assert_eq!(rect.kind, ShapeKind::Rectangle);
+        assert_eq!(rect.width, 4);
+
+        let ellipse = RectangleAnnotation::from_corners_with_kind(
+            CanvasPoint::new(1, 2),
+            CanvasPoint::new(11, 22),
+            ShapeKind::Ellipse,
+            rect.color,
+            2,
+            AnnotationLineStyle::Solid,
+        );
+        assert_eq!(ellipse.kind, ShapeKind::Ellipse);
+        assert_eq!(ellipse.rect.width(), 10);
     }
 }

@@ -106,8 +106,45 @@ impl WaveformCanvas for SvgCanvas {
         ));
     }
 
+    fn stroke_ellipse(
+        &mut self,
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+        color: Rgba,
+        width: i32,
+    ) {
+        if right <= left || bottom <= top {
+            return;
+        }
+        let cx = (left + right) as f32 / 2.0;
+        let cy = (top + bottom) as f32 / 2.0;
+        let rx = (right - left) as f32 / 2.0;
+        let ry = (bottom - top) as f32 / 2.0;
+        let stroke = width.max(1);
+        self.elements.push(format!(
+            r#"<ellipse cx="{cx:.1}" cy="{cy:.1}" rx="{rx:.1}" ry="{ry:.1}" fill="none" stroke="{}"{} stroke-width="{stroke}" />"#,
+            color_hex(color),
+            opacity_attr("stroke", color)
+        ));
+    }
+
     fn line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: Rgba, width: i32) {
         self.line_styled(x0, y0, x1, y1, color, width, StrokeStyle::Solid);
+    }
+
+    fn line_styled(
+        &mut self,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        color: Rgba,
+        width: i32,
+        style: StrokeStyle,
+    ) {
+        SvgCanvas::line_styled(self, x0, y0, x1, y1, color, width, style);
     }
 
     fn line_clipped(
@@ -138,6 +175,9 @@ impl WaveformCanvas for SvgCanvas {
     ) {
         let width = width.max(1);
         self.line_styled(x0, y0, x1, y1, color, width, style);
+        if head_size <= 0.0 {
+            return;
+        }
         let angle = ((y1 - y0) as f32).atan2((x1 - x0) as f32);
         let head = head_size.max(3.0);
         for offset in [2.55_f32, -2.55_f32] {

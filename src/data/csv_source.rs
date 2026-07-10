@@ -7,8 +7,11 @@ use std::{
 use csv::{Position, StringRecord};
 
 use super::{
+    append_sample_columns, decimation_stride_for_budget, ensure_last_sample_columns,
+    should_keep_decimated_sample,
     text_encoding::{csv_reader_from_path, normalize_label},
-    ChannelMeta, DataError, DataResult, DataSource, DatasetMeta, RangeSummary, SampleBlock,
+    ChannelMeta, DataCancelToken, DataError, DataResult, DataSource, DatasetMeta, RangeSummary,
+    SampleBlock,
 };
 
 const MAX_CHANNELS: usize = 128;
@@ -303,24 +306,18 @@ impl CsvDataSource {
         }
         Ok(())
     }
-}
 
-impl DataSource for CsvDataSource {
-    fn open(path: &Path) -> DataResult<Self> {
-        Self::open_with_sample_rate(path, 1000.0)
-    }
-
-    fn metadata(&self) -> &DatasetMeta {
-        &self.meta
-    }
-
-    fn read_range(
+    fn read_range_with_cancel(
         &self,
         start_time: f64,
         end_time: f64,
         channels: &[usize],
         max_points: usize,
+        cancel: Option<&DataCancelToken>,
     ) -> DataResult<SampleBlock> {
+        if let Some(cancel) = cancel {
+            cancel.check()?;
+        }
         self.validate_channels(channels)?;
         if self.blocks.is_empty() || channels.is_empty() || end_time <= start_time {
             return Ok(SampleBlock::default());
@@ -331,8 +328,8 @@ impl DataSource for CsvDataSource {
         reader.seek(self.blocks[first_block].position.clone())?;
         let mut sample_index = self.blocks[first_block].start_sample;
         let estimated_points =
-            ((end_time - start_time) * self.meta.nominal_sample_rate_hz).max(1.0) as usize;
-        let stride = (estimated_points / max_points.max(1)).max(1);
+            ((end_time - start_time) * self.meta.nominal_sample_rate_hz + 1.0).max(1.0) as usize;
+        let stride = decimation_stride_for_budget(estimated_points, max_points);
         let mut seen = 0_usize;
         let capacity = estimated_points.min(max_points.max(1)) + 1;
         let mut times = Vec::with_capacity(capacity);
@@ -340,8 +337,15 @@ impl DataSource for CsvDataSource {
             .map(|_| Vec::with_capacity(capacity))
             .collect::<Vec<_>>();
         let mut record = StringRecord::new();
+        let mut last_in_window_time = None;
+        let mut last_in_window_values: Option<Vec<f32>> = None;
 
         while reader.read_record(&mut record)? {
+            if seen.is_multiple_of(1024) {
+                if let Some(cancel) = cancel {
+                    cancel.check()?;
+                }
+            }
             let time = match self.layout {
                 CsvLayout::TimeColumn => {
                     let Ok(time) = Self::parse_time(&record) else {
@@ -363,36 +367,78 @@ impl DataSource for CsvDataSource {
             if time > end_time {
                 break;
             }
-            if seen.is_multiple_of(stride) {
-                let values = match self.layout {
-                    CsvLayout::TimeColumn => {
-                        Self::parse_selected_values(&record, self.meta.channels.len(), channels)
-                    }
-                    CsvLayout::SyntheticTime {
-                        first_channel_column,
-                        ..
-                    } => Self::parse_synthetic_selected_values(
-                        &record,
-                        self.meta.channels.len(),
-                        first_channel_column,
-                        channels,
-                    ),
-                };
-                let Ok(values) = values else {
-                    continue;
-                };
-                times.push(time);
-                for (out_index, value) in values.iter().enumerate() {
-                    channel_values[out_index].push(*value);
+            let values = match self.layout {
+                CsvLayout::TimeColumn => {
+                    Self::parse_selected_values(&record, self.meta.channels.len(), channels)
                 }
+                CsvLayout::SyntheticTime {
+                    first_channel_column,
+                    ..
+                } => Self::parse_synthetic_selected_values(
+                    &record,
+                    self.meta.channels.len(),
+                    first_channel_column,
+                    channels,
+                ),
+            };
+            let Ok(values) = values else {
+                seen += 1;
+                continue;
+            };
+            last_in_window_time = Some(time);
+            last_in_window_values = Some(values.clone());
+            if should_keep_decimated_sample(seen, estimated_points, max_points, stride) {
+                append_sample_columns(&mut times, &mut channel_values, time, &values);
             }
             seen += 1;
         }
 
+        ensure_last_sample_columns(
+            &mut times,
+            &mut channel_values,
+            last_in_window_time,
+            last_in_window_values.as_deref(),
+            max_points.max(1),
+        );
+
+        if let Some(cancel) = cancel {
+            cancel.check()?;
+        }
         Ok(SampleBlock {
             times,
             channels: channel_values,
         })
+    }
+}
+
+impl DataSource for CsvDataSource {
+    fn open(path: &Path) -> DataResult<Self> {
+        Self::open_with_sample_rate(path, 1000.0)
+    }
+
+    fn metadata(&self) -> &DatasetMeta {
+        &self.meta
+    }
+
+    fn read_range(
+        &self,
+        start_time: f64,
+        end_time: f64,
+        channels: &[usize],
+        max_points: usize,
+    ) -> DataResult<SampleBlock> {
+        self.read_range_with_cancel(start_time, end_time, channels, max_points, None)
+    }
+
+    fn read_range_cancellable(
+        &self,
+        start_time: f64,
+        end_time: f64,
+        channels: &[usize],
+        max_points: usize,
+        cancel: &DataCancelToken,
+    ) -> DataResult<SampleBlock> {
+        self.read_range_with_cancel(start_time, end_time, channels, max_points, Some(cancel))
     }
 
     fn summarize_range(
@@ -415,7 +461,7 @@ impl DataSource for CsvDataSource {
         let first = self.find_block_for_time(start_time);
         let last = self.find_block_for_time(end_time);
         let estimated_points =
-            ((end_time - start_time) * self.meta.nominal_sample_rate_hz).max(1.0) as usize;
+            ((end_time - start_time) * self.meta.nominal_sample_rate_hz + 1.0).max(1.0) as usize;
         let exact_summary_limit = target_bins
             .max(1)
             .saturating_mul(MAX_EXACT_SUMMARY_ROWS_PER_BIN);
@@ -482,25 +528,138 @@ impl DataSource for CsvDataSource {
             max: maxs,
         })
     }
+
+    fn summarize_range_cancellable(
+        &self,
+        start_time: f64,
+        end_time: f64,
+        channels: &[usize],
+        target_bins: usize,
+        cancel: &DataCancelToken,
+    ) -> DataResult<RangeSummary> {
+        cancel.check()?;
+        self.validate_channels(channels)?;
+        if self.blocks.is_empty() || channels.is_empty() || end_time <= start_time {
+            return Ok(RangeSummary {
+                bin_start: Vec::new(),
+                bin_end: Vec::new(),
+                min: vec![Vec::new(); channels.len()],
+                max: vec![Vec::new(); channels.len()],
+            });
+        }
+
+        let first = self.find_block_for_time(start_time);
+        let last = self.find_block_for_time(end_time);
+        let estimated_points =
+            ((end_time - start_time) * self.meta.nominal_sample_rate_hz + 1.0).max(1.0) as usize;
+        let exact_summary_limit = target_bins
+            .max(1)
+            .saturating_mul(MAX_EXACT_SUMMARY_ROWS_PER_BIN);
+        if estimated_points <= exact_summary_limit {
+            let block = self.read_range_cancellable(
+                start_time,
+                end_time,
+                channels,
+                estimated_points.saturating_add(2),
+                cancel,
+            )?;
+            return Ok(RangeSummary::from_samples(
+                &block,
+                channels.len(),
+                start_time,
+                end_time,
+                target_bins,
+            ));
+        }
+
+        let block_count = last.saturating_sub(first) + 1;
+        let group = block_count.div_ceil(target_bins.max(1)).max(1);
+        let capacity = target_bins.min(block_count).max(1);
+        let mut bin_start = Vec::with_capacity(capacity);
+        let mut bin_end = Vec::with_capacity(capacity);
+        let mut mins = (0..channels.len())
+            .map(|_| Vec::with_capacity(capacity))
+            .collect::<Vec<_>>();
+        let mut maxs = (0..channels.len())
+            .map(|_| Vec::with_capacity(capacity))
+            .collect::<Vec<_>>();
+
+        let mut index = first;
+        while index <= last {
+            cancel.check()?;
+            let group_end = (index + group - 1).min(last);
+            let mut group_min = vec![f32::INFINITY; channels.len()];
+            let mut group_max = vec![f32::NEG_INFINITY; channels.len()];
+            let start = self.blocks[index].start_time.max(start_time);
+            let end = self.blocks[group_end].end_time.min(end_time);
+
+            for block in &self.blocks[index..=group_end] {
+                for (out_index, &channel) in channels.iter().enumerate() {
+                    group_min[out_index] = group_min[out_index].min(block.min[channel]);
+                    group_max[out_index] = group_max[out_index].max(block.max[channel]);
+                }
+            }
+
+            bin_start.push(start);
+            bin_end.push(end);
+            for out_index in 0..channels.len() {
+                mins[out_index].push(group_min[out_index]);
+                maxs[out_index].push(group_max[out_index]);
+            }
+
+            if group_end == usize::MAX {
+                break;
+            }
+            index = group_end + 1;
+        }
+
+        cancel.check()?;
+        Ok(RangeSummary {
+            bin_start,
+            bin_end,
+            min: mins,
+            max: maxs,
+        })
+    }
 }
 
 impl CsvDataSource {
     pub fn open_with_sample_rate(path: &Path, fallback_sample_rate_hz: f64) -> DataResult<Self> {
-        Self::open_with_options(path, fallback_sample_rate_hz, false)
+        Self::open_with_options(path, fallback_sample_rate_hz, false, None)
+    }
+
+    pub fn open_with_sample_rate_cancellable(
+        path: &Path,
+        fallback_sample_rate_hz: f64,
+        cancel: &DataCancelToken,
+    ) -> DataResult<Self> {
+        Self::open_with_options(path, fallback_sample_rate_hz, false, Some(cancel))
     }
 
     pub fn open_skipping_first_column_with_sample_rate(
         path: &Path,
         fallback_sample_rate_hz: f64,
     ) -> DataResult<Self> {
-        Self::open_with_options(path, fallback_sample_rate_hz, true)
+        Self::open_with_options(path, fallback_sample_rate_hz, true, None)
+    }
+
+    pub fn open_skipping_first_column_with_sample_rate_cancellable(
+        path: &Path,
+        fallback_sample_rate_hz: f64,
+        cancel: &DataCancelToken,
+    ) -> DataResult<Self> {
+        Self::open_with_options(path, fallback_sample_rate_hz, true, Some(cancel))
     }
 
     fn open_with_options(
         path: &Path,
         fallback_sample_rate_hz: f64,
         skip_first_synthetic_column: bool,
+        cancel: Option<&DataCancelToken>,
     ) -> DataResult<Self> {
+        if let Some(cancel) = cancel {
+            cancel.check()?;
+        }
         let mut reader = Self::reader_from_path(path)?;
         let (layout, names) = Self::discover_layout(
             &mut reader,
@@ -535,6 +694,11 @@ impl CsvDataSource {
         let mut row_values = Vec::with_capacity(channel_count);
 
         loop {
+            if row_count.is_multiple_of(1024) {
+                if let Some(cancel) = cancel {
+                    cancel.check()?;
+                }
+            }
             let position = reader.position().clone();
             if !reader.read_record(&mut record)? {
                 break;
@@ -605,6 +769,10 @@ impl CsvDataSource {
                 }
             }
             row_count += 1;
+        }
+
+        if let Some(cancel) = cancel {
+            cancel.check()?;
         }
 
         if let Some(block) = current.take() {
@@ -701,6 +869,46 @@ mod tests {
         let block = source.read_range(0.002, 0.006, &[0, 1], 100).unwrap();
         assert_eq!(block.channels.len(), 2);
         assert_eq!(block.times.len(), 5);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_range_decimation_preserves_window_end_sample() {
+        let path = std::env::temp_dir().join("scope_analyzer_decimated_range_test.csv");
+        let mut file = File::create(&path).unwrap();
+        writeln!(file, "time,A").unwrap();
+        for index in 0..10 {
+            writeln!(file, "{:.3},{}", index as f64 * 0.001, index).unwrap();
+        }
+        drop(file);
+
+        let source = CsvDataSource::open(&path).unwrap();
+        let block = source.read_range(0.0, 0.009, &[0], 4).unwrap();
+
+        assert_eq!(block.times, vec![0.0, 0.003, 0.006, 0.009]);
+        assert_eq!(block.channels[0], vec![0.0, 3.0, 6.0, 9.0]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_range_decimation_preserves_sparse_local_window_end_sample() {
+        let path = std::env::temp_dir().join("scope_analyzer_sparse_window_test.csv");
+        let mut file = File::create(&path).unwrap();
+        writeln!(file, "time,A").unwrap();
+        for index in 0..100 {
+            writeln!(file, "{:.3},{}", index as f64 * 0.001, index).unwrap();
+        }
+        writeln!(file, "0.500,500").unwrap();
+        writeln!(file, "0.900,900").unwrap();
+        drop(file);
+
+        let source = CsvDataSource::open(&path).unwrap();
+        let block = source.read_range(0.5, 0.9, &[0], 2).unwrap();
+
+        assert_eq!(block.times, vec![0.5, 0.9]);
+        assert_eq!(block.channels[0], vec![500.0, 900.0]);
 
         let _ = std::fs::remove_file(path);
     }

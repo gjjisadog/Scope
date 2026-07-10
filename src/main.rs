@@ -1,8 +1,11 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod data;
 mod export_annotation;
 mod fft;
 mod png_export;
+mod repid_derived;
 mod svg_export;
 mod transforms;
 mod vscode_bridge;
@@ -12,11 +15,14 @@ mod word_export;
 mod perf_tests;
 
 use std::{
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
     io::Write as _,
-    process::{Command, ExitStatus},
+    process::{Command, ExitStatus, Stdio},
     time::{Duration, SystemTime},
 };
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 const RENDERER_CHILD_ENV: &str = "SCOPE_RENDERER_CHILD";
 const RENDERER_ENV: &str = "SCOPE_RENDERER";
@@ -27,6 +33,8 @@ const INITIAL_WINDOW_SIZE: [f32; 2] = [1280.0, 760.0];
 const MIN_WINDOW_SIZE: [f32; 2] = [860.0, 520.0];
 const MESA_RUNTIME_DIR: &str = "mesa";
 const MESA_HELPER_EXE: &str = "ScopeAnalyzerMesa.exe";
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DEFAULT_RENDERER_ORDER: [RendererMode; 5] = [
     RendererMode::GlowSoftware,
     RendererMode::GlowHardware,
@@ -42,6 +50,11 @@ enum RendererMode {
     WgpuDx12,
     WgpuDx12Software,
     MesaSoftware,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildStdioPolicy {
+    AppendStartupLog,
 }
 
 impl RendererMode {
@@ -114,7 +127,13 @@ fn main() -> eframe::Result<()> {
     if let Ok(renderer) = std::env::var(RENDERER_ENV) {
         if let Some(mode) = RendererMode::from_env_value(&renderer) {
             write_startup_log(&format!("starting renderer: {}", mode.label()));
-            return run_selected_renderer(mode);
+            return run_selected_renderer(mode).map_err(|error| {
+                write_startup_log(&format!("selected renderer failed: {error}"));
+                if std::env::var_os(RENDERER_CHILD_ENV).is_none() {
+                    show_startup_failure_message();
+                }
+                error
+            });
         }
         write_startup_log(&format!(
             "unknown {RENDERER_ENV}={renderer}; using automatic fallback"
@@ -190,7 +209,9 @@ fn launch_with_process_fallback() -> eframe::Result<()> {
         }
     }
     write_startup_log(exhausted_renderer_message());
-    eprintln!("{}", exhausted_renderer_message());
+    write_startup_log(exhausted_renderer_user_message());
+    show_startup_failure_message();
+    eprintln!("{}", exhausted_renderer_user_message());
     std::process::exit(1);
 }
 
@@ -216,7 +237,46 @@ fn spawn_renderer_child(mode: RendererMode) -> std::io::Result<std::process::Chi
         }
     }
 
+    configure_renderer_child_process(&mut command);
     command.spawn()
+}
+
+fn configure_renderer_child_process(command: &mut Command) {
+    apply_hidden_child_window(command);
+    match child_stdio_policy() {
+        ChildStdioPolicy::AppendStartupLog => redirect_child_output_to_startup_log(command),
+    }
+}
+
+#[cfg(windows)]
+fn apply_hidden_child_window(command: &mut Command) {
+    command.creation_flags(windows_child_creation_flags());
+}
+
+#[cfg(not(windows))]
+fn apply_hidden_child_window(_command: &mut Command) {}
+
+#[cfg(windows)]
+fn windows_child_creation_flags() -> u32 {
+    CREATE_NO_WINDOW
+}
+
+fn child_stdio_policy() -> ChildStdioPolicy {
+    ChildStdioPolicy::AppendStartupLog
+}
+
+fn redirect_child_output_to_startup_log(command: &mut Command) {
+    if let Some(stdout_log) = open_startup_log_for_append() {
+        let stderr_log = stdout_log.try_clone().ok();
+        command.stdout(Stdio::from(stdout_log));
+        if let Some(stderr_log) = stderr_log {
+            command.stderr(Stdio::from(stderr_log));
+        } else {
+            command.stderr(Stdio::null());
+        }
+    } else {
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+    }
 }
 
 fn renderer_executable(mode: RendererMode, current_exe: &std::path::Path) -> std::path::PathBuf {
@@ -267,11 +327,25 @@ fn exhausted_renderer_message() -> &'static str {
     "launcher: all child renderers failed; not running WGPU/WARP in-process because virtual graphics drivers can panic before returning an error"
 }
 
+fn exhausted_renderer_user_message() -> &'static str {
+    "无法启动图形界面。请先尝试 Start-ScopeAnalyzer-Mesa.bat；如仍无法启动，请把 ScopeAnalyzer-startup.log 发给开发人员排查。"
+}
+
+fn show_startup_failure_message() {
+    let _ = rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("Scope Analyzer 启动失败")
+        .set_description(exhausted_renderer_user_message())
+        .show();
+}
+
 fn run_app(mode: RendererMode) -> eframe::Result<()> {
-    let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
-    wgpu_options.supported_backends = eframe::wgpu::Backends::DX12;
-    wgpu_options.power_preference = eframe::wgpu::PowerPreference::LowPower;
-    wgpu_options.force_fallback_adapter = mode.force_wgpu_fallback_adapter();
+    let wgpu_options = eframe::egui_wgpu::WgpuConfiguration {
+        supported_backends: eframe::wgpu::Backends::DX12,
+        power_preference: eframe::wgpu::PowerPreference::LowPower,
+        force_fallback_adapter: mode.force_wgpu_fallback_adapter(),
+        ..Default::default()
+    };
 
     let mut viewport = base_scope_viewport_builder();
     if let Some(icon) = scope_window_icon() {
@@ -368,14 +442,20 @@ fn configure_graphics_runtime() {
 }
 
 fn write_startup_log(message: &str) {
+    if let Some(mut file) = open_startup_log_for_append() {
+        let _ = writeln!(file, "{:?} {message}", SystemTime::now());
+    }
+}
+
+fn open_startup_log_for_append() -> Option<File> {
     let mut paths = startup_log_paths();
     for path in paths.drain(..) {
-        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        let Ok(file) = OpenOptions::new().create(true).append(true).open(path) else {
             continue;
         };
-        let _ = writeln!(file, "{:?} {message}", SystemTime::now());
-        break;
+        return Some(file);
     }
+    None
 }
 
 fn startup_log_paths() -> Vec<std::path::PathBuf> {
@@ -452,6 +532,25 @@ mod tests {
     fn exhausted_renderer_fallback_does_not_run_wgpu_in_process() {
         let message = exhausted_renderer_message();
         assert!(message.contains("not running WGPU/WARP in-process"));
+    }
+
+    #[test]
+    fn exhausted_renderer_user_message_is_chinese_and_actionable() {
+        let message = exhausted_renderer_user_message();
+        assert!(message.contains("无法启动图形界面"));
+        assert!(message.contains("Start-ScopeAnalyzer-Mesa.bat"));
+        assert!(message.contains("ScopeAnalyzer-startup.log"));
+    }
+
+    #[test]
+    fn renderer_child_output_is_redirected_to_startup_log() {
+        assert_eq!(child_stdio_policy(), ChildStdioPolicy::AppendStartupLog);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn renderer_child_process_is_hidden_on_windows() {
+        assert_ne!(windows_child_creation_flags() & CREATE_NO_WINDOW, 0);
     }
 
     #[test]

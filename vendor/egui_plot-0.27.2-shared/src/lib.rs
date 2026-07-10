@@ -22,9 +22,9 @@ use epaint::{util::FloatOrd, Hsva};
 pub use crate::{
     axis::{Axis, AxisHints, HPlacement, Placement, VPlacement},
     items::{
-        Arrows, Bar, BarChart, BoxElem, BoxPlot, BoxSpread, HLine, Line, LineStyle, MarkerShape,
-        Orientation, PlotGeometry, PlotImage, PlotItem, PlotPoint, PlotPoints, Points, Polygon,
-        Text, VLine,
+        Arrows, Bar, BarChart, BoxElem, BoxPlot, BoxSpread, Envelope, HLine, Line, LineStyle,
+        MarkerShape, Orientation, PlotGeometry, PlotImage, PlotItem, PlotPoint, PlotPoints, Points,
+        Polygon, Text, VLine,
     },
     legend::{Corner, Legend},
     memory::PlotMemory,

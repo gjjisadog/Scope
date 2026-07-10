@@ -22,6 +22,30 @@ mod values;
 
 const DEFAULT_FILL_ALPHA: f32 = 0.05;
 
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[test]
+    fn envelope_bounds_include_high_and_low_series() {
+        let high: Arc<[PlotPoint]> = Arc::from([
+            PlotPoint::new(0.0, 10.0),
+            PlotPoint::new(1.0, 12.0),
+        ]);
+        let low: Arc<[PlotPoint]> = Arc::from([
+            PlotPoint::new(0.0, -8.0),
+            PlotPoint::new(1.0, -6.0),
+        ]);
+
+        let bounds = Envelope::new(high, low).bounds();
+
+        assert_eq!(bounds.min(), [0.0, -8.0]);
+        assert_eq!(bounds.max(), [1.0, 12.0]);
+    }
+}
+
 /// Container to pass-through several parameters related to plot visualization
 pub struct PlotConfig<'a> {
     pub ui: &'a Ui,
@@ -564,6 +588,148 @@ impl PlotItem for Line {
 
     fn bounds(&self) -> PlotBounds {
         self.series.bounds()
+    }
+
+    fn id(&self) -> Option<Id> {
+        self.id
+    }
+}
+
+/// A min/max envelope drawn as one plot item.
+///
+/// This keeps dense waveform summaries as a single legend/picking item while still drawing the
+/// upper and lower bounds, so spikes are preserved without doubling the number of plot items.
+pub struct Envelope {
+    pub(super) high_series: PlotPoints,
+    pub(super) low_series: PlotPoints,
+    pub(super) stroke: Stroke,
+    pub(super) name: String,
+    pub(super) highlight: bool,
+    pub(super) style: LineStyle,
+    id: Option<Id>,
+}
+
+impl Envelope {
+    pub fn new(high_series: impl Into<PlotPoints>, low_series: impl Into<PlotPoints>) -> Self {
+        Self {
+            high_series: high_series.into(),
+            low_series: low_series.into(),
+            stroke: Stroke::new(1.5, Color32::TRANSPARENT),
+            name: Default::default(),
+            highlight: false,
+            style: LineStyle::Solid,
+            id: None,
+        }
+    }
+
+    /// Highlight this envelope in the plot by scaling up the line.
+    #[inline]
+    pub fn highlight(mut self, highlight: bool) -> Self {
+        self.highlight = highlight;
+        self
+    }
+
+    /// Add a stroke.
+    #[inline]
+    pub fn stroke(mut self, stroke: impl Into<Stroke>) -> Self {
+        self.stroke = stroke.into();
+        self
+    }
+
+    /// Stroke width. A high value means the plot thickens.
+    #[inline]
+    pub fn width(mut self, width: impl Into<f32>) -> Self {
+        self.stroke.width = width.into();
+        self
+    }
+
+    /// Stroke color. Default is `Color32::TRANSPARENT` which means a color will be auto-assigned.
+    #[inline]
+    pub fn color(mut self, color: impl Into<Color32>) -> Self {
+        self.stroke.color = color.into();
+        self
+    }
+
+    /// Set the envelope's style. Default is `LineStyle::Solid`.
+    #[inline]
+    pub fn style(mut self, style: LineStyle) -> Self {
+        self.style = style;
+        self
+    }
+
+    /// Name of this envelope.
+    ///
+    /// This name will show up in the plot legend, if legends are turned on.
+    #[allow(clippy::needless_pass_by_value)]
+    #[inline]
+    pub fn name(mut self, name: impl ToString) -> Self {
+        self.name = name.to_string();
+        self
+    }
+
+    /// Set the envelope's id which is used to identify it in the plot's response.
+    #[inline]
+    pub fn id(mut self, id: Id) -> Self {
+        self.id = Some(id);
+        self
+    }
+}
+
+impl PlotItem for Envelope {
+    fn shapes(&self, _ui: &Ui, transform: &PlotTransform, shapes: &mut Vec<Shape>) {
+        let Self {
+            high_series,
+            low_series,
+            stroke,
+            highlight,
+            style,
+            ..
+        } = self;
+
+        let high_values_tf: Vec<_> = high_series
+            .points()
+            .iter()
+            .map(|v| transform.position_from_point(v))
+            .collect();
+        let low_values_tf: Vec<_> = low_series
+            .points()
+            .iter()
+            .map(|v| transform.position_from_point(v))
+            .collect();
+
+        style.style_line(high_values_tf, *stroke, *highlight, shapes);
+        style.style_line(low_values_tf, *stroke, *highlight, shapes);
+    }
+
+    fn initialize(&mut self, x_range: RangeInclusive<f64>) {
+        self.high_series.generate_points(x_range.clone());
+        self.low_series.generate_points(x_range);
+    }
+
+    fn name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    fn color(&self) -> Color32 {
+        self.stroke.color
+    }
+
+    fn highlight(&mut self) {
+        self.highlight = true;
+    }
+
+    fn highlighted(&self) -> bool {
+        self.highlight
+    }
+
+    fn geometry(&self) -> PlotGeometry<'_> {
+        PlotGeometry::Points(self.high_series.points())
+    }
+
+    fn bounds(&self) -> PlotBounds {
+        let mut bounds = self.high_series.bounds();
+        bounds.merge(&self.low_series.bounds());
+        bounds
     }
 
     fn id(&self) -> Option<Id> {

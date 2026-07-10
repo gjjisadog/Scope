@@ -1,13 +1,26 @@
+param(
+    [switch]$SkipPerformanceBaselines,
+    [switch]$OfflinePackage
+)
+
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
-$version = "0.6.0"
+$version = "0.7.1"
 $dist = Join-Path $root "dist"
 $stage = Join-Path $dist "ScopeAnalyzer-$version-win-x64"
 $zip = Join-Path $dist "ScopeAnalyzer-$version-win-x64.zip"
 $msi = Join-Path $dist "ScopeAnalyzer-$version-win-x64.msi"
 $wixobj = Join-Path $dist "ScopeAnalyzer-$version-win-x64.wixobj"
 $wxs = Join-Path $PSScriptRoot "ScopeAnalyzer.wxs"
+$mesaReleaseTag = "26.0.8"
+$mesaAssetName = "mesa3d-26.0.8-release-msvc.7z"
+$mesaAssetSha256 = "a438c26c2752726916e455f9ad121f8a7e3cfecf8626251abf8e5b3e129d8497"
+$sevenZipUrl = "https://www.7-zip.org/a/7zr.exe"
+$sevenZipSha256 = "abcf64ae1cbafddb5395e4cdd3bdc7e3e0561d54a0c6380e3dd43bdbffe519a2"
+$mesaManifestName = "mesa-runtime-manifest.json"
+$angleManifestName = "angle-runtime-manifest.json"
+$headers = @{ "User-Agent" = "ScopeAnalyzerPackageScript" }
 
 function Resolve-Tool {
     param([string]$Name)
@@ -38,7 +51,32 @@ function Resolve-Tool {
     return $null
 }
 
-function Resolve-AngleRuntimeDir {
+function Test-AngleRuntimeDir {
+    param([string]$Dir)
+
+    if (-not $Dir -or -not (Test-Path $Dir)) {
+        return $false
+    }
+
+    return (Test-Path (Join-Path $Dir "libEGL.dll")) -and (Test-Path (Join-Path $Dir "libGLESv2.dll"))
+}
+
+function Resolve-AngleRuntimeCandidate {
+    param([string]$Dir)
+
+    if (Test-AngleRuntimeDir $Dir) {
+        return $Dir
+    }
+
+    $x64Dir = Join-Path $Dir "x64"
+    if (Test-AngleRuntimeDir $x64Dir) {
+        return $x64Dir
+    }
+
+    return $null
+}
+
+function Resolve-SystemAngleRuntimeDir {
     $candidateDirs = @()
     if ($env:SystemRoot) {
         $candidateDirs += Join-Path $env:SystemRoot "System32\Microsoft-Edge-WebView"
@@ -52,7 +90,7 @@ function Resolve-AngleRuntimeDir {
     }
 
     foreach ($dir in $candidateDirs) {
-        if ((Test-Path (Join-Path $dir "libEGL.dll")) -and (Test-Path (Join-Path $dir "libGLESv2.dll"))) {
+        if (Test-AngleRuntimeDir $dir) {
             return $dir
         }
 
@@ -63,7 +101,7 @@ function Resolve-AngleRuntimeDir {
         $versionDirs = Get-ChildItem -Path $dir -Directory -ErrorAction SilentlyContinue |
             Sort-Object Name -Descending
         foreach ($versionDir in $versionDirs) {
-            if ((Test-Path (Join-Path $versionDir.FullName "libEGL.dll")) -and (Test-Path (Join-Path $versionDir.FullName "libGLESv2.dll"))) {
+            if (Test-AngleRuntimeDir $versionDir.FullName) {
                 return $versionDir.FullName
             }
         }
@@ -104,34 +142,235 @@ function Resolve-MesaRuntimeCandidate {
     return $null
 }
 
-function Install-MesaRuntime {
-    $cacheDir = Join-Path $root "target\mesa-runtime"
-    $runtimeDir = Join-Path $cacheDir "x64"
-    $cached = Resolve-MesaRuntimeCandidate $runtimeDir
-    if ($cached) {
-        return $cached
+function Resolve-AngleRuntimeDir {
+    if ($env:ANGLE_RUNTIME_DIR) {
+        $resolved = Resolve-AngleRuntimeCandidate $env:ANGLE_RUNTIME_DIR
+        if ($resolved) {
+            Write-Host "ANGLE runtime explicit path: $resolved"
+            return $resolved
+        }
+        Write-Warning "ANGLE_RUNTIME_DIR was set but does not contain libEGL.dll and libGLESv2.dll: $env:ANGLE_RUNTIME_DIR"
     }
 
-    New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
-    $headers = @{ "User-Agent" = "ScopeAnalyzerPackageScript" }
-    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest" -Headers $headers
-    $asset = $release.assets |
-        Where-Object { $_.name -like "*release-msvc.7z" } |
-        Select-Object -First 1
-    if (-not $asset) {
-        Write-Warning "Mesa release-msvc asset was not found in the latest mesa-dist-win release."
+    foreach ($dir in @(
+        (Join-Path $root "third_party\angle"),
+        (Join-Path $root "target\angle-runtime")
+    )) {
+        $resolved = Resolve-AngleRuntimeCandidate $dir
+        if ($resolved) {
+            Write-Host "ANGLE runtime explicit path: $resolved"
+            return $resolved
+        }
+    }
+
+    if ($env:SCOPE_ALLOW_SYSTEM_ANGLE -eq "1") {
+        $resolvedSystem = Resolve-SystemAngleRuntimeDir
+        if ($resolvedSystem) {
+            Write-Host "ANGLE runtime system path: $resolvedSystem"
+            return $resolvedSystem
+        }
+    } else {
+        Write-Host "ANGLE runtime cache miss: set ANGLE_RUNTIME_DIR or populate third_party\angle to bundle ANGLE. Set SCOPE_ALLOW_SYSTEM_ANGLE=1 to opt in to build-machine Edge/WebView probing."
+    }
+
+    return $null
+}
+
+function Get-IsOfflinePackage {
+    return $OfflinePackage -or $env:SCOPE_PACKAGE_OFFLINE -eq "1"
+}
+
+function Get-FileSha256 {
+    param([string]$Path)
+
+    if (-not (Test-Path $Path)) {
         return $null
     }
 
-    $archive = Join-Path $cacheDir $asset.name
-    if (-not (Test-Path $archive)) {
-        Invoke-WebRequest -Uri $asset.browser_download_url -Headers $headers -OutFile $archive
+    return (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Test-FileSha256 {
+    param(
+        [string]$Path,
+        [string]$ExpectedSha256
+    )
+
+    $actual = Get-FileSha256 $Path
+    return $actual -and $actual -eq $ExpectedSha256.ToLowerInvariant()
+}
+
+function Assert-FileSha256 {
+    param(
+        [string]$Path,
+        [string]$ExpectedSha256,
+        [string]$Description
+    )
+
+    if (-not (Test-FileSha256 -Path $Path -ExpectedSha256 $ExpectedSha256)) {
+        $actual = Get-FileSha256 $Path
+        if (-not $actual) {
+            throw "$Description was not found at $Path"
+        }
+        throw "$Description hash mismatch at $Path. Expected $ExpectedSha256, got $actual"
+    }
+}
+
+function Save-PinnedDownload {
+    param(
+        [string]$Uri,
+        [string]$Path,
+        [string]$ExpectedSha256,
+        [string]$Description,
+        [hashtable]$Headers
+    )
+
+    if (Test-FileSha256 -Path $Path -ExpectedSha256 $ExpectedSha256) {
+        Write-Host "$Description cache hit: $Path"
+        return
     }
 
-    $sevenZip = Join-Path $cacheDir "7zr.exe"
-    if (-not (Test-Path $sevenZip)) {
-        Invoke-WebRequest -Uri "https://www.7-zip.org/a/7zr.exe" -OutFile $sevenZip
+    if (Test-Path $Path) {
+        if (Get-IsOfflinePackage) {
+            Assert-FileSha256 -Path $Path -ExpectedSha256 $ExpectedSha256 -Description $Description
+        }
+        Write-Host "$Description cache miss: removing hash-mismatched $Path"
+        Remove-Item -Force $Path
+    } else {
+        Write-Host "$Description cache miss: $Path"
     }
+
+    if (Get-IsOfflinePackage) {
+        throw "$Description is missing and SCOPE_PACKAGE_OFFLINE=1/-OfflinePackage forbids downloads."
+    }
+
+    if ($Headers) {
+        Invoke-WebRequest -Uri $Uri -Headers $Headers -OutFile $Path
+    } else {
+        Invoke-WebRequest -Uri $Uri -OutFile $Path
+    }
+    Assert-FileSha256 -Path $Path -ExpectedSha256 $ExpectedSha256 -Description $Description
+}
+
+function Get-MesaManifestPath {
+    param([string]$RuntimeDir)
+
+    return Join-Path $RuntimeDir $mesaManifestName
+}
+
+function Test-MesaRuntimeCache {
+    param([string]$RuntimeDir)
+
+    if (-not (Test-MesaRuntimeDir $RuntimeDir)) {
+        Write-Host "Mesa runtime cache miss: required DLLs are missing from $RuntimeDir"
+        return $false
+    }
+
+    $manifestPath = Get-MesaManifestPath $RuntimeDir
+    if (-not (Test-Path $manifestPath)) {
+        Write-Host "Mesa runtime cache miss: manifest not found at $manifestPath"
+        return $false
+    }
+
+    try {
+        $manifest = Get-Content -Raw $manifestPath | ConvertFrom-Json
+    } catch {
+        Write-Host "Mesa runtime cache miss: manifest is not valid JSON at $manifestPath"
+        return $false
+    }
+
+    if ($manifest.mesaReleaseTag -ne $mesaReleaseTag -or
+        $manifest.mesaAssetName -ne $mesaAssetName -or
+        $manifest.mesaAssetSha256 -ne $mesaAssetSha256) {
+        Write-Host "Mesa runtime cache miss: manifest pins $($manifest.mesaReleaseTag)/$($manifest.mesaAssetName), expected $mesaReleaseTag/$mesaAssetName"
+        return $false
+    }
+
+    if (-not $manifest.fileHashes) {
+        Write-Host "Mesa runtime cache miss: manifest does not contain file hashes"
+        return $false
+    }
+
+    foreach ($file in $manifest.fileHashes.PSObject.Properties) {
+        $path = Join-Path $RuntimeDir $file.Name
+        if (-not (Test-FileSha256 -Path $path -ExpectedSha256 $file.Value)) {
+            Write-Host "Mesa runtime cache miss: cached file hash mismatch for $($file.Name)"
+            return $false
+        }
+    }
+
+    Write-Host "Mesa runtime cache hit: $RuntimeDir ($mesaReleaseTag/$mesaAssetName)"
+    return $true
+}
+
+function Write-MesaRuntimeManifest {
+    param(
+        [string]$RuntimeDir,
+        [string]$Archive
+    )
+
+    $fileHashes = [ordered]@{}
+    foreach ($name in @("opengl32.dll", "libgallium_wgl.dll", "libEGL.dll", "libGLESv2.dll", "libGLESv1_CM.dll")) {
+        $path = Join-Path $RuntimeDir $name
+        if (Test-Path $path) {
+            $fileHashes[$name] = Get-FileSha256 $path
+        }
+    }
+
+    $manifest = [ordered]@{
+        mesaReleaseTag = $mesaReleaseTag
+        mesaAssetName = $mesaAssetName
+        mesaAssetSha256 = $mesaAssetSha256
+        sourceArchiveSha256 = Get-FileSha256 $Archive
+        cachedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
+        fileHashes = $fileHashes
+    }
+
+    $manifest | ConvertTo-Json -Depth 4 | Set-Content -Path (Get-MesaManifestPath $RuntimeDir) -Encoding ASCII
+}
+
+function Write-AngleRuntimeManifest {
+    param(
+        [string]$RuntimeDir,
+        [string]$ManifestPath
+    )
+
+    $fileHashes = [ordered]@{}
+    foreach ($name in @("libEGL.dll", "libGLESv2.dll", "d3dcompiler_47.dll")) {
+        $path = Join-Path $RuntimeDir $name
+        if (Test-Path $path) {
+            $fileHashes[$name] = Get-FileSha256 $path
+        }
+    }
+
+    $manifest = [ordered]@{
+        sourcePath = (Resolve-Path $RuntimeDir).Path
+        cachedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
+        fileHashes = $fileHashes
+    }
+
+    $manifest | ConvertTo-Json -Depth 4 | Set-Content -Path $ManifestPath -Encoding ASCII
+}
+
+function Install-MesaRuntime {
+    $cacheDir = Join-Path $root "target\mesa-runtime"
+    $runtimeDir = Join-Path $cacheDir "x64"
+    if (Test-MesaRuntimeCache $runtimeDir) {
+        return $runtimeDir
+    }
+
+    if (Get-IsOfflinePackage) {
+        throw "Mesa runtime cache is missing or stale and SCOPE_PACKAGE_OFFLINE=1/-OfflinePackage forbids downloads. Preload $runtimeDir with $mesaManifestName or set MESA_RUNTIME_DIR/third_party\mesa."
+    }
+
+    New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+    Write-Host "Mesa runtime cache miss: downloading pinned $mesaReleaseTag/$mesaAssetName"
+    $assetUrl = "https://github.com/pal1000/mesa-dist-win/releases/download/$mesaReleaseTag/$mesaAssetName"
+    $archive = Join-Path $cacheDir $mesaAssetName
+    Save-PinnedDownload -Uri $assetUrl -Path $archive -ExpectedSha256 $mesaAssetSha256 -Description "Mesa runtime archive" -Headers $headers
+
+    $sevenZip = Join-Path $cacheDir "7zr.exe"
+    Save-PinnedDownload -Uri $sevenZipUrl -Path $sevenZip -ExpectedSha256 $sevenZipSha256 -Description "7-Zip extractor" -Headers $null
 
     $extractDir = Join-Path $cacheDir "extract"
     if (Test-Path $extractDir) {
@@ -165,25 +404,37 @@ function Install-MesaRuntime {
         Copy-Item (Join-Path $sourceDir $name) (Join-Path $runtimeDir $name) -Force
     }
 
+    Write-MesaRuntimeManifest -RuntimeDir $runtimeDir -Archive $archive
+    if (-not (Test-MesaRuntimeCache $runtimeDir)) {
+        throw "Mesa runtime cache failed validation after extraction."
+    }
+
     return $runtimeDir
 }
 
 function Resolve-MesaRuntimeDir {
-    $candidateDirs = @()
     if ($env:MESA_RUNTIME_DIR) {
-        $candidateDirs += $env:MESA_RUNTIME_DIR
-    }
-    $candidateDirs += Join-Path $root "third_party\mesa"
-    $candidateDirs += Join-Path $root "target\mesa-runtime\x64"
-
-    foreach ($dir in $candidateDirs) {
-        $resolved = Resolve-MesaRuntimeCandidate $dir
+        $resolved = Resolve-MesaRuntimeCandidate $env:MESA_RUNTIME_DIR
         if ($resolved) {
+            Write-Host "Mesa runtime explicit path: $resolved"
             return $resolved
         }
     }
 
+    $thirdPartyDir = Join-Path $root "third_party\mesa"
+    $resolvedThirdParty = Resolve-MesaRuntimeCandidate $thirdPartyDir
+    if ($resolvedThirdParty) {
+        Write-Host "Mesa runtime explicit path: $resolvedThirdParty"
+        return $resolvedThirdParty
+    }
+
+    $cacheRuntimeDir = Join-Path $root "target\mesa-runtime\x64"
+    if (Test-MesaRuntimeCache $cacheRuntimeDir) {
+        return $cacheRuntimeDir
+    }
+
     if ($env:SCOPE_SKIP_MESA_DOWNLOAD -eq "1") {
+        Write-Warning "Skipping Mesa download because SCOPE_SKIP_MESA_DOWNLOAD=1."
         return $null
     }
 
@@ -212,6 +463,15 @@ $includeMesaRuntime = "false"
 
 Push-Location $root
 try {
+    if (-not $SkipPerformanceBaselines) {
+        & (Join-Path $PSScriptRoot "run-performance-baselines.ps1")
+        if ($LASTEXITCODE -ne 0) {
+            throw "performance baseline gate failed with exit code $LASTEXITCODE"
+        }
+    } else {
+        Write-Warning "Skipping performance baseline gate. Do not use this for release builds."
+    }
+
     $linkLibDir = Join-Path $root "target\package-link-libs"
     New-Item -ItemType Directory -Force -Path $linkLibDir | Out-Null
     $shlwapiImportLib = Get-ChildItem -Path (Join-Path $env:USERPROFILE ".cargo\registry\src") -Recurse -Filter "libwinapi_shlwapi.a" -ErrorAction SilentlyContinue |
@@ -239,8 +499,9 @@ try {
             Copy-Item $d3dCompiler (Join-Path $stage "d3dcompiler_47.dll") -Force
             $includeD3DCompiler = "true"
         }
+        Write-AngleRuntimeManifest -RuntimeDir $angleRuntimeDir -ManifestPath (Join-Path $stage $angleManifestName)
     } else {
-        Write-Warning "ANGLE runtime DLLs were not found. The package will rely on the target machine's OpenGL/ANGLE installation."
+        Write-Warning "ANGLE runtime DLLs were not bundled. The installed app will rely on the target machine's OpenGL/ANGLE installation."
     }
     $mesaRuntimeDir = Resolve-MesaRuntimeDir
     if ($mesaRuntimeDir) {
@@ -261,24 +522,6 @@ try {
 Set-Content -Path (Join-Path $stage "Start-ScopeAnalyzer.bat") -Encoding ASCII -Value @(
     "@echo off",
     "cd /d ""%~dp0""",
-    "start """" ""%~dp0ScopeAnalyzer.exe"""
-)
-Set-Content -Path (Join-Path $stage "Start-ScopeAnalyzer-DX12.bat") -Encoding ASCII -Value @(
-    "@echo off",
-    "cd /d ""%~dp0""",
-    "set SCOPE_RENDERER=wgpu",
-    "start """" ""%~dp0ScopeAnalyzer.exe"""
-)
-Set-Content -Path (Join-Path $stage "Start-ScopeAnalyzer-Software.bat") -Encoding ASCII -Value @(
-    "@echo off",
-    "cd /d ""%~dp0""",
-    "set SCOPE_RENDERER=glow-software",
-    "start """" ""%~dp0ScopeAnalyzer.exe"""
-)
-Set-Content -Path (Join-Path $stage "Start-ScopeAnalyzer-OpenGL.bat") -Encoding ASCII -Value @(
-    "@echo off",
-    "cd /d ""%~dp0""",
-    "set SCOPE_RENDERER=glow",
     "start """" ""%~dp0ScopeAnalyzer.exe"""
 )
 Set-Content -Path (Join-Path $stage "Start-ScopeAnalyzer-Mesa.bat") -Encoding ASCII -Value @(

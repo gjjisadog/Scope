@@ -6,23 +6,39 @@ normal `cargo test` runs stay fast.
 Run all performance baselines:
 
 ```powershell
-cargo test perf_ -- --ignored --nocapture --test-threads=1
+.\scripts\run-performance-baselines.ps1
 ```
 
 Each test creates temporary CSV, DAT, cloud `Content` CSV, or PNG files, prints
 timings like `perf:csv_open 123.45 ms`, and removes the temporary files.
 
-Optional regression thresholds can be supplied with environment variables. The
-name is `SCOPE_PERF_MAX_<LABEL>_MS`, where `<LABEL>` is the printed label in
-uppercase with non-alphanumeric characters replaced by `_`.
+The script runs:
+
+```powershell
+cargo test perf_ -- --ignored --nocapture --test-threads=1
+```
+
+and sets conservative default regression thresholds for every printed label.
+Override any threshold with `SCOPE_PERF_MAX_<LABEL>_MS`, where `<LABEL>` is the
+printed label in uppercase with non-alphanumeric characters replaced by `_`.
 
 Examples:
 
 ```powershell
 $env:SCOPE_PERF_MAX_CSV_OPEN_MS = "1500"
 $env:SCOPE_PERF_MAX_DAT_SUMMARY_FULL_MS = "200"
-cargo test perf_ -- --ignored --nocapture --test-threads=1
+.\scripts\run-performance-baselines.ps1
 ```
+
+To inspect the command and effective thresholds without running the perf tests:
+
+```powershell
+.\scripts\run-performance-baselines.ps1 -PrintCommandOnly
+```
+
+`scripts/package-windows.ps1` runs the performance gate before building release
+artifacts. Use `-SkipPerformanceBaselines` only for local packaging experiments,
+not release builds.
 
 Covered scenarios:
 

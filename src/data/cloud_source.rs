@@ -7,8 +7,10 @@ use std::{
 use csv::{Position, StringRecord};
 
 use super::{
-    channel_names::VARIABLE_NAMES, text_encoding::csv_reader_from_path_with_headers, ChannelMeta,
-    DataError, DataResult, DataSource, DatasetMeta, RangeSummary, SampleBlock,
+    append_sample_columns, channel_names::VARIABLE_NAMES, decimation_stride_for_budget,
+    ensure_last_sample_columns, should_keep_decimated_sample,
+    text_encoding::csv_reader_from_path_with_headers, ChannelMeta, DataError, DataResult,
+    DataSource, DatasetMeta, RangeSummary, SampleBlock,
 };
 
 const CHANNEL_COUNT: usize = 60;
@@ -329,7 +331,7 @@ impl DataSource for CloudCsvDataSource {
         let estimated_points = (((end_time - start_time) * self.sample_rate_hz + 1.0).max(1.0)
             as usize)
             .min(remaining_samples);
-        let stride = (estimated_points / max_points.max(1)).max(1);
+        let stride = decimation_stride_for_budget(estimated_points, max_points);
         let mut sample_index = self.blocks[first_block].start_sample;
         let mut seen = 0_usize;
         let capacity = estimated_points.min(max_points.max(1)) + 1;
@@ -338,6 +340,8 @@ impl DataSource for CloudCsvDataSource {
             .map(|_| Vec::with_capacity(capacity))
             .collect::<Vec<_>>();
         let mut record = StringRecord::new();
+        let mut last_in_window_time = None;
+        let mut last_in_window_values: Option<Vec<f32>> = None;
 
         while reader.read_record(&mut record)? {
             let Ok(frames) = Self::parse_record_from_csv(&record, self.content_column) else {
@@ -351,20 +355,38 @@ impl DataSource for CloudCsvDataSource {
                     continue;
                 }
                 if time > end_time {
+                    ensure_last_sample_columns(
+                        &mut times,
+                        &mut channel_values,
+                        last_in_window_time,
+                        last_in_window_values.as_deref(),
+                        max_points.max(1),
+                    );
                     return Ok(SampleBlock {
                         times,
                         channels: channel_values,
                     });
                 }
-                if seen.is_multiple_of(stride) {
-                    times.push(time);
-                    for (out_index, &channel) in channels.iter().enumerate() {
-                        channel_values[out_index].push(frame[channel]);
-                    }
+                let values = channels
+                    .iter()
+                    .map(|&channel| frame[channel])
+                    .collect::<Vec<_>>();
+                last_in_window_time = Some(time);
+                last_in_window_values = Some(values.clone());
+                if should_keep_decimated_sample(seen, estimated_points, max_points, stride) {
+                    append_sample_columns(&mut times, &mut channel_values, time, &values);
                 }
                 seen += 1;
             }
         }
+
+        ensure_last_sample_columns(
+            &mut times,
+            &mut channel_values,
+            last_in_window_time,
+            last_in_window_values.as_deref(),
+            max_points.max(1),
+        );
 
         Ok(SampleBlock {
             times,
@@ -414,7 +436,7 @@ impl DataSource for CloudCsvDataSource {
         }
 
         let block_count = last.saturating_sub(first) + 1;
-        let group = (block_count / target_bins.max(1)).max(1);
+        let group = block_count.div_ceil(target_bins.max(1)).max(1);
         let capacity = target_bins.min(block_count).max(1);
         let mut bin_start = Vec::with_capacity(capacity);
         let mut bin_end = Vec::with_capacity(capacity);

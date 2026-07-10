@@ -63,7 +63,26 @@ pub trait WaveformCanvas {
         color: Rgba,
         width: i32,
     );
+    fn stroke_ellipse(
+        &mut self,
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+        color: Rgba,
+        width: i32,
+    );
     fn line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: Rgba, width: i32);
+    fn line_styled(
+        &mut self,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        color: Rgba,
+        width: i32,
+        style: StrokeStyle,
+    );
     fn line_clipped(
         &mut self,
         x0: i32,
@@ -149,6 +168,37 @@ impl Canvas {
         self.fill_rect(right - width, top, right, bottom, color);
     }
 
+    pub fn stroke_ellipse(
+        &mut self,
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+        color: Rgba,
+        width: i32,
+    ) {
+        if right <= left || bottom <= top {
+            return;
+        }
+        let cx = (left + right) as f32 / 2.0;
+        let cy = (top + bottom) as f32 / 2.0;
+        let rx = ((right - left).abs() as f32 / 2.0).max(1.0);
+        let ry = ((bottom - top).abs() as f32 / 2.0).max(1.0);
+        let steps = (((rx + ry) * 1.6).round() as i32).clamp(24, 360) as usize;
+        let mut previous = None;
+        for step in 0..=steps {
+            let angle = step as f32 / steps as f32 * std::f32::consts::TAU;
+            let point = (
+                (cx + rx * angle.cos()).round() as i32,
+                (cy + ry * angle.sin()).round() as i32,
+            );
+            if let Some((px, py)) = previous {
+                self.line(px, py, point.0, point.1, color, width);
+            }
+            previous = Some(point);
+        }
+    }
+
     pub fn line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: Rgba, width: i32) {
         let mut x0 = x0;
         let mut y0 = y0;
@@ -202,6 +252,9 @@ impl Canvas {
     ) {
         let width = width.max(1);
         self.line_styled(x0, y0, x1, y1, color, width, style);
+        if head_size <= 0.0 {
+            return;
+        }
         let angle = ((y1 - y0) as f32).atan2((x1 - x0) as f32);
         let head = head_size.max(3.0);
         for offset in [2.55_f32, -2.55_f32] {
@@ -510,8 +563,33 @@ impl WaveformCanvas for Canvas {
         Canvas::stroke_rect(self, left, top, right, bottom, color, width);
     }
 
+    fn stroke_ellipse(
+        &mut self,
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+        color: Rgba,
+        width: i32,
+    ) {
+        Canvas::stroke_ellipse(self, left, top, right, bottom, color, width);
+    }
+
     fn line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: Rgba, width: i32) {
         Canvas::line(self, x0, y0, x1, y1, color, width);
+    }
+
+    fn line_styled(
+        &mut self,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        color: Rgba,
+        width: i32,
+        style: StrokeStyle,
+    ) {
+        Canvas::line_styled(self, x0, y0, x1, y1, color, width, style);
     }
 
     fn line_clipped(

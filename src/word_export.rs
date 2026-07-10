@@ -35,7 +35,7 @@ pub struct WordReport {
 
 #[derive(Debug, Error)]
 pub enum WordExportError {
-    #[error("report has no figures")]
+    #[error("DOCX has no figures")]
     EmptyReport,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -64,7 +64,10 @@ fn write_word_report_to_writer<W: Write + Seek>(
     let mut zip = SimpleZipWriter::new(writer);
     zip.add_file("[Content_Types].xml", content_types(report).as_bytes())?;
     zip.add_file("_rels/.rels", root_rels().as_bytes())?;
-    zip.add_file("word/_rels/document.xml.rels", document_rels(report).as_bytes())?;
+    zip.add_file(
+        "word/_rels/document.xml.rels",
+        document_rels(report).as_bytes(),
+    )?;
     zip.add_file("word/document.xml", document_xml(report).as_bytes())?;
 
     for (index, figure) in report.figures.iter().enumerate() {
@@ -235,11 +238,17 @@ fn document_xml(report: &WordReport) -> String {
     let mut body = String::new();
     body.push_str(&paragraph(&report.title, true));
     body.push_str(&paragraph(
-        &format!("实验名称：{}", report.experiment_name),
+        &format!("名称：{}", report.experiment_name),
         false,
     ));
-    body.push_str(&paragraph(&format!("数据文件：{}", report.source_name), false));
-    body.push_str(&paragraph(&format!("导出时间：{}", report.exported_at), false));
+    body.push_str(&paragraph(
+        &format!("数据文件：{}", report.source_name),
+        false,
+    ));
+    body.push_str(&paragraph(
+        &format!("导出时间：{}", report.exported_at),
+        false,
+    ));
     if let Some(sample_rate) = &report.sample_rate {
         body.push_str(&paragraph(&format!("采样率：{sample_rate}"), false));
     }
@@ -332,16 +341,80 @@ mod tests {
     use super::*;
 
     fn sample_png() -> Vec<u8> {
-        b"\x89PNG\r\n\x1A\nsample".to_vec()
+        vec![
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ]
+    }
+
+    fn le_u16(bytes: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
+    }
+
+    fn le_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn zip_entry(bytes: &[u8], name: &str) -> Vec<u8> {
+        let mut offset = 0;
+        while offset + 30 <= bytes.len() {
+            if le_u32(bytes, offset) != 0x0403_4b50 {
+                break;
+            }
+            let method = le_u16(bytes, offset + 8);
+            let size = le_u32(bytes, offset + 18) as usize;
+            let name_len = le_u16(bytes, offset + 26) as usize;
+            let extra_len = le_u16(bytes, offset + 28) as usize;
+            let name_start = offset + 30;
+            let data_start = name_start + name_len + extra_len;
+            let data_end = data_start + size;
+            assert!(data_end <= bytes.len(), "zip entry extends beyond archive");
+            let entry_name = std::str::from_utf8(&bytes[name_start..name_start + name_len])
+                .expect("zip entry names are utf-8");
+            if entry_name == name {
+                assert_eq!(method, 0, "test extractor only supports stored entries");
+                return bytes[data_start..data_end].to_vec();
+            }
+            offset = data_end;
+        }
+        panic!("zip entry not found: {name}");
+    }
+
+    fn zip_entry_text(bytes: &[u8], name: &str) -> String {
+        String::from_utf8(zip_entry(bytes, name)).expect("xml entry should be utf-8")
+    }
+
+    fn libreoffice_executable() -> Option<std::path::PathBuf> {
+        if let Some(path) = std::env::var_os("SCOPE_LIBREOFFICE_PATH") {
+            let path = std::path::PathBuf::from(path);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+        let path_var = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path_var) {
+            for name in ["soffice.exe", "soffice", "libreoffice.exe", "libreoffice"] {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
     }
 
     fn zip_contains_file(bytes: &[u8], name: &str) -> bool {
-        bytes.windows(name.len()).any(|window| window == name.as_bytes())
+        bytes
+            .windows(name.len())
+            .any(|window| window == name.as_bytes())
     }
 
     fn sample_report(include_cursor_tables: bool) -> WordReport {
         WordReport {
-            title: "实验波形报告".to_owned(),
+            title: "波形导出".to_owned(),
             experiment_name: "sample".to_owned(),
             source_name: "sample.csv".to_owned(),
             exported_at: "2026-06-09 12:00:00".to_owned(),
@@ -390,5 +463,113 @@ mod tests {
             write_word_report_to_vec(&report),
             Err(WordExportError::EmptyReport)
         ));
+    }
+
+    #[test]
+    fn word_report_test_fixture_uses_a_structurally_valid_png() {
+        let png = sample_png();
+
+        assert!(png.starts_with(b"\x89PNG\r\n\x1A\n"));
+        assert_eq!(&png[12..16], b"IHDR");
+        assert_eq!(&png[png.len() - 8..png.len() - 4], b"IEND");
+    }
+
+    #[test]
+    fn word_report_preserves_chinese_and_escapes_xml_special_characters() {
+        let mut report = sample_report(true);
+        report.title = "波形导出 & 验证 <DOCX>".to_owned();
+        report.experiment_name = "实验 \"A\" & 'B'".to_owned();
+        report.source_name = "电流<采样>&电压.csv".to_owned();
+        report.figures[0].caption = "图 1：A<B & C>D \"quote\" 'apostrophe'".to_owned();
+        report.figures[0].cursor_table = Some(CursorTable {
+            headers: vec!["变量&名称".to_owned(), "Y<X1>".to_owned()],
+            rows: vec![vec!["Ia\"相\"".to_owned(), "1 < 2 & 3 > 2".to_owned()]],
+        });
+
+        let bytes = write_word_report_to_vec(&report).unwrap();
+        let document = zip_entry_text(&bytes, "word/document.xml");
+
+        assert!(document.contains("波形导出"));
+        assert!(document.contains("验证"));
+        assert!(document.contains("&amp;"));
+        assert!(document.contains("&lt;DOCX&gt;"));
+        assert!(document.contains("&quot;A&quot;"));
+        assert!(document.contains("&apos;B&apos;"));
+        assert!(document.contains("变量&amp;名称"));
+        assert!(document.contains("1 &lt; 2 &amp; 3 &gt; 2"));
+    }
+
+    #[test]
+    fn word_report_writes_multiple_images_relationships_and_media_parts() {
+        let mut report = sample_report(false);
+        report.figures.push(WordReportFigure {
+            caption: "图 2：large".to_owned(),
+            png: sample_png(),
+            width_px: 12_000,
+            height_px: 4_000,
+            cursor_table: None,
+        });
+        report.figures.push(WordReportFigure {
+            caption: "图 3：tall".to_owned(),
+            png: sample_png(),
+            width_px: 800,
+            height_px: 2_400,
+            cursor_table: None,
+        });
+
+        let bytes = write_word_report_to_vec(&report).unwrap();
+        let content_types = zip_entry_text(&bytes, "[Content_Types].xml");
+        let rels = zip_entry_text(&bytes, "word/_rels/document.xml.rels");
+        let document = zip_entry_text(&bytes, "word/document.xml");
+
+        for index in 1..=3 {
+            assert!(zip_contains_file(
+                &bytes,
+                &format!("word/media/image{index}.png")
+            ));
+            assert!(content_types.contains(&format!("/word/media/image{index}.png")));
+            assert!(rels.contains(&format!(r#"Id="rId{index}""#)));
+            assert!(rels.contains(&format!(r#"Target="media/image{index}.png""#)));
+            assert!(document.contains(&format!(r#"r:embed="rId{index}""#)));
+        }
+    }
+
+    #[test]
+    fn word_report_scales_large_images_to_page_width_preserving_aspect_ratio() {
+        let (wide_cx, wide_cy) = image_size_emu(12_000, 4_000);
+        let (tall_cx, tall_cy) = image_size_emu(800, 2_400);
+
+        assert_eq!(wide_cx, (6.5 * EMU_PER_INCH as f64).round() as i64);
+        assert_eq!(wide_cy, (wide_cx as f64 / 3.0).round() as i64);
+        assert_eq!(tall_cx, wide_cx);
+        assert_eq!(tall_cy, (wide_cx as f64 * 3.0).round() as i64);
+    }
+
+    #[test]
+    #[ignore = "requires LibreOffice/soffice; set SCOPE_LIBREOFFICE_PATH or PATH"]
+    fn word_report_can_be_converted_by_libreoffice_when_available() {
+        let Some(soffice) = libreoffice_executable() else {
+            eprintln!("LibreOffice/soffice was not found; skipping compatibility smoke test");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("scope_word_export_lo_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let docx = dir.join("compatibility.docx");
+        let pdf = dir.join("compatibility.pdf");
+        write_word_report(&docx, &sample_report(true)).unwrap();
+
+        let status = std::process::Command::new(soffice)
+            .arg("--headless")
+            .arg("--convert-to")
+            .arg("pdf")
+            .arg("--outdir")
+            .arg(&dir)
+            .arg(&docx)
+            .status()
+            .unwrap();
+
+        assert!(status.success(), "LibreOffice conversion failed: {status}");
+        assert!(pdf.is_file(), "LibreOffice did not create {pdf:?}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
