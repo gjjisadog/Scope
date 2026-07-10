@@ -20,6 +20,8 @@ pub enum DataError {
     CsvRead(#[from] csv::Error),
     #[error("DAT format error: {0}")]
     Dat(String),
+    #[error("SCOPE recording format error: {0}")]
+    Scope(String),
     #[error("字段不足：没有找到数值通道。请确认第一行包含时间列和至少 1 个通道列。")]
     NoChannels,
     #[error("空文件或没有有效采样点。请确认文件不是空文件，且数据行格式正确。")]

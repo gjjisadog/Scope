@@ -4,7 +4,7 @@
 
 ## 当前里程碑
 
-里程碑 3：有界实时缓冲与软件触发。
+里程碑 4：可恢复 `.scope` 录波与离线回放。
 
 ## 已完成内容
 
@@ -26,6 +26,10 @@
 - 已实现多通道对齐环形缓冲、容量淘汰、自动/显式 gap、按 gap 分段的显示快照和尖峰保留 min-max 采样。
 - 已实现 Auto/Normal/Single 软件触发、Rising/Falling/Either 边沿、hysteresis、pre/post capture、Auto 超时和 gap 状态重置。
 - 缓冲与触发在布局、索引或时间戳非法时先返回错误，不产生部分状态更新。
+- 已实现 `.scope` 文件头、JSON 会话元数据、带 CRC32C 的 SampleFrame/Gap/Trigger/Index/SessionEnd 记录。
+- 录波只接受通过协议和通道表校验的 SAMPLE_BATCH；干净结束写入索引和结束标记。
+- 已实现顺序扫描恢复：截断的最终记录可恢复，文件中间 CRC 错误会拒绝打开，不静默跳过。
+- 已实现独立 `ScopeRecordingDataSource`，支持范围读取、抽取、min-max 摘要和取消令牌，并复用现有离线分析 trait。
 
 ## 测试结果
 
@@ -50,6 +54,9 @@
 - 里程碑 3 TDD RED：缓冲/触发测试因类型与状态机缺失编译失败；实现后新增测试全部通过。
 - `cargo +1.87.0 test --lib live::`：20/20 通过。
 - 里程碑 3 的 `cargo +1.87.0 fmt --all --check` 与 `cargo +1.87.0 clippy --lib --quiet`：退出码 0，仅有 vendor eframe 既有警告。
+- 里程碑 4 TDD RED：录波往返测试因 writer、scanner 和 DataSource 不存在而编译失败；实现后录波测试通过。
+- `cargo +1.87.0 test --lib live::`：23/23 通过，包括截断尾恢复和中间 CRC 损坏拒绝。
+- 里程碑 4 的 `cargo +1.87.0 fmt --all --check` 与 `cargo +1.87.0 clippy --lib --quiet`：退出码 0，仅有 vendor eframe 既有警告。
 
 ## 未验证内容
 
@@ -60,8 +67,8 @@
 
 ## 后续任务
 
-1. 实现可恢复 `.scope` 录波和独立离线 DataSource 回放。
-2. 按 TDD 实施模拟器、采集会话和 UI。
+1. 实现 TCP/串口 transport、DSP 模拟器和采集 session。
+2. 按 TDD 实施端到端录波闭环和 UI。
 3. 每个可验收里程碑执行测试、更新本文件并独立提交。
 4. 完成全量回归、版本同步和正常推送。
 
@@ -74,4 +81,4 @@
 - 当前仓库基线在 macOS 上已有 4 个失败测试，详见“测试结果”。
 - Rust 1.97.0 会因更严格的浮点类型推断在现有 `src/app.rs` 中编译失败；Rust 1.87.0 能执行基线测试。
 - 仓库没有现成的实时采集协议、串口模块、触发模块或 `.scope` 格式。
-- 当前已完成协议、实时缓冲和客户端软件触发；连接会话、录波、回放、模拟器和 UI 尚未实现。
+- 当前已完成协议、实时缓冲、软件触发、录波和离线回放；连接会话、模拟器和 UI 尚未实现。

@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use thiserror::Error;
 
@@ -41,7 +42,7 @@ pub struct HelloAck {
     pub firmware_name: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum ChannelKind {
     Analog = 0,
@@ -62,7 +63,7 @@ impl TryFrom<u8> for ChannelKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum WireFormat {
     I16 = 1,
@@ -97,7 +98,7 @@ impl TryFrom<u8> for WireFormat {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChannelDescriptor {
     pub channel_id: u16,
     pub kind: ChannelKind,
@@ -108,7 +109,7 @@ pub struct ChannelDescriptor {
     pub name: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChannelTable {
     pub revision: u32,
     pub channels: Vec<ChannelDescriptor>,
