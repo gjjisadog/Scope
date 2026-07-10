@@ -44,6 +44,7 @@
 - README 已加入实时工作区、模拟器、TCP/串口、触发、录波与回放操作说明，并明确真实硬件尚未验证。
 - 已修复最近文件标签在非 Windows 主机读取反斜杠路径时不截取文件名的问题。
 - 已把 Mesa helper、窗口 maximized 和导出光标表测试改为平台路径/builder 真实语义/字体度量不变量，消除测试对 Windows 路径解析和特定系统字体像素值的错误假设。
+- 已将 `feature/live-dsp-scope-v1` 正常推送到 `github`（`gjjisadog/Scope`），未 force push、未合并 main、未创建 Pull Request。
 
 ## 测试结果
 
@@ -98,8 +99,8 @@
 
 ## 后续任务
 
-1. 正常推送 `feature/live-dsp-scope-v1`。
-2. 获得目标 DSP 板卡和 Windows 测试机后执行硬件/安装包验收。
+1. 获得目标 DSP 板卡和 Windows 测试机后执行硬件/安装包验收。
+2. 如后续需要集成，由用户明确决定是否创建 Pull Request 或合并。
 
 ## 硬件实测状态
 
