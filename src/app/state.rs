@@ -17,6 +17,7 @@ pub(super) struct ImportedDataset {
 }
 
 pub struct ScopeApp {
+    pub live: scope_analyzer::live::state::LiveScopeState,
     pub(super) source: Option<Arc<dyn DataSource>>,
     pub(super) source_kind: Option<SourceKind>,
     pub(super) imported_datasets: Vec<ImportedDataset>,

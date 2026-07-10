@@ -4,7 +4,7 @@
 
 ## 当前里程碑
 
-里程碑 5：串口/TCP transport、采集 session 与 DSP 模拟器闭环。
+里程碑 6：实时工作区 UI、`.scope` 打开入口与桌面程序组合接入。
 
 ## 已完成内容
 
@@ -35,6 +35,10 @@
 - UI 事件背压丢弃显示批次时会累计 HostBackpressure gap，不静默跨缺口连接波形。
 - 已实现确定性 TCP DSP 模拟器和独立 CLI，支持实时/加速、采样率、批量大小、seed、周期丢帧/损坏和主动断线。
 - 已实现 `LiveScopeState` 组合层，持有 session、buffer、trigger、recording 和统计；端到端测试完成连接、采集、录波、停止和 DataSource 回放。
+- 已通过单一 `live: LiveScopeState` 字段把实时模块组合进 `ScopeApp`，没有把会话、触发、缓冲和录波状态继续平铺到主应用。
+- 已实现离线/实时工作区切换；实时工作区包含 TCP/串口连接、采集配置、Start/Stop、暂停显示、通道可见性/颜色、触发配置、实时统计和分段波形显示。
+- 已实现 `.scope` 文件对话框入口；录波回放通过独立 `ScopeRecordingDataSource` 进入既有离线分析工作区。
+- 已把已连接时的界面刷新节流为约 60 Hz；采集线程和协议处理不在 egui 绘制线程中阻塞。
 
 ## 测试结果
 
@@ -66,20 +70,24 @@
 - 里程碑 5 TDD RED：组合闭环测试因 `LiveScopeState` 缺失编译失败；实现后客户端—模拟器—录波—回放通过。
 - `cargo +1.87.0 test --lib live::`：27/27 通过，包括丢帧 gap 与端到端录波回放。
 - `cargo +1.87.0 test --bin scope_dsp_simulator`：1/1 通过。
+- 里程碑 6 TDD RED：`ScopeApp` 组合测试在缺少 `LiveScopeState` 字段和初始化时编译失败；接入后通过。
+- `cargo +1.87.0 test --bin scope_analyzer app::tests::scope_app_live_state_defaults_to_offline_workspace`：1/1 通过。
+- `cargo +1.87.0 clippy --all-targets --quiet`：退出码 0；仅有 vendor eframe 和既有离线应用警告。
+- `cargo +1.87.0 test --no-run`：通过，library、桌面客户端和模拟器全部测试目标编译成功。
+- 已实际启动 `scope_dsp_simulator --accelerated`，监听 `127.0.0.1:19090`；桌面 `scope_analyzer` 也成功启动且无启动期错误。
 
 ## 未验证内容
 
 - 尚未验证 DSP 实物串口通信。
 - 尚未验证 Windows 串口枚举、连接、断线恢复与安装包运行。
 - 尚未运行 Windows `scripts/release-check.ps1` 和离线安装包构建。
-- 尚未验证客户端—模拟器端到端采集、触发、录波和回放闭环。
+- 未完成人工点击桌面 UI 的运行验证：当前开发二进制没有 macOS `.app` 包装，辅助功能层无法识别其窗口；已有编译、单元测试、端到端 session/录波测试及两个进程启动证据。
 
 ## 后续任务
 
-1. 将 `LiveScopeState` 通过单一字段组合进 `ScopeApp`，实现实时工作区 UI。
-2. 增加 `.scope` 打开入口、版本同步、协议/操作文档和完整回归。
-3. 每个可验收里程碑执行测试、更新本文件并独立提交。
-4. 完成全量回归、版本同步和正常推送。
+1. 同步 0.8.0 版本，补充协议/操作文档和发布检查。
+2. 处理或隔离 macOS 基线的 4 个失败测试，完成全量回归。
+3. 验证 release 构建并正常推送功能分支。
 
 ## 硬件实测状态
 
@@ -90,4 +98,4 @@
 - 当前仓库基线在 macOS 上已有 4 个失败测试，详见“测试结果”。
 - Rust 1.97.0 会因更严格的浮点类型推断在现有 `src/app.rs` 中编译失败；Rust 1.87.0 能执行基线测试。
 - 仓库没有现成的实时采集协议、串口模块、触发模块或 `.scope` 格式。
-- 当前已完成无硬件依赖的客户端—模拟器闭环；egui 实时工作区和真实 DSP 串口硬件实测尚未完成。
+- 当前已完成无硬件依赖的客户端—模拟器闭环和 egui 实时工作区；真实 DSP 串口硬件实测尚未完成。

@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use super::{
     buffer::{LiveBuffer, LiveSnapshot},
@@ -30,6 +33,11 @@ pub struct LiveScopeState {
     pub stats: SessionStats,
     pub last_error: Option<String>,
     pub recording_path: Option<PathBuf>,
+    pub channel_visibility: BTreeMap<u16, bool>,
+    pub channel_colors: BTreeMap<u16, [u8; 4]>,
+    pub display_paused: bool,
+    pub frozen_snapshot: Option<LiveSnapshot>,
+    pub serial_ports: Vec<String>,
     session: Option<LiveSession>,
     recording: Option<ScopeWriter>,
 }
@@ -55,6 +63,11 @@ impl Default for LiveScopeState {
             stats: SessionStats::default(),
             last_error: None,
             recording_path: None,
+            channel_visibility: BTreeMap::new(),
+            channel_colors: BTreeMap::new(),
+            display_paused: false,
+            frozen_snapshot: None,
+            serial_ports: Vec::new(),
             session: None,
             recording: None,
         }
@@ -156,6 +169,23 @@ impl LiveScopeState {
             .map(|buffer| buffer.snapshot(max_points))
     }
 
+    pub fn set_display_paused(&mut self, paused: bool) {
+        if paused && !self.display_paused {
+            self.frozen_snapshot = self.snapshot(8_000);
+        } else if !paused {
+            self.frozen_snapshot = None;
+        }
+        self.display_paused = paused;
+    }
+
+    pub fn display_snapshot(&self, max_points: usize) -> Option<LiveSnapshot> {
+        if self.display_paused {
+            self.frozen_snapshot.clone()
+        } else {
+            self.snapshot(max_points)
+        }
+    }
+
     pub fn poll(&mut self) {
         let mut events = Vec::new();
         if let Some(session) = &self.session {
@@ -175,6 +205,14 @@ impl LiveScopeState {
             SessionEvent::State(state) => self.connection_state = state,
             SessionEvent::HelloAck(hello) => self.hello_ack = Some(hello),
             SessionEvent::ChannelTable(table) => {
+                for channel in &table.channels {
+                    self.channel_visibility
+                        .entry(channel.channel_id)
+                        .or_insert(true);
+                    self.channel_colors
+                        .entry(channel.channel_id)
+                        .or_insert_with(|| default_channel_color(channel.channel_id));
+                }
                 self.channel_table = Some(table);
                 self.rebuild_buffer()?;
             }
@@ -247,6 +285,15 @@ impl LiveScopeState {
         }
         Ok(())
     }
+
+    pub fn refresh_serial_ports(&mut self) -> Result<(), String> {
+        self.serial_ports = super::transport::available_serial_ports()
+            .map_err(error_string)?
+            .into_iter()
+            .map(|port| port.port_name)
+            .collect();
+        Ok(())
+    }
 }
 
 impl Drop for LiveScopeState {
@@ -266,6 +313,20 @@ fn hex_device_id(bytes: &[u8; 16]) -> String {
 
 fn error_string(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+fn default_channel_color(channel_id: u16) -> [u8; 4] {
+    const COLORS: [[u8; 4]; 8] = [
+        [32, 120, 220, 255],
+        [220, 70, 70, 255],
+        [30, 160, 95, 255],
+        [180, 100, 210, 255],
+        [230, 145, 30, 255],
+        [35, 165, 175, 255],
+        [210, 80, 155, 255],
+        [110, 125, 145, 255],
+    ];
+    COLORS[usize::from(channel_id) % COLORS.len()]
 }
 
 #[cfg(test)]

@@ -38,6 +38,7 @@ use crate::{
 
 mod export;
 mod jobs;
+mod live_ui;
 mod plot;
 mod state;
 
@@ -1861,6 +1862,7 @@ enum SourceKind {
     Cloud,
     Dat,
     Local,
+    Scope,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2180,6 +2182,10 @@ impl ThemeMode {
 }
 
 impl ScopeApp {
+    fn default_live_state() -> scope_analyzer::live::state::LiveScopeState {
+        scope_analyzer::live::state::LiveScopeState::default()
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         Self::install_panic_hook();
         Self::install_cjk_fonts(&cc.egui_ctx);
@@ -2190,6 +2196,7 @@ impl ScopeApp {
         let recent_shortcut_configs = Self::load_recent_configs(ConfigSection::Shortcut);
         let recent_dataset_configs = Self::load_recent_configs(ConfigSection::Dataset);
         Self {
+            live: Self::default_live_state(),
             source: None,
             source_kind: None,
             imported_datasets: Vec::new(),
@@ -3692,8 +3699,15 @@ impl ScopeApp {
                 }
                 Err(error) => Err(error),
             },
+            "scope" => scope_analyzer::live::scope_source::ScopeRecordingDataSource::open(path)
+                .map(|source| OpenedDataset {
+                    source: Arc::new(source),
+                    path: path.to_owned(),
+                    kind: SourceKind::Scope,
+                })
+                .map_err(|error| error.to_string()),
             other => Err(format!(
-                "Unsupported waveform file extension `{}`. Supported formats: .csv, .dat",
+                "Unsupported waveform file extension `{}`. Supported formats: .csv, .dat, .scope",
                 if other.is_empty() { "(none)" } else { other }
             )),
         }
@@ -16930,6 +16944,12 @@ impl ScopeApp {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.spacing_mut().button_padding.x = 6.0;
         ui.horizontal_wrapped(|ui| {
+            self.workspace_selector(ui);
+            ui.separator();
+            if self.live.workspace_mode == scope_analyzer::live::state::WorkspaceMode::Live {
+                self.live_toolbar(ui);
+                return;
+            }
             ui.menu_button(
                 Self::icon_label("\u{E8E5}", self.t(UiText::ImportData)),
                 |ui| {
@@ -16949,7 +16969,7 @@ impl ScopeApp {
                     {
                         let filter_name = self.t(UiText::WaveformCsv);
                         if let Some(paths) = rfd::FileDialog::new()
-                            .add_filter(filter_name, &["csv", "dat"])
+                            .add_filter(filter_name, &["csv", "dat", "scope"])
                             .pick_files()
                         {
                             self.import_data_files(paths);
@@ -20457,18 +20477,28 @@ impl ScopeApp {
     }
 
     fn update_inner(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.live.poll();
         self.poll_import_worker();
-        if self.any_background_job_running() {
-            ctx.request_repaint();
+        if self.any_background_job_running()
+            || self.live.connection_state
+                != scope_analyzer::live::session::ConnectionState::Disconnected
+        {
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
         self.sync_channel_state_lengths();
         self.apply_theme(ctx);
-        self.handle_shortcuts(ctx);
+        if self.live.workspace_mode == scope_analyzer::live::state::WorkspaceMode::Offline {
+            self.handle_shortcuts(ctx);
+        }
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| self.top_bar(ui));
         self.error_banner(ctx);
         self.help_window(ctx);
         self.options_window(ctx);
+        if self.live.workspace_mode == scope_analyzer::live::state::WorkspaceMode::Live {
+            self.live_workspace(ctx);
+            return;
+        }
         self.export_preview_window(ctx);
         self.batch_export_window(ctx);
 
@@ -20547,6 +20577,16 @@ impl eframe::App for ScopeApp {
 mod tests {
     use super::*;
     use std::{fs::File, io::Write};
+
+    #[test]
+    fn scope_app_live_state_defaults_to_offline_workspace() {
+        let live = ScopeApp::default_live_state();
+
+        assert_eq!(
+            live.workspace_mode,
+            scope_analyzer::live::state::WorkspaceMode::Offline
+        );
+    }
 
     #[test]
     fn opens_indexed_adata_ddata_pair_without_sequence_column_and_merges_first_three_bits() {
