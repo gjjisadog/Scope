@@ -31,6 +31,16 @@ SCP1 是 DSP 与 Scope Analyzer 之间的双向二进制字节流协议。TCP �
 
 CRC 参数与标准检查值：多项式 Castagnoli，`CRC32C("123456789") = 0xE3069283`。长度、版本或 CRC 不合法的帧必须丢弃；接收器继续逐字节寻找下一处 `SCP1`。
 
+固件 golden frame：`PING(nonce=17)`，flags=3、sequence=7、session_id=11、timestamp_ticks=13 的完整 40 字节帧为：
+
+```text
+53 43 50 31 01 14 03 00 07 00 00 00 08 00 00 00
+0b 00 00 00 0d 00 00 00 00 00 00 00 11 00 00 00
+00 00 00 00 1d 23 97 cb
+```
+
+末尾 CRC32C 的 little-endian 数值为 `0xCB97231D`。固件实现应首先用该向量验证字节序、CRC 覆盖范围和最终异或。
+
 ## 3. 消息类型与方向
 
 | 值 | 名称 | 方向 | 用途 |
@@ -48,7 +58,7 @@ CRC 参数与标准检查值：多项式 Castagnoli，`CRC32C("123456789") = 0xE
 | `0x21` | STATUS | DSP → Client | 设备状态与丢样统计 |
 | `0x22` | ERROR | DSP → Client | 异步错误 |
 
-任何 payload 解码后有剩余字节均视为协议错误。V1 未定义 capability 位语义；未知位必须忽略，当前客户端发送 `client_capabilities = 0b111`。
+任何 payload 解码后有剩余字节均视为协议错误。V1 客户端 capability：bit 0=录波、bit 1=软件触发、bit 2=gap 记录；其他位必须发送 0。接收端必须忽略未知 capability 位。
 
 ## 4. 会话状态机
 
@@ -79,9 +89,9 @@ CRC 参数与标准检查值：多项式 Castagnoli，`CRC32C("123456789") = 0xE
 
 头部：`u32 revision, u16 descriptor_count`。
 
-每个 descriptor：
+每个 descriptor 的固定部分和两个长度字段必须连续出现，随后才是两个字符串：
 
-`u16 channel_id, u8 kind, u8 wire_format, f32 scale, f32 offset, str8 unit, str8 name`
+`u16 channel_id, u8 kind, u8 wire_format, f32 scale, f32 offset, u8 unit_len, u8 name_len, u8 unit[unit_len], u8 name[name_len]`
 
 - `channel_id` 唯一，范围 0..63；名称非空。
 - kind：0=Analog，1=Digital。
@@ -94,7 +104,7 @@ CRC 参数与标准检查值：多项式 Castagnoli，`CRC32C("123456789") = 0xE
 
 `u32 sample_rate_hz, u16 batch_samples, u16 reserved_zero, u64 channel_mask`
 
-mask bit N 选择 channel_id N；至少选择一个通道。DSP 不支持参数时以 COMMAND_RESULT 拒绝，不得静默替换。
+mask bit N 选择 channel_id N；至少选择一个通道。采样率不得超过 `tick_hz`，批量不得超过 `max_batch_samples`，预计 SAMPLE_BATCH payload 不得超过协商的 `max_payload`。DSP 不支持参数时以 COMMAND_RESULT 拒绝，不得静默替换。
 
 ### START / STOP (`0x11` / `0x12`)
 
@@ -105,6 +115,12 @@ payload 长度为 0。
 `u32 request_sequence, u16 result_code, str16 detail`
 
 result_code：0=Ok，1=Unsupported，2=InvalidState，3=InvalidArgument，4=Busy，5=InternalError。异步 ERROR 的 `request_sequence` 可为 0。
+
+CONFIGURE 成功时 detail 必须返回设备实际采用的参数，固定 ASCII 格式如下（字段次序固定，mask 为 16 位小写十六进制）：
+
+```text
+sample_rate_hz=20000;batch_samples=64;channel_mask=0x000000000000000f
+```
 
 ### PING / PONG (`0x14` / `0x15`)
 

@@ -4,7 +4,7 @@
 
 ## 当前里程碑
 
-里程碑 8 已完成：跨平台测试基线修复与发布前全量回归。
+里程碑 9：完成性复审与 V1 互操作/运行时缺口补齐。
 
 ## 已完成内容
 
@@ -45,6 +45,9 @@
 - 已修复最近文件标签在非 Windows 主机读取反斜杠路径时不截取文件名的问题。
 - 已把 Mesa helper、窗口 maximized 和导出光标表测试改为平台路径/builder 真实语义/字体度量不变量，消除测试对 Windows 路径解析和特定系统字体像素值的错误假设。
 - 已将 `feature/live-dsp-scope-v1` 正常推送到 `github`（`gjjisadog/Scope`），未 force push、未合并 main、未创建 Pull Request。
+- 完成性复审发现初版 CHANNEL_TABLE 字符串长度排列与冻结设计不一致、协议文档缺少固件 golden frame、配置未对设备协商上限做统一校验；已以新测试先复现并修正。
+- CHANNEL_TABLE descriptor 已冻结为“固定字段、unit/name 两个长度、unit/name 两段字节”的布局；PING 完整 golden frame 和 CRC 已写入固件协议文档。
+- 已新增设备约束校验和 CONFIGURE 成功 detail 的规范编码/解码，覆盖 tick_hz、最大批量、通道 mask 和协商 payload 上限。
 
 ## 测试结果
 
@@ -89,6 +92,8 @@
 - 最终 `cargo +1.87.0 clippy --all-targets --quiet`：退出码 0；保留 vendor eframe 与既有离线模块的非阻断警告，没有新增实时模块警告。
 - 最终 `cargo +1.87.0 test --quiet -- --ignored`：5/5 ignored 性能/兼容性测试通过。
 - 最终 `cargo +1.87.0 build --release --bins`：通过，生成 release 客户端与 DSP 模拟器二进制。
+- 里程碑 9 TDD RED：CHANNEL_TABLE golden layout 测试实际得到 `unit_len, unit, name_len, name`，与冻结设计不符；调整 codec 后通过。
+- `cargo +1.87.0 test --lib live::protocol::tests`：15/15 通过，包括完整帧 golden bytes、descriptor golden bytes 和设备配置协商约束。
 
 ## 未验证内容
 
@@ -99,8 +104,9 @@
 
 ## 后续任务
 
-1. 获得目标 DSP 板卡和 Windows 测试机后执行硬件/安装包验收。
-2. 如后续需要集成，由用户明确决定是否创建 Pull Request 或合并。
+1. 实现独立有界录波线程、完整 Trigger/Index 记录和写入故障传播。
+2. 补齐会话关闭、状态机、背压、重连与 UI 操作面缺口。
+3. 重新执行完整发布验证并正常推送功能分支。
 
 ## 硬件实测状态
 

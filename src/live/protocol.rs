@@ -350,8 +350,12 @@ impl Message {
                     bytes.push(descriptor.wire_format as u8);
                     put_f32(&mut bytes, descriptor.scale);
                     put_f32(&mut bytes, descriptor.offset);
-                    put_string_u8(&mut bytes, &descriptor.unit, "channel unit")?;
-                    put_string_u8(&mut bytes, &descriptor.name, "channel name")?;
+                    ensure_u8_string(&descriptor.unit, "channel unit")?;
+                    ensure_u8_string(&descriptor.name, "channel name")?;
+                    bytes.push(descriptor.unit.len() as u8);
+                    bytes.push(descriptor.name.len() as u8);
+                    bytes.extend_from_slice(descriptor.unit.as_bytes());
+                    bytes.extend_from_slice(descriptor.name.as_bytes());
                 }
             }
             Self::Configure(message) => {
@@ -470,14 +474,21 @@ impl Message {
                 )?;
                 let mut channels = Vec::with_capacity(descriptor_count);
                 for _ in 0..descriptor_count {
+                    let channel_id = reader.u16()?;
+                    let kind = ChannelKind::try_from(reader.u8()?)?;
+                    let wire_format = WireFormat::try_from(reader.u8()?)?;
+                    let scale = reader.f32()?;
+                    let offset = reader.f32()?;
+                    let unit_len = usize::from(reader.u8()?);
+                    let name_len = usize::from(reader.u8()?);
                     channels.push(ChannelDescriptor {
-                        channel_id: reader.u16()?,
-                        kind: ChannelKind::try_from(reader.u8()?)?,
-                        wire_format: WireFormat::try_from(reader.u8()?)?,
-                        scale: reader.f32()?,
-                        offset: reader.f32()?,
-                        unit: reader.string_u8("channel unit")?,
-                        name: reader.string_u8("channel name")?,
+                        channel_id,
+                        kind,
+                        wire_format,
+                        scale,
+                        offset,
+                        unit: reader.string(unit_len, "channel unit")?,
+                        name: reader.string(name_len, "channel name")?,
                     });
                 }
                 let table = ChannelTable { revision, channels };
@@ -790,6 +801,135 @@ fn validate_configure(message: Configure) -> Result<Configure, ProtocolError> {
     Ok(message)
 }
 
+pub fn validate_configure_for_device(
+    configure: &Configure,
+    hello: &HelloAck,
+    table: &ChannelTable,
+) -> Result<(), ProtocolError> {
+    validate_configure(configure.clone())?;
+    table.validate()?;
+    if usize::from(hello.channel_count) != table.channels.len() {
+        return invalid(format!(
+            "HELLO_ACK channel count {} does not match channel table count {}",
+            hello.channel_count,
+            table.channels.len()
+        ));
+    }
+    if configure.sample_rate_hz as u64 > hello.tick_hz {
+        return invalid(format!(
+            "sample rate {} exceeds device tick rate {}",
+            configure.sample_rate_hz, hello.tick_hz
+        ));
+    }
+    if configure.batch_samples > hello.max_batch_samples {
+        return invalid(format!(
+            "batch samples {} exceeds device maximum {}",
+            configure.batch_samples, hello.max_batch_samples
+        ));
+    }
+    let known_mask = table
+        .channels
+        .iter()
+        .fold(0_u64, |mask, channel| mask | (1_u64 << channel.channel_id));
+    if configure.channel_mask & !known_mask != 0 {
+        return invalid(format!(
+            "channel mask 0x{:016x} selects unknown device channels",
+            configure.channel_mask
+        ));
+    }
+    let selected = table
+        .channels
+        .iter()
+        .filter(|channel| configure.channel_mask & (1_u64 << channel.channel_id) != 0)
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return invalid("channel mask selects no device channels");
+    }
+    let bytes_per_sample = selected.iter().try_fold(0_usize, |total, channel| {
+        total
+            .checked_add(channel.wire_format.byte_width())
+            .ok_or(ProtocolError::LengthOverflow)
+    })?;
+    let payload_len = 20_usize
+        .checked_add(
+            selected
+                .len()
+                .checked_mul(2)
+                .ok_or(ProtocolError::LengthOverflow)?,
+        )
+        .and_then(|length| {
+            bytes_per_sample
+                .checked_mul(usize::from(configure.batch_samples))
+                .and_then(|sample_bytes| length.checked_add(sample_bytes))
+        })
+        .ok_or(ProtocolError::LengthOverflow)?;
+    let negotiated_max = usize::try_from(hello.max_payload)
+        .unwrap_or(usize::MAX)
+        .min(MAX_PAYLOAD_LEN);
+    if payload_len > negotiated_max {
+        return invalid(format!(
+            "configured sample payload {payload_len} exceeds negotiated maximum {negotiated_max}"
+        ));
+    }
+    Ok(())
+}
+
+pub fn encode_configure_result_detail(configure: &Configure) -> String {
+    format!(
+        "sample_rate_hz={};batch_samples={};channel_mask=0x{:016x}",
+        configure.sample_rate_hz, configure.batch_samples, configure.channel_mask
+    )
+}
+
+pub fn decode_configure_result_detail(detail: &str) -> Result<Configure, ProtocolError> {
+    let mut sample_rate_hz = None;
+    let mut batch_samples = None;
+    let mut channel_mask = None;
+    for field in detail.split(';') {
+        let (name, value) = field
+            .split_once('=')
+            .ok_or_else(|| invalid_error("invalid CONFIGURE result detail"))?;
+        match name {
+            "sample_rate_hz" if sample_rate_hz.is_none() => {
+                sample_rate_hz = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| invalid_error("invalid configured sample rate"))?,
+                );
+            }
+            "batch_samples" if batch_samples.is_none() => {
+                batch_samples = Some(
+                    value
+                        .parse::<u16>()
+                        .map_err(|_| invalid_error("invalid configured batch samples"))?,
+                );
+            }
+            "channel_mask" if channel_mask.is_none() => {
+                let value = value
+                    .strip_prefix("0x")
+                    .ok_or_else(|| invalid_error("configured channel mask must use 0x prefix"))?;
+                channel_mask = Some(
+                    u64::from_str_radix(value, 16)
+                        .map_err(|_| invalid_error("invalid configured channel mask"))?,
+                );
+            }
+            _ => {
+                return invalid(format!(
+                    "unknown or duplicate CONFIGURE result field {name}"
+                ))
+            }
+        }
+    }
+    validate_configure(Configure {
+        sample_rate_hz: sample_rate_hz
+            .ok_or_else(|| invalid_error("CONFIGURE result is missing sample_rate_hz"))?,
+        batch_samples: batch_samples
+            .ok_or_else(|| invalid_error("CONFIGURE result is missing batch_samples"))?,
+        channel_mask: channel_mask
+            .ok_or_else(|| invalid_error("CONFIGURE result is missing channel_mask"))?,
+    })
+}
+
 fn validate_sample_batch_header(batch: &SampleBatch) -> Result<(), ProtocolError> {
     if batch.sample_period_ticks == 0 {
         return invalid("sample period ticks must be greater than zero");
@@ -860,13 +1000,6 @@ fn put_u64(bytes: &mut Vec<u8>, value: u64) {
 
 fn put_f32(bytes: &mut Vec<u8>, value: f32) {
     bytes.extend_from_slice(&value.to_le_bytes());
-}
-
-fn put_string_u8(bytes: &mut Vec<u8>, value: &str, label: &str) -> Result<(), ProtocolError> {
-    ensure_u8_string(value, label)?;
-    bytes.push(value.len() as u8);
-    bytes.extend_from_slice(value.as_bytes());
-    Ok(())
 }
 
 fn put_string_u16(bytes: &mut Vec<u8>, value: &str, label: &str) -> Result<(), ProtocolError> {
@@ -948,11 +1081,6 @@ impl<'a> PayloadReader<'a> {
         Ok(f32::from_le_bytes(
             self.bytes(4, "f32")?.try_into().expect("length checked"),
         ))
-    }
-
-    fn string_u8(&mut self, label: &str) -> Result<String, ProtocolError> {
-        let len = usize::from(self.u8()?);
-        self.string(len, label)
     }
 
     fn string_u16(&mut self, label: &str) -> Result<String, ProtocolError> {
@@ -1183,9 +1311,45 @@ mod tests {
 
         let encoded = frame.encode().unwrap();
 
-        assert_eq!(&encoded[..4], b"SCP1");
-        assert_eq!(u32::from_le_bytes(encoded[12..16].try_into().unwrap()), 8);
+        assert_eq!(
+            encoded,
+            [
+                0x53, 0x43, 0x50, 0x31, 0x01, 0x14, 0x03, 0x00, 0x07, 0x00, 0x00, 0x00, 0x08, 0x00,
+                0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1d, 0x23, 0x97, 0xcb,
+            ]
+        );
         assert_eq!(Frame::decode(&encoded).unwrap(), frame);
+    }
+
+    #[test]
+    fn channel_table_descriptor_matches_frozen_v1_byte_layout() {
+        let message = Message::ChannelTable(ChannelTable {
+            revision: 0x0102_0304,
+            channels: vec![ChannelDescriptor {
+                channel_id: 2,
+                kind: ChannelKind::Analog,
+                wire_format: WireFormat::I16,
+                scale: 1.0,
+                offset: 0.0,
+                unit: "V".to_owned(),
+                name: "Ua".to_owned(),
+            }],
+        });
+
+        let payload = message.encode_payload().unwrap();
+
+        assert_eq!(
+            payload,
+            [
+                0x04, 0x03, 0x02, 0x01, 0x01, 0x00, 0x02, 0x00, 0x00, 0x01, 0x00, 0x00, 0x80, 0x3f,
+                0x00, 0x00, 0x00, 0x00, 0x01, 0x02, b'V', b'U', b'a',
+            ]
+        );
+        assert_eq!(
+            Message::decode(MSG_CHANNEL_TABLE, &payload).unwrap(),
+            message
+        );
     }
 
     #[test]
@@ -1370,6 +1534,79 @@ mod tests {
             Message::decode(MSG_PING, &ping),
             Err(ProtocolError::InvalidPayload(_))
         ));
+    }
+
+    #[test]
+    fn configure_is_validated_against_negotiated_device_limits() {
+        let hello = HelloAck {
+            device_capabilities: 0,
+            max_payload: 128,
+            tick_hz: 1_000,
+            channel_count: 1,
+            max_batch_samples: 10,
+            device_id: [1; 16],
+            firmware_name: "test".to_owned(),
+        };
+        let table = ChannelTable {
+            revision: 1,
+            channels: vec![ChannelDescriptor {
+                channel_id: 2,
+                kind: ChannelKind::Analog,
+                wire_format: WireFormat::I16,
+                scale: 1.0,
+                offset: 0.0,
+                unit: "V".to_owned(),
+                name: "Ua".to_owned(),
+            }],
+        };
+
+        assert!(validate_configure_for_device(
+            &Configure {
+                sample_rate_hz: 1_000,
+                batch_samples: 10,
+                channel_mask: 1 << 2,
+            },
+            &hello,
+            &table,
+        )
+        .is_ok());
+        for invalid in [
+            Configure {
+                sample_rate_hz: 1_001,
+                batch_samples: 10,
+                channel_mask: 1 << 2,
+            },
+            Configure {
+                sample_rate_hz: 1_000,
+                batch_samples: 11,
+                channel_mask: 1 << 2,
+            },
+            Configure {
+                sample_rate_hz: 1_000,
+                batch_samples: 10,
+                channel_mask: 1 << 3,
+            },
+        ] {
+            assert!(validate_configure_for_device(&invalid, &hello, &table).is_err());
+        }
+    }
+
+    #[test]
+    fn configure_command_result_detail_round_trips_actual_parameters() {
+        let configure = Configure {
+            sample_rate_hz: 20_000,
+            batch_samples: 64,
+            channel_mask: 0x8000_0000_0000_0001,
+        };
+
+        let detail = encode_configure_result_detail(&configure);
+
+        assert_eq!(
+            detail,
+            "sample_rate_hz=20000;batch_samples=64;channel_mask=0x8000000000000001"
+        );
+        assert_eq!(decode_configure_result_detail(&detail).unwrap(), configure);
+        assert!(decode_configure_result_detail("ok").is_err());
     }
 
     #[test]
