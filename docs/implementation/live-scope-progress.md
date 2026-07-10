@@ -4,7 +4,7 @@
 
 ## 当前里程碑
 
-里程碑 2：SCP1 控制消息、通道表与采样解码。
+里程碑 3：有界实时缓冲与软件触发。
 
 ## 已完成内容
 
@@ -23,6 +23,9 @@
 - 已实现 HELLO/ACK、CHANNEL_TABLE、CONFIGURE、START/STOP、COMMAND_RESULT、PING/PONG、STATUS、ERROR 和 SAMPLE_BATCH 负载。
 - 已实现 1..64 通道表校验、UTF-8/精确长度/保留位检查，以及 `i16`、`i32`、`f32`、`u8` 混合采样到工程值的解码。
 - 已实现通道表修订匹配、数字量范围、样本数据精确长度，以及样点索引和时间戳 checked arithmetic。
+- 已实现多通道对齐环形缓冲、容量淘汰、自动/显式 gap、按 gap 分段的显示快照和尖峰保留 min-max 采样。
+- 已实现 Auto/Normal/Single 软件触发、Rising/Falling/Either 边沿、hysteresis、pre/post capture、Auto 超时和 gap 状态重置。
+- 缓冲与触发在布局、索引或时间戳非法时先返回错误，不产生部分状态更新。
 
 ## 测试结果
 
@@ -44,6 +47,9 @@
 - 里程碑 2 TDD RED：样点索引溢出测试在缺少 checked arithmetic 时断言失败；补充索引与时间戳校验后通过。
 - `cargo +1.87.0 test --lib live::protocol::tests`：12/12 通过。
 - `cargo +1.87.0 clippy --lib --quiet`：退出码 0；仅有 vendor eframe 既有警告。
+- 里程碑 3 TDD RED：缓冲/触发测试因类型与状态机缺失编译失败；实现后新增测试全部通过。
+- `cargo +1.87.0 test --lib live::`：20/20 通过。
+- 里程碑 3 的 `cargo +1.87.0 fmt --all --check` 与 `cargo +1.87.0 clippy --lib --quiet`：退出码 0，仅有 vendor eframe 既有警告。
 
 ## 未验证内容
 
@@ -54,8 +60,8 @@
 
 ## 后续任务
 
-1. 实现有界实时缓冲、gap、显示包络和软件触发。
-2. 按 TDD 实施录波、回放、模拟器、采集会话和 UI。
+1. 实现可恢复 `.scope` 录波和独立离线 DataSource 回放。
+2. 按 TDD 实施模拟器、采集会话和 UI。
 3. 每个可验收里程碑执行测试、更新本文件并独立提交。
 4. 完成全量回归、版本同步和正常推送。
 
@@ -68,4 +74,4 @@
 - 当前仓库基线在 macOS 上已有 4 个失败测试，详见“测试结果”。
 - Rust 1.97.0 会因更严格的浮点类型推断在现有 `src/app.rs` 中编译失败；Rust 1.87.0 能执行基线测试。
 - 仓库没有现成的实时采集协议、串口模块、触发模块或 `.scope` 格式。
-- 当前已完成协议层；连接会话、实时缓冲、触发、录波、回放、模拟器和 UI 尚未实现。
+- 当前已完成协议、实时缓冲和客户端软件触发；连接会话、录波、回放、模拟器和 UI 尚未实现。
