@@ -252,7 +252,7 @@ fn worker_loop(
     let mut table: Option<ChannelTable> = None;
     let mut pending = HashMap::new();
     let mut stats = SessionStats::default();
-    let mut last_batch_sequence: Option<u32> = None;
+    let mut last_frame_sequence: Option<u32> = None;
     let mut next_sample_index: Option<u64> = None;
     let mut last_received = Instant::now();
     let mut last_ping = Instant::now();
@@ -374,6 +374,13 @@ fn worker_loop(
                 )?;
                 continue;
             }
+            if let Some(previous_sequence) = last_frame_sequence {
+                let expected = previous_sequence.wrapping_add(1);
+                if frame.sequence != expected {
+                    stats.sequence_gaps = stats.sequence_gaps.saturating_add(1);
+                }
+            }
+            last_frame_sequence = Some(frame.sequence);
             let message = match Message::decode(frame.message_type, &frame.payload) {
                 Ok(message) => message,
                 Err(error) => {
@@ -479,12 +486,6 @@ fn worker_loop(
                             continue;
                         }
                     };
-                    if let Some(previous_sequence) = last_batch_sequence {
-                        let expected = previous_sequence.wrapping_add(1);
-                        if frame.sequence != expected {
-                            stats.sequence_gaps = stats.sequence_gaps.saturating_add(1);
-                        }
-                    }
                     if let Some(expected) = next_sample_index {
                         if decoded.first_sample_index > expected {
                             let gap = LiveGap {
@@ -517,7 +518,6 @@ fn worker_loop(
                     }
                     let sample_count = decoded.channels.first().map(Vec::len).unwrap_or(0);
                     next_sample_index = decoded.first_sample_index.checked_add(sample_count as u64);
-                    last_batch_sequence = Some(frame.sequence);
                     stats.received_batches = stats.received_batches.saturating_add(1);
                     stats.received_samples =
                         stats.received_samples.saturating_add(sample_count as u64);
@@ -965,6 +965,47 @@ mod tests {
         assert!(stats.ping_requests > 0, "device must receive client PING");
         assert!(stats.pings_sent > 0, "device must initiate PING");
         assert!(stats.pongs_received > 0, "client must answer device PING");
+        session.disconnect().unwrap();
+    }
+
+    #[test]
+    fn control_frames_interleaved_with_samples_do_not_report_sequence_gaps() {
+        let simulator = SimulatorHandle::spawn(SimulatorConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            ..SimulatorConfig::default()
+        })
+        .unwrap();
+        let session = LiveSession::connect(TransportConfig::Tcp {
+            address: simulator.address().to_string(),
+        })
+        .unwrap();
+        wait_for(&session, Duration::from_secs(2), |event| {
+            matches!(event, SessionEvent::State(ConnectionState::Ready))
+        });
+        session
+            .configure(Configure {
+                sample_rate_hz: 100,
+                batch_samples: 10,
+                channel_mask: 0b1111,
+            })
+            .unwrap();
+        wait_for(&session, Duration::from_secs(2), |event| {
+            matches!(event, SessionEvent::Configured(_))
+        });
+        session.start().unwrap();
+
+        let deadline = Instant::now() + Duration::from_millis(1_400);
+        let mut latest = SessionStats::default();
+        while Instant::now() < deadline {
+            if let Ok(SessionEvent::Stats(stats)) = session.recv_timeout(Duration::from_millis(50))
+            {
+                latest = stats;
+            }
+        }
+
+        assert!(latest.received_batches >= 8);
+        assert_eq!(latest.sequence_gaps, 0);
+        assert!(simulator.stats().pings_sent > 0);
         session.disconnect().unwrap();
     }
 }

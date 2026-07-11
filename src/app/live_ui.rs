@@ -10,16 +10,28 @@ impl ScopeApp {
     pub(super) fn workspace_selector(&mut self, ui: &mut egui::Ui) {
         let offline_label = self.live_text("离线", "Offline");
         let live_label = self.live_text("实时", "Live");
-        ui.selectable_value(
-            &mut self.live.workspace_mode,
-            WorkspaceMode::Offline,
-            offline_label,
-        );
-        ui.selectable_value(
-            &mut self.live.workspace_mode,
-            WorkspaceMode::Live,
-            live_label,
-        );
+        let mut changed = ui
+            .selectable_value(
+                &mut self.live.workspace_mode,
+                WorkspaceMode::Offline,
+                offline_label,
+            )
+            .changed();
+        changed |= ui
+            .selectable_value(
+                &mut self.live.workspace_mode,
+                WorkspaceMode::Live,
+                live_label,
+            )
+            .changed();
+        if changed
+            && self.live.workspace_mode == WorkspaceMode::Live
+            && self.live.serial_ports.is_empty()
+        {
+            if let Err(error) = self.live.refresh_serial_ports() {
+                self.live.last_error = Some(error);
+            }
+        }
     }
 
     pub(super) fn live_toolbar(&mut self, ui: &mut egui::Ui) {
@@ -36,7 +48,7 @@ impl ScopeApp {
             } else {
                 TransportConfig::Serial {
                     port: self.live.serial_ports.first().cloned().unwrap_or_default(),
-                    baud: 921_600,
+                    baud: 115_200,
                 }
             };
         }
@@ -123,11 +135,17 @@ impl ScopeApp {
                 egui::Button::new(self.live_text("应用采集", "Configure")),
             )
             .clicked();
+        let start_label = if self.live.configuration_applied {
+            self.live_text("开始", "Start")
+        } else {
+            self.live_text("应用并开始", "Configure & Start")
+        };
         let start_clicked = ui
-            .add_enabled(
-                ready && self.live.configuration_applied,
-                egui::Button::new(self.live_text("开始", "Start")),
-            )
+            .add_enabled(ready, egui::Button::new(start_label))
+            .on_hover_text(self.live_text(
+                "未应用的采集参数会自动下发，然后开始采集。",
+                "Pending acquisition settings are applied before streaming starts.",
+            ))
             .clicked();
         let stop_clicked = ui
             .add_enabled(streaming, egui::Button::new(self.live_text("停止", "Stop")))
@@ -140,22 +158,35 @@ impl ScopeApp {
             self.live.set_display_paused(paused);
         }
 
+        let recording = self.live.is_recording();
         let record_clicked = ui
             .add_enabled(
-                self.live.configuration_applied
-                    && (ready || streaming)
-                    && !self.live.is_recording(),
+                streaming && self.live.configuration_applied && !recording,
                 egui::Button::new(self.live_text("录波", "Record")),
             )
+            .on_hover_text(self.live_text(
+                "开始实时采集后才能录波，避免生成没有采样数据的文件。",
+                "Start live acquisition before recording to avoid empty recordings.",
+            ))
             .clicked();
         let stop_record_clicked = ui
             .add_enabled(
-                self.live.is_recording(),
+                recording,
                 egui::Button::new(self.live_text("结束录波", "Finish recording")),
             )
             .clicked();
         let open_recording_clicked = ui
-            .button(self.live_text("打开录波", "Open recording"))
+            .add_enabled(
+                !recording,
+                egui::Button::new(self.live_text("打开录波", "Open recording")),
+            )
+            .clicked();
+        let latest_recording = self.live.recording_path.clone();
+        let replay_latest_clicked = ui
+            .add_enabled(
+                !recording && latest_recording.as_ref().is_some_and(|path| path.is_file()),
+                egui::Button::new(self.live_text("回放刚才录波", "Replay latest")),
+            )
             .clicked();
 
         if connect_clicked {
@@ -172,7 +203,8 @@ impl ScopeApp {
             self.apply_live_result(result);
         }
         if start_clicked {
-            let result = self.live.start();
+            let configure = self.live.acquisition.clone();
+            let result = self.live.start_with_configuration(configure);
             self.apply_live_result(result);
         }
         if stop_clicked {
@@ -201,9 +233,17 @@ impl ScopeApp {
                 self.open_scope_recording(path);
             }
         }
+        if replay_latest_clicked {
+            if let Some(path) = latest_recording {
+                self.open_scope_recording(path);
+            }
+        }
 
         ui.separator();
-        ui.label(format!("{:?}", self.live.connection_state));
+        ui.label(self.live_connection_state_text());
+        if ready && !self.live.configuration_applied {
+            ui.label(self.live_text("点击“应用并开始”", "Click Configure & Start"));
+        }
         if self.live.is_recording() {
             ui.colored_label(Color32::from_rgb(210, 45, 45), "● REC");
         }
@@ -378,29 +418,61 @@ impl ScopeApp {
         let mut config = self.live.trigger.config().clone();
         let mut changed = false;
         egui::ComboBox::from_id_source("live_trigger_mode")
-            .selected_text(format!("{:?}", config.mode))
+            .selected_text(match config.mode {
+                TriggerMode::Auto => self.live_text("自动", "Auto"),
+                TriggerMode::Normal => self.live_text("普通", "Normal"),
+                TriggerMode::Single => self.live_text("单次", "Single"),
+            })
             .show_ui(ui, |ui| {
                 changed |= ui
-                    .selectable_value(&mut config.mode, TriggerMode::Auto, "Auto")
+                    .selectable_value(
+                        &mut config.mode,
+                        TriggerMode::Auto,
+                        self.live_text("自动", "Auto"),
+                    )
                     .changed();
                 changed |= ui
-                    .selectable_value(&mut config.mode, TriggerMode::Normal, "Normal")
+                    .selectable_value(
+                        &mut config.mode,
+                        TriggerMode::Normal,
+                        self.live_text("普通", "Normal"),
+                    )
                     .changed();
                 changed |= ui
-                    .selectable_value(&mut config.mode, TriggerMode::Single, "Single")
+                    .selectable_value(
+                        &mut config.mode,
+                        TriggerMode::Single,
+                        self.live_text("单次", "Single"),
+                    )
                     .changed();
             });
         egui::ComboBox::from_id_source("live_trigger_edge")
-            .selected_text(format!("{:?}", config.edge))
+            .selected_text(match config.edge {
+                TriggerEdge::Rising => self.live_text("上升沿", "Rising"),
+                TriggerEdge::Falling => self.live_text("下降沿", "Falling"),
+                TriggerEdge::Either => self.live_text("双边沿", "Either"),
+            })
             .show_ui(ui, |ui| {
                 changed |= ui
-                    .selectable_value(&mut config.edge, TriggerEdge::Rising, "Rising")
+                    .selectable_value(
+                        &mut config.edge,
+                        TriggerEdge::Rising,
+                        self.live_text("上升沿", "Rising"),
+                    )
                     .changed();
                 changed |= ui
-                    .selectable_value(&mut config.edge, TriggerEdge::Falling, "Falling")
+                    .selectable_value(
+                        &mut config.edge,
+                        TriggerEdge::Falling,
+                        self.live_text("下降沿", "Falling"),
+                    )
                     .changed();
                 changed |= ui
-                    .selectable_value(&mut config.edge, TriggerEdge::Either, "Either")
+                    .selectable_value(
+                        &mut config.edge,
+                        TriggerEdge::Either,
+                        self.live_text("双边沿", "Either"),
+                    )
                     .changed();
             });
         let source_name = self
@@ -431,7 +503,7 @@ impl ScopeApp {
             .add(
                 egui::DragValue::new(&mut config.level)
                     .speed(0.01)
-                    .prefix("Level "),
+                    .prefix(self.live_text("电平 ", "Level ")),
             )
             .changed();
         changed |= ui
@@ -439,20 +511,26 @@ impl ScopeApp {
                 egui::DragValue::new(&mut config.hysteresis)
                     .clamp_range(0.0..=f32::MAX)
                     .speed(0.01)
-                    .prefix("Hys "),
+                    .prefix(self.live_text("回差 ", "Hys ")),
             )
             .changed();
         changed |= ui
-            .add(egui::DragValue::new(&mut config.pre_samples).prefix("Pre "))
+            .add(
+                egui::DragValue::new(&mut config.pre_samples)
+                    .prefix(self.live_text("前置 ", "Pre ")),
+            )
             .changed();
         changed |= ui
-            .add(egui::DragValue::new(&mut config.post_samples).prefix("Post "))
+            .add(
+                egui::DragValue::new(&mut config.post_samples)
+                    .prefix(self.live_text("后置 ", "Post ")),
+            )
             .changed();
         changed |= ui
             .add(
                 egui::DragValue::new(&mut config.auto_timeout_samples)
                     .clamp_range(1..=usize::MAX)
-                    .prefix("Auto timeout "),
+                    .prefix(self.live_text("Auto 超时 ", "Auto timeout ")),
             )
             .changed();
         if changed {
@@ -638,6 +716,17 @@ impl ScopeApp {
         match self.language {
             Language::Zh => zh,
             Language::En => en,
+        }
+    }
+
+    fn live_connection_state_text(&self) -> &'static str {
+        match self.live.connection_state {
+            ConnectionState::Disconnected => self.live_text("未连接", "Disconnected"),
+            ConnectionState::Connecting => self.live_text("正在连接", "Connecting"),
+            ConnectionState::Handshaking => self.live_text("正在握手", "Handshaking"),
+            ConnectionState::Configuring => self.live_text("正在应用采集", "Configuring"),
+            ConnectionState::Ready => self.live_text("已就绪", "Ready"),
+            ConnectionState::Streaming => self.live_text("正在采集", "Streaming"),
         }
     }
 }
