@@ -43,6 +43,7 @@ pub struct LiveScopeState {
     pub serial_ports: Vec<String>,
     session: Option<LiveSession>,
     recording: Option<AsyncScopeRecorder>,
+    start_after_configure: bool,
 }
 
 impl Default for LiveScopeState {
@@ -54,12 +55,12 @@ impl Default for LiveScopeState {
             hello_ack: None,
             channel_table: None,
             acquisition: Configure {
-                sample_rate_hz: 10_000,
-                batch_samples: 100,
+                sample_rate_hz: 500,
+                batch_samples: 10,
                 channel_mask: u64::MAX,
             },
             configuration_applied: false,
-            history_seconds: 10,
+            history_seconds: 1,
             buffer: None,
             trigger: TriggerEngine::new(TriggerConfig::default())
                 .expect("default trigger configuration is valid"),
@@ -76,6 +77,7 @@ impl Default for LiveScopeState {
             serial_ports: Vec::new(),
             session: None,
             recording: None,
+            start_after_configure: false,
         }
     }
 }
@@ -91,6 +93,7 @@ impl LiveScopeState {
         self.buffer = None;
         self.configuration_applied = false;
         self.stats = SessionStats::default();
+        self.start_after_configure = false;
         self.workspace_mode = WorkspaceMode::Live;
         self.connection_state = ConnectionState::Connecting;
         self.session = Some(LiveSession::connect(self.transport.clone()).map_err(error_string)?);
@@ -105,6 +108,7 @@ impl LiveScopeState {
             session.disconnect().map_err(error_string)?;
         }
         self.connection_state = ConnectionState::Disconnected;
+        self.start_after_configure = false;
         Ok(())
     }
 
@@ -136,6 +140,21 @@ impl LiveScopeState {
             .ok_or_else(|| "live session is not connected".to_owned())?
             .start()
             .map_err(error_string)
+    }
+
+    pub fn start_with_configuration(&mut self, configure: Configure) -> Result<(), String> {
+        if self.connection_state != ConnectionState::Ready {
+            return Err("live acquisition is not ready to start".to_owned());
+        }
+        if self.configuration_applied {
+            return self.start();
+        }
+        self.start_after_configure = true;
+        if let Err(error) = self.configure(configure) {
+            self.start_after_configure = false;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn stop(&self) -> Result<(), String> {
@@ -344,6 +363,10 @@ impl LiveScopeState {
         match event {
             SessionEvent::State(state) => {
                 self.connection_state = state;
+                if state == ConnectionState::Disconnected {
+                    self.start_after_configure = false;
+                    self.session.take();
+                }
                 if state == ConnectionState::Disconnected && self.recording.is_some() {
                     self.last_recording_stats = self.recording_stats();
                     self.recording.take();
@@ -382,9 +405,17 @@ impl LiveScopeState {
                 self.acquisition = configure;
                 self.configuration_applied = true;
                 self.rebuild_buffer()?;
+                if std::mem::take(&mut self.start_after_configure) {
+                    self.session
+                        .as_ref()
+                        .ok_or_else(|| "live session is not connected".to_owned())?
+                        .start()
+                        .map_err(error_string)?;
+                }
             }
             SessionEvent::CommandResult(result) => {
                 if result.result_code != ResultCode::Ok {
+                    self.start_after_configure = false;
                     return Err(format!(
                         "device command {} failed: {}",
                         result.request_sequence, result.detail
@@ -629,6 +660,38 @@ mod tests {
     }
 
     #[test]
+    fn start_with_configuration_applies_settings_and_streams_in_one_action() {
+        let simulator = SimulatorHandle::spawn(SimulatorConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            ..SimulatorConfig::default()
+        })
+        .unwrap();
+        let mut state = LiveScopeState::default();
+        state.transport = TransportConfig::Tcp {
+            address: simulator.address().to_string(),
+        };
+        state.connect().unwrap();
+        wait_until(&mut state, |state| {
+            state.connection_state == ConnectionState::Ready
+        });
+
+        state
+            .start_with_configuration(Configure {
+                sample_rate_hz: 10_000,
+                batch_samples: 10,
+                channel_mask: 0b1111,
+            })
+            .unwrap();
+        wait_until(&mut state, |state| {
+            state.connection_state == ConnectionState::Streaming
+        });
+
+        assert!(state.configuration_applied);
+        assert_eq!(state.acquisition.batch_samples, 10);
+        state.disconnect().unwrap();
+    }
+
+    #[test]
     fn recording_bypasses_a_backpressured_display_queue() {
         let simulator = SimulatorHandle::spawn(SimulatorConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
@@ -723,6 +786,7 @@ mod tests {
         wait_until(&mut state, |state| {
             state.connection_state == ConnectionState::Disconnected
         });
+        assert!(state.session.is_none());
         assert!(!state.is_recording());
         assert!(state
             .last_error

@@ -81,7 +81,7 @@ struct CaptureBuilder {
 pub struct TriggerEngine {
     config: TriggerConfig,
     armed: bool,
-    previous_source: Option<f32>,
+    edge_latch: Option<TriggerEdge>,
     pre_history: VecDeque<SamplePoint>,
     active_capture: Option<CaptureBuilder>,
     samples_since_arm: usize,
@@ -93,7 +93,7 @@ impl TriggerEngine {
         Ok(Self {
             config,
             armed: true,
-            previous_source: None,
+            edge_latch: None,
             pre_history: VecDeque::new(),
             active_capture: None,
             samples_since_arm: 0,
@@ -221,17 +221,14 @@ impl TriggerEngine {
 
         let source = point.values[source_position];
         if !source.is_finite() {
-            self.previous_source = None;
+            self.edge_latch = None;
             self.push_pre_history(point);
             return Ok(None);
         }
         self.samples_since_arm = self.samples_since_arm.saturating_add(1);
-        let edge_hit = self
-            .previous_source
-            .is_some_and(|previous| self.crossed(previous, source));
+        let edge_hit = self.detect_edge(source);
         let auto_timeout = self.config.mode == TriggerMode::Auto
             && self.samples_since_arm >= self.config.auto_timeout_samples;
-        self.previous_source = Some(source);
         if edge_hit || auto_timeout {
             let mut points = self.pre_history.drain(..).collect::<Vec<_>>();
             let trigger_position = points.len();
@@ -252,16 +249,46 @@ impl TriggerEngine {
         Ok(None)
     }
 
-    fn crossed(&self, previous: f32, current: f32) -> bool {
+    fn detect_edge(&mut self, current: f32) -> bool {
         let half_hysteresis = self.config.hysteresis * 0.5;
         let low = self.config.level - half_hysteresis;
         let high = self.config.level + half_hysteresis;
-        let rising = previous <= low && current >= high;
-        let falling = previous >= high && current <= low;
         match self.config.edge {
-            TriggerEdge::Rising => rising,
-            TriggerEdge::Falling => falling,
-            TriggerEdge::Either => rising || falling,
+            TriggerEdge::Rising => {
+                if current <= low {
+                    self.edge_latch = Some(TriggerEdge::Rising);
+                    false
+                } else if current >= high && self.edge_latch == Some(TriggerEdge::Rising) {
+                    self.edge_latch = None;
+                    true
+                } else {
+                    false
+                }
+            }
+            TriggerEdge::Falling => {
+                if current >= high {
+                    self.edge_latch = Some(TriggerEdge::Falling);
+                    false
+                } else if current <= low && self.edge_latch == Some(TriggerEdge::Falling) {
+                    self.edge_latch = None;
+                    true
+                } else {
+                    false
+                }
+            }
+            TriggerEdge::Either => {
+                if current <= low {
+                    let hit = self.edge_latch == Some(TriggerEdge::Falling);
+                    self.edge_latch = Some(TriggerEdge::Rising);
+                    hit
+                } else if current >= high {
+                    let hit = self.edge_latch == Some(TriggerEdge::Rising);
+                    self.edge_latch = Some(TriggerEdge::Falling);
+                    hit
+                } else {
+                    false
+                }
+            }
         }
     }
 
@@ -305,7 +332,7 @@ impl TriggerEngine {
     }
 
     fn reset_history(&mut self) {
-        self.previous_source = None;
+        self.edge_latch = None;
         self.pre_history.clear();
         self.active_capture = None;
         self.samples_since_arm = 0;
@@ -380,6 +407,26 @@ mod tests {
         assert_eq!(capture.channels[0], vec![-1.0, -0.2, 0.2, 1.0]);
         assert!(!capture.auto_timeout);
         assert!(!trigger.is_armed());
+    }
+
+    #[test]
+    fn gradual_rising_signal_crosses_a_nonzero_hysteresis_band() {
+        let mut trigger = TriggerEngine::new(TriggerConfig {
+            mode: TriggerMode::Single,
+            pre_samples: 4,
+            post_samples: 0,
+            ..config(TriggerMode::Single)
+        })
+        .unwrap();
+
+        let capture = trigger
+            .feed(&batch(0, &[-1.0, -0.05, 0.0, 0.05, 0.2]))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(capture.sample_indices, vec![0, 1, 2, 3, 4]);
+        assert_eq!(capture.trigger_position, 4);
+        assert!(!capture.auto_timeout);
     }
 
     #[test]
