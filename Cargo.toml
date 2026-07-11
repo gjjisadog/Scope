@@ -1,6 +1,6 @@
 [package]
 name = "scope_analyzer"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2021"
 description = "Windows offline oscilloscope-style waveform analyzer"
 license = "Proprietary"
@@ -8,6 +8,7 @@ license = "Proprietary"
 [dependencies]
 ab_glyph = "0.2"
 csv = "1.4"
+crossbeam-channel = "0.5"
 eframe = { version = "0.27", default-features = false, features = ["default_fonts", "glow", "wgpu"] }
 egui_plot = "0.27"
 encoding_rs = "0.8"
@@ -15,6 +16,7 @@ rfd = "0.14"
 rustfft = "6.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serialport = { version = "4", default-features = false }
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

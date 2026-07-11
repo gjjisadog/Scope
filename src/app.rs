@@ -38,6 +38,7 @@ use crate::{
 
 mod export;
 mod jobs;
+mod live_ui;
 mod plot;
 mod state;
 
@@ -1861,6 +1862,7 @@ enum SourceKind {
     Cloud,
     Dat,
     Local,
+    Scope,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2180,6 +2182,10 @@ impl ThemeMode {
 }
 
 impl ScopeApp {
+    fn default_live_state() -> scope_analyzer::live::state::LiveScopeState {
+        scope_analyzer::live::state::LiveScopeState::default()
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         Self::install_panic_hook();
         Self::install_cjk_fonts(&cc.egui_ctx);
@@ -2190,6 +2196,7 @@ impl ScopeApp {
         let recent_shortcut_configs = Self::load_recent_configs(ConfigSection::Shortcut);
         let recent_dataset_configs = Self::load_recent_configs(ConfigSection::Dataset);
         Self {
+            live: Self::default_live_state(),
             source: None,
             source_kind: None,
             imported_datasets: Vec::new(),
@@ -3388,9 +3395,12 @@ impl ScopeApp {
     }
 
     fn recent_file_label(path: &Path) -> String {
-        path.file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string())
+        let display = path.to_string_lossy();
+        display
+            .rsplit(['/', '\\'])
+            .find(|part| !part.is_empty())
+            .unwrap_or(&display)
+            .to_owned()
     }
 
     #[allow(dead_code)]
@@ -3692,8 +3702,15 @@ impl ScopeApp {
                 }
                 Err(error) => Err(error),
             },
+            "scope" => scope_analyzer::live::scope_source::ScopeRecordingDataSource::open(path)
+                .map(|source| OpenedDataset {
+                    source: Arc::new(source),
+                    path: path.to_owned(),
+                    kind: SourceKind::Scope,
+                })
+                .map_err(|error| error.to_string()),
             other => Err(format!(
-                "Unsupported waveform file extension `{}`. Supported formats: .csv, .dat",
+                "Unsupported waveform file extension `{}`. Supported formats: .csv, .dat, .scope",
                 if other.is_empty() { "(none)" } else { other }
             )),
         }
@@ -16930,6 +16947,12 @@ impl ScopeApp {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.spacing_mut().button_padding.x = 6.0;
         ui.horizontal_wrapped(|ui| {
+            self.workspace_selector(ui);
+            ui.separator();
+            if self.live.workspace_mode == scope_analyzer::live::state::WorkspaceMode::Live {
+                self.live_toolbar(ui);
+                return;
+            }
             ui.menu_button(
                 Self::icon_label("\u{E8E5}", self.t(UiText::ImportData)),
                 |ui| {
@@ -16949,7 +16972,7 @@ impl ScopeApp {
                     {
                         let filter_name = self.t(UiText::WaveformCsv);
                         if let Some(paths) = rfd::FileDialog::new()
-                            .add_filter(filter_name, &["csv", "dat"])
+                            .add_filter(filter_name, &["csv", "dat", "scope"])
                             .pick_files()
                         {
                             self.import_data_files(paths);
@@ -20457,18 +20480,28 @@ impl ScopeApp {
     }
 
     fn update_inner(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.live.poll();
         self.poll_import_worker();
-        if self.any_background_job_running() {
-            ctx.request_repaint();
+        if self.any_background_job_running()
+            || self.live.connection_state
+                != scope_analyzer::live::session::ConnectionState::Disconnected
+        {
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
         self.sync_channel_state_lengths();
         self.apply_theme(ctx);
-        self.handle_shortcuts(ctx);
+        if self.live.workspace_mode == scope_analyzer::live::state::WorkspaceMode::Offline {
+            self.handle_shortcuts(ctx);
+        }
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| self.top_bar(ui));
         self.error_banner(ctx);
         self.help_window(ctx);
         self.options_window(ctx);
+        if self.live.workspace_mode == scope_analyzer::live::state::WorkspaceMode::Live {
+            self.live_workspace(ctx);
+            return;
+        }
         self.export_preview_window(ctx);
         self.batch_export_window(ctx);
 
@@ -20547,6 +20580,74 @@ impl eframe::App for ScopeApp {
 mod tests {
     use super::*;
     use std::{fs::File, io::Write};
+
+    #[test]
+    fn scope_app_live_state_defaults_to_offline_workspace() {
+        let live = ScopeApp::default_live_state();
+
+        assert_eq!(
+            live.workspace_mode,
+            scope_analyzer::live::state::WorkspaceMode::Offline
+        );
+    }
+
+    #[test]
+    fn opens_scope_recording_through_the_application_dispatch_path() {
+        use scope_analyzer::live::{
+            protocol::{
+                ChannelDescriptor, ChannelKind, ChannelTable, Frame, Message, SampleBatch,
+                WireFormat, MSG_SAMPLE_BATCH,
+            },
+            recording::{RecordingMetadata, ScopeWriter},
+        };
+
+        let dir = unique_test_dir("scope_dispatch");
+        let path = dir.join("capture.scope");
+        let metadata = RecordingMetadata {
+            device_id: "app-test".to_owned(),
+            firmware_name: "test".to_owned(),
+            tick_hz: 1_000,
+            channel_table: ChannelTable {
+                revision: 1,
+                channels: vec![ChannelDescriptor {
+                    channel_id: 0,
+                    kind: ChannelKind::Analog,
+                    wire_format: WireFormat::I16,
+                    scale: 0.5,
+                    offset: 1.0,
+                    unit: "V".to_owned(),
+                    name: "DSP-A".to_owned(),
+                }],
+            },
+            sample_rate_hz: 10,
+            batch_samples: 2,
+            channel_mask: 1,
+            client_version: "app-test".to_owned(),
+        };
+        let payload = Message::SampleBatch(SampleBatch {
+            channel_table_revision: 1,
+            first_sample_index: 0,
+            sample_period_ticks: 100,
+            sample_count: 2,
+            channel_ids: vec![0],
+            sample_data: [2_i16.to_le_bytes(), 4_i16.to_le_bytes()].concat(),
+        })
+        .encode_payload()
+        .unwrap();
+        let frame = Frame::new(MSG_SAMPLE_BATCH, 0, 1, 7, 0, payload);
+        let mut writer = ScopeWriter::create(&path, metadata).unwrap();
+        writer.write_sample_frame(&frame).unwrap();
+        writer.finish().unwrap();
+
+        let opened = ScopeApp::open_waveform_file_with_cancel(&path, 48_000.0, None).unwrap();
+
+        assert_eq!(opened.kind, SourceKind::Scope);
+        assert_eq!(opened.source.metadata().source_name, "capture.scope");
+        assert_eq!(opened.source.metadata().channels[0].name, "DSP-A");
+        let block = opened.source.read_range(0.0, 0.1, &[0], 10).unwrap();
+        assert_eq!(block.channels[0], vec![2.0, 3.0]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn opens_indexed_adata_ddata_pair_without_sequence_column_and_merges_first_three_bits() {
@@ -21173,7 +21274,10 @@ mod tests {
         assert!(!ScopeApp::should_draw_export_variable_labels(false, true));
         assert!(!ScopeApp::should_draw_export_variable_labels(true, false));
         assert!(ScopeApp::should_draw_export_variable_labels(true, true));
-        assert_eq!(ScopeApp::export_cursor_table_height(2, 3), 153);
+        let one_curve = ScopeApp::export_cursor_table_height(1, 3);
+        let two_curves = ScopeApp::export_cursor_table_height(2, 3);
+        assert_eq!(two_curves - one_curve, Canvas::text_height(3) + 9);
+        assert!(two_curves > one_curve);
     }
 
     #[test]
