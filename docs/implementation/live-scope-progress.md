@@ -4,7 +4,7 @@
 
 ## 当前里程碑
 
-里程碑 10：V1 完成性审计、全量发布门禁与分支交付。
+里程碑 11：真机反馈修复——跨平台中文字体、带回差触发、录波/回放交互和异常重连。
 
 ## 已完成内容
 
@@ -68,6 +68,16 @@
 - 模拟器 `--accelerated` 已改为不做定时 sleep 的加速时钟，只通过 `yield_now` 让出线程；按墙钟演示仍使用默认实时模式。
 - 补齐 `.scope` 防御性与集成验证：超限元数据在分配前拒绝、内外 CRC 正确但 SAMPLE_BATCH 内容非法仍拒绝、回放保持调用方请求的通道顺序，桌面应用扩展名分派实际返回独立 `ScopeRecordingDataSource`。
 - SCP1 增量解析器新增超大 payload 候选后的重同步验证，非法候选不会阻塞其后的有效帧。
+- 真实 `LAUNCHXL-F28P65X` + XDS110 Application/User UART 已完成 SCP1 串口实测；验收配置为 115200 baud、四通道、500 Hz、每批 10 点。
+- 已定位三秒失联的根因是 DSP 发送路径内递归解析 RX 导致 C28x 卡在编码栈；独立 TI Demo 固件已改为 TX 期间只暂存 RX、主循环统一解析。
+- 0.8.1 修复客户端触发回差算法：边沿状态会跨多个渐进样点保持施密特锁存，不再要求相邻样点一次跨过整个回差带。
+- 链路序号统计改为检查所有设备帧的全局 sequence；合法插入的 PING/PONG/STATUS 不再被误报为样本缺口。
+- 异常断线后会释放已结束的 `LiveSession`，用户可直接重新连接，不再出现 Disconnected 状态下仍提示 already connected。
+- 实时默认采集参数调整为真机安全的 500 Hz / 每批 10 点；切换串口默认 115200 baud。
+- “应用并开始”会在需要时自动 CONFIGURE 并等待设备确认后 START；录波只在 Streaming 时启用，防止空录波。
+- 结束录波后新增“回放刚才录波”，可直接通过 `ScopeRecordingDataSource` 进入离线工作区。
+- CJK 字体搜索扩展到 Windows、macOS 和常见 Linux 字体位置，并支持 `SCOPE_CJK_FONT` 显式覆盖；CJK 字体作为 fallback 保留默认拉丁字体。
+- 版本已同步升级到 0.8.1，覆盖 Cargo、Cargo.lock、PowerShell、WiX、README 和版本同步测试。
 
 ## 测试结果
 
@@ -135,25 +145,33 @@
 - 最终 `cargo +1.87.0 test --quiet`：library 77/77、桌面客户端 112/112（另 5 个显式 ignored）、DSP 模拟器 1/1、doc tests 0，全部普通测试通过。
 - 最终 `cargo +1.87.0 test --quiet -- --ignored`：5/5 性能/LibreOffice 兼容性测试通过。
 - 最终 `cargo +1.87.0 build --release --bin scope_analyzer --bin scope_dsp_simulator`：通过，0.8.0 客户端和模拟器 release 二进制均生成成功。
+- 0.8.1 全量普通测试：library 80/80、桌面客户端 115/115（另 5 个 ignored）、DSP 模拟器 1/1、doc tests 0，全部通过。
+- 新增渐进信号跨非零回差带触发测试，修复前无法命中，修复后通过。
+- 新增 CONFIGURE+START 单动作测试、异常断线 session 释放测试，以及控制帧/采样帧交织时 sequence gaps 为 0 的回归测试，全部通过。
+- macOS 实际加载 `/System/Library/Fonts/Supplemental/Arial Unicode.ttf`，egui 字体系统确认包含“中文实时触发录波回放”全部字形。
+- 0.8.1 真机客户端验收：300 个批次、3000 在线样本、CRC 0、协议错误 0、sequence gaps 0、主机/设备丢样 0、TX overrun 0。
+- 0.8.1 真机使用 0.2 工程值非零回差完成 23 次真实 Normal 上升沿触发；录波包含 301 个 SampleFrame、3010 个连续样本、23 个 Trigger、0 个 Gap，并以干净 SessionEnd 结束。
+- 0.8.1 真机 `.scope` 通过独立 DataSource 回放四通道，读取 1506 个抽取点；硬件验收结论为 `SCOPE HARDWARE CLIENT ACCEPTANCE: PASS`。
+- 0.8.1 `cargo clippy --all-targets -- -D warnings`：通过；`cargo test -- --ignored`：5/5 通过；release 客户端与模拟器构建通过。
 
 ## 未验证内容
 
-- 尚未验证 DSP 实物串口通信。
-- 尚未验证 Windows 串口枚举、连接、断线恢复与安装包运行。
+- 尚未在 Windows 实机验证 0.8.1 串口枚举、系统字体选择与安装包运行。
 - 尚未运行 Windows `scripts/release-check.ps1` 和离线安装包构建。
-- 未完成人工点击桌面 UI 的运行验证。已在忽略的 `target/ScopeAnalyzerDev.app` 创建开发包装并实际启动；当前 macOS 在进入 egui 前由既有 `icrate 0.0.4` 对 `NSScreen` 的 Objective-C 返回类型编码检查触发 non-unwinding abort，glow/wgpu 路径均相同。该平台问题与实时模块无关，但不能据此宣称窗口交互已验证。
+- 本轮桌面控制通道无法初始化，因此未保存 0.8.1 UI 截图；中文字体已通过实际字体解析和 egui glyph 测试验证，实时功能已通过同一客户端状态机的真机验收。
 
 ## 后续任务
 
-1. 在具备目标 DSP 板卡和固件后执行串口板级互操作、吞吐、断线和长时间录波测试。
-2. 在 Windows 构建机运行 `scripts/release-check.ps1`、离线 MSI/ZIP 打包及安装后串口枚举验证。
-3. 修复或升级现有 macOS 原生窗口依赖后补做人工 UI 点击验收；此项不能由自动化测试替代。
+1. 在 Windows 构建机运行 `scripts/release-check.ps1`、离线 MSI/ZIP 打包及安装后串口/字体验证。
+2. 发布前补拍中文实时界面、触发命中、录波统计和回放工作区截图。
+3. 产品接入时用真实 ADC/变量采集替换 TI Demo 的确定性信号生成器，保留已验收 SCP1 传输层。
 
 ## 硬件实测状态
 
-未进行硬件实测。当前没有 DSP 板卡型号、物理接口、串口参数或既有帧格式资料，不能把模拟器验证描述为硬件验证。
+已实测。硬件为 `LAUNCHXL-F28P65X`（TMS320F28P650DK9）与板载 XDS110，串口为 `/dev/cu.usbmodemCL6500011`、115200 8N1。CPU1 RAM 镜像完成握手、配置、持续采样、双向心跳、非零回差触发、录波、停止和回放；CPU2、Flash 和 RAMGS 所有权未操作。最终 DSP 镜像 SHA-256 为 `01964ef65c3077cae3a8ff7235691bd62c4ebfb68a484831d3aa097906569c1f`。
 
 ## 已知限制
 
 - Rust 1.97.0 会因更严格的浮点类型推断在现有 `src/app.rs` 中编译失败；Rust 1.87.0 能执行基线测试。
-- 当前已完成无硬件依赖的客户端—模拟器闭环和 egui 实时工作区；真实 DSP 串口硬件实测尚未完成。
+- TI Demo 当前生成确定性合成通道，尚未接入产品 ADC 或固件变量。
+- 当前真机镜像为 CPU1 RAM 运行，断电或复位后需要重新加载。

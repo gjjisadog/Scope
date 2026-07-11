@@ -2240,6 +2240,12 @@ impl ScopeApp {
             show_options: false,
             show_channel_panel: true,
             show_analysis_panel: true,
+            live_show_signal_panel: true,
+            live_show_inspector_panel: true,
+            live_show_bottom_panel: true,
+            live_inspector_tab: 0,
+            live_bottom_tab: 0,
+            live_channel_filter: String::new(),
             show_export_preview: false,
             show_batch_export: false,
             export_preview_dirty: false,
@@ -2641,7 +2647,7 @@ impl ScopeApp {
                     .families
                     .entry(family)
                     .or_default()
-                    .insert(0, font_name.clone());
+                    .push(font_name.clone());
             }
         }
 
@@ -2649,25 +2655,50 @@ impl ScopeApp {
     }
 
     fn load_cjk_font() -> Option<(String, Vec<u8>)> {
+        Self::cjk_font_candidates().into_iter().find_map(|path| {
+            fs::read(&path).ok().map(|font_data| {
+                let file_name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "custom".to_owned());
+                (format!("scope-cjk-{file_name}"), font_data)
+            })
+        })
+    }
+
+    fn cjk_font_candidates() -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+        if let Some(path) = env::var_os("SCOPE_CJK_FONT") {
+            candidates.push(PathBuf::from(path));
+        }
+
         let windows_dir = env::var_os("WINDIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
         let fonts_dir = windows_dir.join("Fonts");
-        let candidates = [
-            "Deng.ttf",
-            "simhei.ttf",
-            "simsunb.ttf",
-            "NotoSansSC-VF.ttf",
-            "msyh.ttc",
-            "simsun.ttc",
-        ];
+        candidates.extend(
+            [
+                "Deng.ttf",
+                "simhei.ttf",
+                "simsunb.ttf",
+                "NotoSansSC-VF.ttf",
+                "msyh.ttc",
+                "simsun.ttc",
+            ]
+            .into_iter()
+            .map(|file_name| fonts_dir.join(file_name)),
+        );
 
-        candidates.iter().find_map(|file_name| {
-            let path = fonts_dir.join(file_name);
-            fs::read(path)
-                .ok()
-                .map(|font_data| (format!("scope-cjk-{file_name}"), font_data))
-        })
+        candidates.extend([
+            PathBuf::from("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+            PathBuf::from("/Library/Fonts/Arial Unicode.ttf"),
+            PathBuf::from("/System/Library/Fonts/STHeiti Medium.ttc"),
+            PathBuf::from("/System/Library/Fonts/STHeiti Light.ttc"),
+            PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+            PathBuf::from("/usr/share/fonts/truetype/noto/NotoSansSC-Regular.otf"),
+            PathBuf::from("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"),
+        ]);
+        candidates
     }
 
     fn meta(&self) -> Option<&DatasetMeta> {
@@ -7746,7 +7777,7 @@ impl ScopeApp {
         color: Color32,
         with_head: bool,
     ) {
-        let width = if style == ExportArrowLineStyle::Thick {
+        let width: f32 = if style == ExportArrowLineStyle::Thick {
             3.0
         } else {
             1.8
@@ -21130,6 +21161,40 @@ mod tests {
     #[test]
     fn default_language_is_chinese() {
         assert_eq!(default_language(), Language::Zh);
+    }
+
+    #[test]
+    fn cjk_font_search_includes_cross_platform_fallbacks() {
+        let candidates = ScopeApp::cjk_font_candidates();
+
+        assert!(candidates
+            .iter()
+            .any(|path| path.ends_with("NotoSansCJK-Regular.ttc")));
+        assert!(candidates
+            .iter()
+            .any(|path| path.ends_with("Arial Unicode.ttf")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_installation_has_a_loadable_cjk_font() {
+        let (name, bytes) = ScopeApp::load_cjk_font().expect("macOS CJK font fallback");
+
+        assert!(name.starts_with("scope-cjk-"));
+        assert!(bytes.len() > 1_000_000);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn installed_macos_font_renders_live_scope_chinese_labels() {
+        let ctx = egui::Context::default();
+        ScopeApp::install_cjk_fonts(&ctx);
+        ctx.begin_frame(egui::RawInput::default());
+
+        ctx.fonts(|fonts| {
+            assert!(fonts.has_glyphs(&egui::FontId::proportional(14.0), "中文实时触发录波回放"));
+        });
+        let _ = ctx.end_frame();
     }
 
     #[test]
