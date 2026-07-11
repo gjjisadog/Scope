@@ -2240,6 +2240,12 @@ impl ScopeApp {
             show_options: false,
             show_channel_panel: true,
             show_analysis_panel: true,
+            live_show_signal_panel: true,
+            live_show_inspector_panel: true,
+            live_show_bottom_panel: true,
+            live_inspector_tab: 0,
+            live_bottom_tab: 0,
+            live_channel_filter: String::new(),
             show_export_preview: false,
             show_batch_export: false,
             export_preview_dirty: false,
@@ -7771,7 +7777,7 @@ impl ScopeApp {
         color: Color32,
         with_head: bool,
     ) {
-        let width = if style == ExportArrowLineStyle::Thick {
+        let width: f32 = if style == ExportArrowLineStyle::Thick {
             3.0
         } else {
             1.8

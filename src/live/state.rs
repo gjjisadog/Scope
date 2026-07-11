@@ -60,7 +60,7 @@ impl Default for LiveScopeState {
                 channel_mask: u64::MAX,
             },
             configuration_applied: false,
-            history_seconds: 10,
+            history_seconds: 1,
             buffer: None,
             trigger: TriggerEngine::new(TriggerConfig::default())
                 .expect("default trigger configuration is valid"),

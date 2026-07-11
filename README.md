@@ -11,6 +11,8 @@ Configuration import/export is intentionally split so one file type cannot overw
 
 Windows 离线波形分析工具。界面按软件示波器方式组织，支持多 CSV 数据组叠加、通道勾选与分栏显示、双光标测量、选区 FFT/THD、三相正负序分析、变量名导入导出、浅色/深色主题和中英文界面。
 
+0.9.0 将实时界面重构为可停靠工程工作区：紧凑采集工具栏、分组信号树、共享时间轴分轨波形、触发/显示/诊断检查器，以及事件/链路底部面板；默认显示最近 1 秒历史数据，兼顾细节与趋势。采集、触发、录波和离线回放协议保持兼容。
+
 0.8.1 修复实时界面的跨平台中文字体、带回差触发、串口默认值、异常重连，以及录波完成后的直接回放流程。
 
 0.8.0 新增 DSP 实时软件示波器：TCP/串口 SCP1 采集、软件触发、有界实时缓冲、`.scope` 录波与离线回放，以及可独立运行的确定性 DSP 模拟器。原有离线分析、FFT、导出、配置和打包流程保持不变。
@@ -203,8 +205,8 @@ experiments.
 
 产物在：
 
-- `dist/ScopeAnalyzer-0.8.1-win-x64.zip`
-- `dist/ScopeAnalyzer-0.8.1-win-x64.msi`
+- `dist/ScopeAnalyzer-0.9.0-win-x64.zip`
+- `dist/ScopeAnalyzer-0.9.0-win-x64.msi`
 
 ## 启动渲染器和云桌面兜底
 
