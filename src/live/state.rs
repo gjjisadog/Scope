@@ -1,10 +1,15 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
+
+use crate::plot_viewport::PlotViewport;
+use crate::presentation::ChannelPresentation;
 
 use super::{
     buffer::{LiveBuffer, LiveSnapshot, SnapshotSegment},
+    capture_history::{CaptureHistory, CapturePayload},
     protocol::{validate_configure_for_device, ChannelTable, Configure, HelloAck, ResultCode},
     recording::{AsyncScopeRecorder, RecordingMetadata, RecordingStats},
     session::{ConnectionState, LiveSession, SessionEvent, SessionStats},
@@ -31,13 +36,14 @@ pub struct LiveScopeState {
     pub buffer: Option<LiveBuffer>,
     pub trigger: TriggerEngine,
     pub last_capture: Option<TriggerCapture>,
+    pub capture_history: CaptureHistory,
+    pub keep_capture_selection: bool,
     pub stats: SessionStats,
     pub last_error: Option<String>,
     pub recording_path: Option<PathBuf>,
     pub last_recording_stats: RecordingStats,
-    pub channel_visibility: BTreeMap<u16, bool>,
-    pub channel_colors: BTreeMap<u16, [u8; 4]>,
-    pub channel_scales: BTreeMap<u16, f32>,
+    pub channel_presentations: BTreeMap<u16, ChannelPresentation>,
+    pub plot_viewport: PlotViewport,
     pub display_paused: bool,
     pub frozen_snapshot: Option<LiveSnapshot>,
     pub serial_ports: Vec<String>,
@@ -65,13 +71,14 @@ impl Default for LiveScopeState {
             trigger: TriggerEngine::new(TriggerConfig::default())
                 .expect("default trigger configuration is valid"),
             last_capture: None,
+            capture_history: CaptureHistory::default(),
+            keep_capture_selection: false,
             stats: SessionStats::default(),
             last_error: None,
             recording_path: None,
             last_recording_stats: RecordingStats::default(),
-            channel_visibility: BTreeMap::new(),
-            channel_colors: BTreeMap::new(),
-            channel_scales: BTreeMap::new(),
+            channel_presentations: BTreeMap::new(),
+            plot_viewport: PlotViewport::default(),
             display_paused: false,
             frozen_snapshot: None,
             serial_ports: Vec::new(),
@@ -192,6 +199,7 @@ impl LiveScopeState {
             batch_samples: self.acquisition.batch_samples,
             channel_mask: self.acquisition.channel_mask,
             client_version: env!("CARGO_PKG_VERSION").to_owned(),
+            channel_presentations: self.channel_presentations.clone(),
         };
         let recorder = AsyncScopeRecorder::create(path, metadata).map_err(error_string)?;
         let ingress = recorder.ingress().map_err(error_string)?;
@@ -247,6 +255,18 @@ impl LiveScopeState {
             .map(|buffer| buffer.snapshot(max_points))
     }
 
+    pub fn measurement_snapshot(&self, max_samples: usize) -> Option<LiveSnapshot> {
+        if let Some(capture) = self.selected_trigger_capture() {
+            return self.trigger_capture_snapshot(capture, max_samples);
+        }
+        if self.display_paused {
+            return self.frozen_snapshot.clone();
+        }
+        self.buffer
+            .as_ref()
+            .map(|buffer| buffer.snapshot_recent(max_samples))
+    }
+
     pub fn set_display_paused(&mut self, paused: bool) {
         if paused && !self.display_paused {
             self.frozen_snapshot = self.current_unpaused_snapshot(8_000);
@@ -264,8 +284,35 @@ impl LiveScopeState {
         }
     }
 
+    /// Returns an immutable, full-resolution analysis input. A completed
+    /// trigger capture takes precedence; otherwise the currently frozen view
+    /// or the full retained ring buffer is used.
+    pub fn analysis_snapshot(&self) -> Option<LiveSnapshot> {
+        if let Some(capture) = self.selected_trigger_capture() {
+            return self.trigger_capture_snapshot(capture, usize::MAX);
+        }
+        if self.display_paused {
+            return self.frozen_snapshot.clone();
+        }
+        self.snapshot(usize::MAX)
+    }
+
+    pub fn has_analysis_snapshot(&self) -> bool {
+        self.selected_trigger_capture().is_some()
+            || (self.display_paused && self.frozen_snapshot.is_some())
+            || self
+                .buffer
+                .as_ref()
+                .is_some_and(|buffer| !buffer.is_empty())
+    }
+
     pub fn scaled_display_value(&self, channel_id: u16, value: f32) -> f32 {
-        value * self.channel_scales.get(&channel_id).copied().unwrap_or(1.0)
+        value
+            * self
+                .channel_presentations
+                .get(&channel_id)
+                .map(|presentation| presentation.scale)
+                .unwrap_or(1.0)
     }
 
     pub fn arm_trigger(&mut self) {
@@ -281,11 +328,21 @@ impl LiveScopeState {
 
     fn current_unpaused_snapshot(&self, max_points: usize) -> Option<LiveSnapshot> {
         if self.trigger.config().mode != TriggerMode::Auto {
-            if let Some(capture) = &self.last_capture {
+            if let Some(capture) = self.selected_trigger_capture() {
                 return self.trigger_capture_snapshot(capture, max_points);
             }
         }
         self.snapshot(max_points)
+    }
+
+    pub fn selected_trigger_capture(&self) -> Option<&TriggerCapture> {
+        self.capture_history
+            .selected()
+            .and_then(|entry| match &entry.payload {
+                CapturePayload::InMemory(capture) => Some(capture.as_ref()),
+                CapturePayload::RecordingRange { .. } => None,
+            })
+            .or(self.last_capture.as_ref())
     }
 
     fn trigger_capture_snapshot(
@@ -390,13 +447,14 @@ impl LiveScopeState {
                         retained_mask
                     };
                 for channel in &table.channels {
-                    self.channel_visibility
+                    self.channel_presentations
                         .entry(channel.channel_id)
-                        .or_insert(true);
-                    self.channel_colors
-                        .entry(channel.channel_id)
-                        .or_insert_with(|| default_channel_color(channel.channel_id));
-                    self.channel_scales.entry(channel.channel_id).or_insert(1.0);
+                        .or_insert_with(|| {
+                            ChannelPresentation::new(
+                                channel.name.clone(),
+                                default_channel_color(channel.channel_id),
+                            )
+                        });
                 }
                 self.channel_table = Some(table);
                 self.configuration_applied = false;
@@ -423,7 +481,7 @@ impl LiveScopeState {
                 }
             }
             SessionEvent::Batch(batch) => {
-                if let Some(capture) = self.trigger.feed(&batch).map_err(error_string)? {
+                for capture in self.trigger.feed_all(&batch).map_err(error_string)? {
                     if let Some(writer) = &mut self.recording {
                         if let Err(error) =
                             writer.try_write_trigger(capture.clone(), self.trigger.config().clone())
@@ -431,6 +489,19 @@ impl LiveScopeState {
                             self.recording.take();
                             return Err(error_string(error));
                         }
+                    }
+                    let created_unix_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64;
+                    if let Err(error) = self.capture_history.insert_live(
+                        capture.clone(),
+                        self.trigger.config().clone(),
+                        created_unix_ms,
+                        !self.keep_capture_selection,
+                    ) {
+                        self.last_error = Some(error.to_string());
                     }
                     self.last_capture = Some(capture);
                 }
@@ -540,11 +611,12 @@ mod tests {
 
     use super::*;
     use crate::{
-        data::DataSource,
+        data::{DataSource, SampleBlock},
         live::{
             scope_source::ScopeRecordingDataSource,
             simulator::{SimulatorConfig, SimulatorHandle},
         },
+        measurements::{analyze_segments, ChannelMeasurementSpec},
     };
 
     fn wait_until(state: &mut LiveScopeState, predicate: impl Fn(&LiveScopeState) -> bool) {
@@ -631,6 +703,123 @@ mod tests {
     }
 
     #[test]
+    fn simulator_stream_measure_trigger_history_and_recording_replay_end_to_end() {
+        let simulator = SimulatorHandle::spawn(SimulatorConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            accelerated: false,
+            drop_every: Some(10),
+            ..SimulatorConfig::default()
+        })
+        .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "scope_live_measure_trigger_e2e_{}_{}.scope",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut state = LiveScopeState::default();
+        state.transport = TransportConfig::Tcp {
+            address: simulator.address().to_string(),
+        };
+        state
+            .set_trigger_config(TriggerConfig {
+                mode: TriggerMode::Auto,
+                source_channel: 0,
+                pre_samples: 10,
+                post_samples: 10,
+                auto_timeout_samples: 40,
+                ..TriggerConfig::default()
+            })
+            .unwrap();
+        state.connect().unwrap();
+        wait_until(&mut state, |state| {
+            state.connection_state == ConnectionState::Ready
+        });
+        state
+            .configure(Configure {
+                sample_rate_hz: 10_000,
+                batch_samples: 100,
+                channel_mask: 0b1111,
+            })
+            .unwrap();
+        wait_until(&mut state, |state| state.configuration_applied);
+        state.start_recording(&path).unwrap();
+        state.start().unwrap();
+        wait_until(&mut state, |state| {
+            state.capture_history.entries().len() >= 3
+                && state
+                    .buffer
+                    .as_ref()
+                    .is_some_and(|buffer| buffer.len() >= 1_000)
+        });
+
+        let snapshot = state.snapshot(20_000).unwrap();
+        let channel_zero = snapshot
+            .channel_ids
+            .iter()
+            .position(|channel_id| *channel_id == 0)
+            .unwrap();
+        let segments = snapshot
+            .segments
+            .into_iter()
+            .map(|segment| SampleBlock {
+                times: segment.times,
+                channels: segment.channels,
+            })
+            .collect::<Vec<_>>();
+        let measurement = analyze_segments(
+            &segments,
+            &[ChannelMeasurementSpec {
+                channel_index: 0,
+                column: channel_zero,
+                name: "Va".to_owned(),
+                unit: "V".to_owned(),
+                scale: 1.0,
+            }],
+            None,
+        )
+        .unwrap();
+        let frequency = measurement.channels[0].frequency.as_ref().unwrap().hz;
+        assert!((frequency - 50.0).abs() < 0.5, "measured {frequency} Hz");
+        assert!(measurement.channels[0].rms.is_some_and(|value| value > 0.5));
+        assert!(state.capture_history.entries().len() >= 3);
+
+        state.stop().unwrap();
+        wait_until(&mut state, |state| {
+            state.connection_state == ConnectionState::Ready
+        });
+        state.stop_recording().unwrap();
+        state.disconnect().unwrap();
+
+        let recording = crate::live::recording::ScopeRecording::open(&path).unwrap();
+        assert!(recording.clean_end());
+        assert!(recording.triggers().len() >= 3);
+        assert!(!recording.gaps().is_empty());
+        assert!(!recording.sample_records().is_empty());
+        let source = ScopeRecordingDataSource::open(&path).unwrap();
+        let replay = source
+            .read_range_segments(
+                source.metadata().start_time,
+                source.metadata().end_time,
+                &[0],
+                20_000,
+            )
+            .unwrap();
+        assert!(replay.len() > 1);
+        let replay_measurement =
+            analyze_segments(&replay, &[ChannelMeasurementSpec::new(0, 0, "Va")], None).unwrap();
+        let replay_frequency = replay_measurement.channels[0]
+            .frequency
+            .as_ref()
+            .unwrap()
+            .hz;
+        assert!((replay_frequency - 50.0).abs() < 0.5);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn configuration_rejects_channels_not_advertised_by_the_device() {
         let simulator = SimulatorHandle::spawn(SimulatorConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
@@ -646,7 +835,13 @@ mod tests {
             state.connection_state == ConnectionState::Ready
         });
         assert_eq!(state.acquisition.channel_mask, 0b1111);
-        assert_eq!(state.channel_scales.get(&0), Some(&1.0));
+        assert_eq!(
+            state
+                .channel_presentations
+                .get(&0)
+                .map(|presentation| presentation.scale),
+            Some(1.0)
+        );
 
         let result = state.configure(Configure {
             sample_rate_hz: 10_000,
@@ -829,7 +1024,16 @@ mod tests {
             trigger_position: 1,
             auto_timeout: false,
         });
-        state.channel_scales.insert(0, 2.0);
+        state.channel_presentations.insert(
+            0,
+            ChannelPresentation {
+                display_name: "CH0".to_owned(),
+                color: default_channel_color(0),
+                visible: true,
+                scale: 2.0,
+                pane: 0,
+            },
+        );
 
         let snapshot = state.display_snapshot(100).unwrap();
 

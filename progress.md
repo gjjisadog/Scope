@@ -1,5 +1,30 @@
 # Progress Log
 
+## Session: 2026-07-11 — Shared Live/Offline Analysis
+
+### Phase 1: Architecture Audit
+- **Status:** complete
+- Loaded `planning-with-files` and `gitnexus-refactoring` workflows.
+- Confirmed unrelated pre-existing dirty files and recorded the preservation boundary.
+- Established the full six-phase implementation and verification plan.
+- Began mapping `DataSource`, `display_snapshot`, analysis workers, channel state, plot state, and export entrypoints.
+- GitNexus impact audit classified `DataSource` as medium risk and `LiveSnapshot` as critical risk; chose additive snapshot conversion rather than mutating either contract.
+- Added `SnapshotDataSource`, full-resolution `analysis_snapshot`, and the first user-visible `Analyze capture` bridge into the existing offline source initialization path.
+- `cargo fmt --all` completed; the chained targeted test command then reproduced the repository's known idle-Cargo condition (Cargo process with no compiler/test child) and was interrupted after two minutes.
+- Added shared `ChannelPresentation` and migrated Live visibility/color/scale/name/pane handling plus snapshot-to-offline presentation transfer.
+- Migrated the offline `ScopeApp` cursor, X/Y range, active pane, and per-pane Y bounds into shared `PlotViewport`; first compile found two localized migration misses and they were corrected.
+- Added shared segmented range reads and migrated mainline plotting plus annotation/export rendering so Snapshot and recording gaps remain disconnected.
+- Added recording presentation metadata with legacy serde compatibility and replay restoration through `DataSource`.
+- Added an end-to-end trigger Capture test covering shared presentation/panes, cursor-range measurement, FFT/THD, sequence analysis, and export preview.
+- Final verification: formatting and `git diff --check` passed; standard Clippy passed with only pre-existing/vendor warnings.
+- Full normal tests passed: library 86/86, main application 118 passed with 5 ignored, simulator 1/1, and doc tests 0/0.
+- All four relevant ignored performance baselines passed: Cloud, CSV+FFT, DAT+FFT, and PNG canvas export.
+- Optimized release builds for `scope_analyzer` and `scope_dsp_simulator` passed with Rust 1.87.
+- GitNexus change detection completed. The shared `DataSource` trait has 10 direct implementations and medium impact; additive default methods preserve existing implementers, confirmed by all-target compilation and the full suite.
+- The Windows PowerShell release preflight could not run on this macOS host; its portable constituent gates and synchronized-version test all passed.
+- **Final result:** all shared Live/offline analysis requirements are implemented and verified.
+
+
 ## Session: 2026-07-11
 
 ### Phase 1: Requirements & Repository Discovery

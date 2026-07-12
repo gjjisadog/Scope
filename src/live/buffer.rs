@@ -257,6 +257,36 @@ impl LiveBuffer {
         }
     }
 
+    /// Returns the newest samples at full resolution while preserving gaps.
+    pub fn snapshot_recent(&self, max_samples: usize) -> LiveSnapshot {
+        if self.is_empty() || max_samples == 0 {
+            return LiveSnapshot {
+                channel_ids: self.channel_ids.clone(),
+                segments: Vec::new(),
+            };
+        }
+        let start = self.len().saturating_sub(max_samples);
+        let mut ranges = Vec::new();
+        let mut range_start = start;
+        for index in start.saturating_add(1)..self.len() {
+            if self.sample_indices[index] != self.sample_indices[index - 1].saturating_add(1) {
+                ranges.push(range_start..index);
+                range_start = index;
+            }
+        }
+        ranges.push(range_start..self.len());
+        LiveSnapshot {
+            channel_ids: self.channel_ids.clone(),
+            segments: ranges
+                .into_iter()
+                .map(|range| {
+                    let count = range.len();
+                    self.snapshot_range(range, count)
+                })
+                .collect(),
+        }
+    }
+
     fn evict_excess(&mut self) {
         while self.len() > self.capacity {
             self.sample_indices.pop_front();
@@ -454,6 +484,27 @@ mod tests {
                 .map(|segment| segment.times.len())
                 .sum::<usize>()
                 <= 4
+        );
+    }
+
+    #[test]
+    fn recent_snapshot_keeps_exact_tail_and_gap_boundaries() {
+        let mut buffer = LiveBuffer::new(vec![0], 20, 1_000_000).unwrap();
+        buffer
+            .push_batch(batch(0, 0, &[0.0, 1.0, 2.0, 3.0, 4.0]))
+            .unwrap();
+        buffer.push_gap(5, 5, GapReason::SampleIndexLoss);
+        buffer
+            .push_batch(batch(10, 100, &[5.0, 6.0, 7.0, 8.0, 9.0]))
+            .unwrap();
+
+        let snapshot = buffer.snapshot_recent(7);
+
+        assert_eq!(snapshot.segments.len(), 2);
+        assert_eq!(snapshot.segments[0].channels[0], vec![3.0, 4.0]);
+        assert_eq!(
+            snapshot.segments[1].channels[0],
+            vec![5.0, 6.0, 7.0, 8.0, 9.0]
         );
     }
 }

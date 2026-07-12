@@ -10,6 +10,7 @@ mod renamed_source;
 mod text_encoding;
 
 pub use crate::live::scope_source::ScopeRecordingDataSource;
+pub use crate::live::snapshot_source::SnapshotDataSource;
 pub use bitfield_source::BitfieldDigitalDataSource;
 pub use channel_names::VARIABLE_NAMES;
 pub use cloud_source::CloudCsvDataSource;

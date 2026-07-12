@@ -8,6 +8,8 @@ use std::{
 
 use thiserror::Error;
 
+use crate::presentation::ChannelPresentation;
+
 pub type DataResult<T> = Result<T, DataError>;
 
 #[derive(Debug, Error)]
@@ -267,6 +269,10 @@ pub trait DataSource: Send + Sync {
 
     fn metadata(&self) -> &DatasetMeta;
 
+    fn channel_presentation(&self, _channel_index: usize) -> Option<ChannelPresentation> {
+        None
+    }
+
     fn read_range(
         &self,
         start_time: f64,
@@ -274,6 +280,39 @@ pub trait DataSource: Send + Sync {
         channels: &[usize],
         max_points: usize,
     ) -> DataResult<SampleBlock>;
+
+    /// Reads a range without bridging discontinuities. File sources that do
+    /// not expose gaps use the default single-block representation.
+    fn read_range_segments(
+        &self,
+        start_time: f64,
+        end_time: f64,
+        channels: &[usize],
+        max_points: usize,
+    ) -> DataResult<Vec<SampleBlock>> {
+        self.read_range(start_time, end_time, channels, max_points)
+            .map(|block| {
+                if block.times.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![block]
+                }
+            })
+    }
+
+    fn read_range_segments_cancellable(
+        &self,
+        start_time: f64,
+        end_time: f64,
+        channels: &[usize],
+        max_points: usize,
+        cancel: &DataCancelToken,
+    ) -> DataResult<Vec<SampleBlock>> {
+        cancel.check()?;
+        let blocks = self.read_range_segments(start_time, end_time, channels, max_points)?;
+        cancel.check()?;
+        Ok(blocks)
+    }
 
     fn read_range_cancellable(
         &self,

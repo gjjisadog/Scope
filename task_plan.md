@@ -1,73 +1,72 @@
-# Task Plan: Live Scope Dockable Engineering Studio
+# Task Plan: Live Scope Shared Analysis Architecture
 
 ## Goal
-Implement the selected Product Design option 2 in the existing Rust/egui application without changing live acquisition semantics, then verify behavior and visual fidelity against the selected mockup.
+Enable an immutable Live Capture to enter the existing offline analysis workflow, then share channel presentation, plot interaction, annotation, and export behavior between Live and replay without destabilizing acquisition.
 
 ## Current Phase
-Complete
+Complete — implementation and verification audit passed
+
+## Requirements
+- [x] Add `SnapshotDataSource` for a frozen Live snapshot/capture.
+- [x] Provide a user-visible “freeze current Capture → offline analysis” workflow.
+- [x] Reuse cursor measurements, FFT/THD, and sequence analysis for triggered Captures.
+- [x] Extract shared `ChannelPresentation` for names, colors, scales, and pane assignment.
+- [x] Extract shared `PlotViewport` for cursors, zoom, pan, gap handling, and multi-pane behavior.
+- [x] Reuse mainline annotation and export workflows from frozen Live data.
+- [x] Preserve SCP1 acquisition, trigger, recording, and replay semantics.
+- [x] Add targeted regression tests and pass formatting, clippy, normal tests, and relevant ignored baselines.
+- [x] Keep version metadata synchronized because this adds user-facing workflow and configuration behavior.
 
 ## Phases
 
-### Phase 1: Requirements & Repository Discovery
-- [x] Resolve selected visual target
-- [x] Load repository governance and Product Design build/QA rules
-- [x] Map current Live UI state, event data, and layout integration points
+### Phase 1: Architecture Audit
+- [x] Map callers and impact of `DataSource`, Live snapshots, channel state, plot state, and export entrypoints.
+- [x] Define immutable snapshot conversion and shared state ownership.
 - **Status:** complete
 
-### Phase 2: UI Architecture & Version Plan
-- [x] Define egui layout/state changes
-- [x] Decide feasible fidelity adaptations for a native immediate-mode UI
-- [x] Plan synchronized version bump
+### Phase 2: Snapshot Analysis Bridge
+- [x] Implement `SnapshotDataSource` with metadata, range reads, decimation, summaries, and validation.
+- [x] Convert frozen/triggered Live snapshots without requiring a temporary file.
+- [x] Load the snapshot as the primary offline dataset and initialize cursors/view/channel state.
 - **Status:** complete
 
-### Phase 3: Implementation
-- [x] Implement dockable-style Live workspace, tabs, toolbar, signal tree, inspector, and event/link dock
-- [x] Add working collapse/tab/layout interactions
-- [x] Synchronize version 0.9.0 across packaging files and README
-- [x] Add/update tests for durable UI state and helpers
+### Phase 3: Shared Analysis
+- [x] Add Live actions for analyzing current/frozen Capture.
+- [x] Verify cursor measurement, FFT/THD, and sequence analysis against known signals.
 - **Status:** complete
 
-### Phase 4: Verification & Design QA
-- [x] Run formatting, clippy, and tests
-- [x] Launch simulator and native app in the target Live state
-- [x] Capture implementation at the available 1370x768 native desktop viewport
-- [x] Compare source and implementation together; fix P0/P1/P2 findings
-- [x] Save passing design-qa.md
+### Phase 4: Shared Presentation and Viewport
+- [x] Extract `ChannelPresentation` and migrate offline + Live callers.
+- [x] Extract `PlotViewport` and migrate shared cursor/zoom/pan/gap/multi-pane state.
 - **Status:** complete
 
-### Phase 5: Delivery
-- [x] Review diff and working tree
-- [x] Confirm planning records and QA evidence
-- [x] Hand off changed files, verification, and remaining P3 polish
+### Phase 5: Annotation and Export
+- [x] Route frozen Capture through existing image/data/DOCX annotation and export paths.
+- [x] Verify export preview initialization uses the shared source, labels, scales, panes, cursors, and gap-separated prepared series.
 - **Status:** complete
 
-## Key Questions
-1. Which parts of the selected dockable studio can be implemented with egui 0.27 without destabilizing streaming?
-2. How can the selected connected/streaming state be reproduced deterministically for screenshot QA?
-3. Which UI states should persist as display settings versus remain session-only?
+### Phase 6: Verification and Delivery
+- [x] Run GitNexus change detection/impact review.
+- [x] Run fmt, clippy, normal tests, relevant ignored performance tests, and release version sync checks.
+- [x] Audit every requirement against source/test/runtime evidence.
+- **Status:** complete
 
-## Decisions Made
+## Decisions
 | Decision | Rationale |
 |----------|-----------|
-| Treat displayed ideation image 2 as source truth | User selected option 2 unambiguously from the most recent three-image set |
-| Implement in the existing native app rather than a separate web prototype | The requested product is the current Rust/egui Live Scope and the user asked to design that interface |
-| Bump to 0.9.0 | Default layout and user-facing workflow materially change, triggering AGENTS.md version rules |
-| Preserve acquisition/session modules | The task is UI redesign; protocol, buffering, triggering, and recording semantics are out of scope |
+| Analyze immutable snapshots, never a mutating ring buffer | Keeps one analysis request internally consistent and avoids coupling analysis workers to acquisition timing |
+| Reuse the existing `DataSource`-based offline pipeline | Avoids duplicate FFT, measurements, sequence, export, and caching implementations |
+| Preserve `LiveScopeState` as the acquisition boundary | Shared UI/data abstractions must not flatten protocol/session state into `ScopeApp` |
+| Preserve unrelated dirty files (`AGENTS.md`, `CLAUDE.md`, `.claude/skills`) | They predate this task and belong to the user |
 
 ## Errors Encountered
 | Error | Attempt | Resolution |
 |-------|---------|------------|
-| In-app browser tabs detached during visual reference capture | 1-2 | Used authoritative project documentation and downloaded the referenced open-source screenshots directly for ideation grounding |
-| `cargo` was not available on the non-login shell PATH | 1 | Use the installed toolchain at `$HOME/.cargo/bin/cargo` explicitly |
-| Rust 1.97 rejected an existing ambiguous float inference in export preview code | 1 | Add the explicit `f32` type already implied by egui painter APIs |
-| First Live UI compile found six mutable/immutable self-borrow conflicts | 1 | Resolve translated labels before borrowing individual UI state fields mutably |
-| `cargo test --quiet` remained idle with no child test process for over six minutes | 1 | Interrupt the stalled runner, verify targeted tests first, then rerun the suite with visible output to identify any specific blocker |
-| Full test suite found the release-sync unit test still expected 0.8.1 | 1 | Update the test's authoritative version constant to 0.9.0 and rerun the suite |
-| Rust 1.97 build aborted during macOS window creation in `icrate` NSScreen ABI code | 1 | Reuse the repository's preloaded Rust 1.87 toolchain that produced the known-good native release binary |
-| First Rust 1.87 rebuild hit a transient stale NFS handle reading Cargo.toml | 1 | Confirm the file remains readable and retry the same deterministic build once |
-| Rust 1.87 debug build still enabled the Objective-C selector type check and aborted | 1 | Build the optimized release profile, matching the existing working native binary; native QA then launched successfully |
-| Raw native executable was not discoverable by the Computer Use accessibility service | 1 | Wrap the QA binary in a temporary macOS `.app` bundle with a unique bundle identifier |
-
-## Notes
-- Source visual: `/Users/wangxuwen/.codex/generated_images/019f501a-582a-7bc1-b4b2-9b6f331ad399/exec-a19468fc-eb91-4270-a355-8168e628089b.png`
-- Do not modify live protocol/data behavior unless required to expose existing state to the redesigned UI.
+| `cargo test` remained idle for two minutes with no `rustc` or test child | 1 | Interrupted the stale Cargo runner; retry with a fresh process and visible output after confirming no compiler child exists |
+| First post-worktree `cargo check` found binary/library import boundary and one multiline viewport reference missed by mechanical migration | 1 | Import shared viewport through `scope_analyzer` and fix the remaining nested field access |
+| Live viewport bounds used private `PlotBounds` fields | 1 | Use the public `min()`/`max()` accessors exposed by the vendored egui_plot API |
+| Tried to pass multiple positional test filters to `cargo test` | 1 | Cargo accepts one filter; use the complete library test target, then a separate binary integration-test filter |
+| Integration test initially assumed `ScopeApp: Default` | 1 | Extract deterministic `from_recent_state` initialization and add a test-only constructor without filesystem recent-state reads |
+| Strict clippy rejected a direct floating-span comparison | 1 | Compare the absolute span against epsilon, preserving the viewport invariant and satisfying the strict lint |
+| Repository-wide `clippy -D warnings` exposes 30+ pre-existing strict lints in the large app/export modules | 1 | Fix all new lints from this change, then use the repository's standard `clippy --all-targets` gate; retain strict-output evidence as baseline debt rather than widening this refactor |
+| Windows release preflight requires PowerShell, which is unavailable on the current macOS host | 1 | Run its constituent portable gates locally: synchronized-version unit test, fmt, standard clippy, full tests, ignored performance baselines, and both release binaries; leave Windows packaging itself for a Windows release host |

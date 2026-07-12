@@ -17,7 +17,7 @@ pub(super) struct PlotCacheKey {
 }
 
 pub(super) enum PlotJobData {
-    Samples(SampleBlock),
+    SegmentedSamples(Vec<SampleBlock>),
     Summary(RangeSummary),
 }
 
@@ -25,6 +25,8 @@ pub(super) enum PlotJobData {
 pub(super) struct PreparedPlotSeries {
     pub(super) points: Vec<Arc<[PlotPoint]>>,
     pub(super) lightweight_points: Vec<Arc<[PlotPoint]>>,
+    pub(super) segmented_points: Vec<Vec<Arc<[PlotPoint]>>>,
+    pub(super) segmented_lightweight_points: Vec<Vec<Arc<[PlotPoint]>>>,
     pub(super) envelope_low_points: Vec<Arc<[PlotPoint]>>,
     pub(super) envelope_low_lightweight_points: Vec<Arc<[PlotPoint]>>,
     pub(super) bounds: Vec<Option<(f64, f64)>>,
@@ -46,9 +48,28 @@ impl PreparedPlotSeries {
                 .collect()
         }
 
+        fn clone_segmented_selected(
+            source: &[Vec<Arc<[PlotPoint]>>],
+            out_indices: &[usize],
+        ) -> Vec<Vec<Arc<[PlotPoint]>>> {
+            out_indices
+                .iter()
+                .filter_map(|index| {
+                    source
+                        .get(*index)
+                        .map(|segments| segments.iter().map(Arc::clone).collect::<Vec<_>>())
+                })
+                .collect()
+        }
+
         Self {
             points: clone_selected(&self.points, out_indices),
             lightweight_points: clone_selected(&self.lightweight_points, out_indices),
+            segmented_points: clone_segmented_selected(&self.segmented_points, out_indices),
+            segmented_lightweight_points: clone_segmented_selected(
+                &self.segmented_lightweight_points,
+                out_indices,
+            ),
             envelope_low_points: clone_selected(&self.envelope_low_points, out_indices),
             envelope_low_lightweight_points: clone_selected(
                 &self.envelope_low_lightweight_points,
@@ -81,6 +102,16 @@ mod tests {
         let series = PreparedPlotSeries {
             points: vec![Arc::clone(&p0), Arc::clone(&p1), Arc::clone(&p2)],
             lightweight_points: vec![Arc::clone(&p0), Arc::clone(&p1), Arc::clone(&p2)],
+            segmented_points: vec![
+                vec![Arc::clone(&p0)],
+                vec![Arc::clone(&p1)],
+                vec![Arc::clone(&p2)],
+            ],
+            segmented_lightweight_points: vec![
+                vec![Arc::clone(&p0)],
+                vec![Arc::clone(&p1)],
+                vec![Arc::clone(&p2)],
+            ],
             envelope_low_points: vec![Arc::clone(&low0), Arc::clone(&low1), Arc::clone(&low2)],
             envelope_low_lightweight_points: vec![
                 Arc::clone(&low0),
@@ -95,6 +126,7 @@ mod tests {
         assert_eq!(subset.points.len(), 2);
         assert!(Arc::ptr_eq(&subset.points[0], &p2));
         assert!(Arc::ptr_eq(&subset.points[1], &p0));
+        assert!(Arc::ptr_eq(&subset.segmented_points[0][0], &p2));
         assert!(Arc::ptr_eq(&subset.envelope_low_points[0], &low2));
         assert!(Arc::ptr_eq(&subset.envelope_low_points[1], &low0));
         assert_eq!(subset.bounds, vec![Some((20.0, 21.0)), Some((0.0, 1.0))]);

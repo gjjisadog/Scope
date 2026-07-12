@@ -1,11 +1,15 @@
 pub mod data;
 pub mod live;
+pub mod measurements;
+pub mod plot_viewport;
+pub mod presentation;
+pub mod project;
 
 #[cfg(test)]
 mod release_tests {
     #[test]
     fn live_scope_release_version_is_synchronized() {
-        const VERSION: &str = "0.9.0";
+        const VERSION: &str = "0.11.0";
         let cargo_toml = include_str!("../Cargo.toml");
         let package_script = include_str!("../scripts/package-windows.ps1");
         let wix = include_str!("../scripts/ScopeAnalyzer.wxs");

@@ -11,6 +11,12 @@ Configuration import/export is intentionally split so one file type cannot overw
 
 Windows 离线波形分析工具。界面按软件示波器方式组织，支持多 CSV 数据组叠加、通道勾选与分栏显示、双光标测量、选区 FFT/THD、三相正负序分析、变量名导入导出、浅色/深色主题和中英文界面。
 
+0.11.0 补齐工程调试闭环：离线、冻结 Capture 和实时窗口统一提供平均值、真 RMS、正/负/绝对峰值、峰峰值与实际频率，并支持三相 P/Q₁/S/PF；Live 增加有界触发事件历史、固定与选择导航，`.scope` 回放可按触发事件跳转；采集设置提供 SCP1 帧大小、链路利用率、批次延迟和安全批次建议；新的 `.scopeproj` 工程文件可恢复数据组、布局、光标、通道外观、分析绑定、Live 预设、Capture 资产和导出标注，恢复时不会自动连接设备。SCP1 V1 与 `.scope` V1 格式保持兼容。
+
+0.10.0 新增实时捕获一键冻结分析：触发 Capture 或当前实时历史可直接进入离线工作区，复用光标测量、FFT/THD、序分量、标注与导出，无需先写入临时录波。在线与回放共享通道名称、颜色、倍率和窗格配置；波形视口共享光标、缩放、平移和多窗格状态，gap 在实时、离线绘图及导出中均保持断线。
+
+0.11.0 详细说明：[工程文件](docs/scopeproj-v1.md)、[工程测量](docs/engineering-measurements.md)、[Capture 历史](docs/capture-history.md)、[采集带宽](docs/acquisition-bandwidth.md)。
+
 0.9.0 将实时界面重构为可停靠工程工作区：紧凑采集工具栏、分组信号树、共享时间轴分轨波形、触发/显示/诊断检查器，以及事件/链路底部面板；默认显示最近 1 秒历史数据，兼顾细节与趋势。采集、触发、录波和离线回放协议保持兼容。
 
 0.8.1 修复实时界面的跨平台中文字体、带回差触发、串口默认值、异常重连，以及录波完成后的直接回放流程。
@@ -205,8 +211,8 @@ experiments.
 
 产物在：
 
-- `dist/ScopeAnalyzer-0.9.0-win-x64.zip`
-- `dist/ScopeAnalyzer-0.9.0-win-x64.msi`
+- `dist/ScopeAnalyzer-0.11.0-win-x64.zip`
+- `dist/ScopeAnalyzer-0.11.0-win-x64.msi`
 
 ## 启动渲染器和云桌面兜底
 

@@ -133,8 +133,15 @@ impl TriggerEngine {
         &mut self,
         batch: &DecodedSampleBatch,
     ) -> Result<Option<TriggerCapture>, TriggerError> {
+        Ok(self.feed_all(batch)?.into_iter().next())
+    }
+
+    pub fn feed_all(
+        &mut self,
+        batch: &DecodedSampleBatch,
+    ) -> Result<Vec<TriggerCapture>, TriggerError> {
         if !self.armed {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let source_position = batch
             .channel_ids
@@ -179,7 +186,7 @@ impl TriggerEngine {
             )
             .ok_or_else(|| TriggerError::InvalidBatch("timestamp overflow".to_owned()))?;
 
-        let mut first_capture = None;
+        let mut captures = Vec::new();
         for sample_offset in 0..sample_count {
             let offset = u64::try_from(sample_offset)
                 .map_err(|_| TriggerError::InvalidBatch("sample offset overflow".to_owned()))?;
@@ -193,15 +200,13 @@ impl TriggerEngine {
                     .collect(),
             };
             if let Some(capture) = self.push_point(point, source_position, &batch.channel_ids)? {
-                if first_capture.is_none() {
-                    first_capture = Some(capture);
-                }
+                captures.push(capture);
                 if !self.armed {
                     break;
                 }
             }
         }
-        Ok(first_capture)
+        Ok(captures)
     }
 
     fn push_point(
@@ -407,6 +412,25 @@ mod tests {
         assert_eq!(capture.channels[0], vec![-1.0, -0.2, 0.2, 1.0]);
         assert!(!capture.auto_timeout);
         assert!(!trigger.is_armed());
+    }
+
+    #[test]
+    fn feed_all_returns_every_normal_capture_completed_in_one_batch() {
+        let mut trigger = TriggerEngine::new(TriggerConfig {
+            mode: TriggerMode::Normal,
+            pre_samples: 0,
+            post_samples: 0,
+            ..config(TriggerMode::Normal)
+        })
+        .unwrap();
+
+        let captures = trigger
+            .feed_all(&batch(0, &[-1.0, 1.0, -1.0, 1.0]))
+            .unwrap();
+
+        assert_eq!(captures.len(), 2);
+        assert_eq!(captures[0].sample_indices, vec![1]);
+        assert_eq!(captures[1].sample_indices, vec![3]);
     }
 
     #[test]

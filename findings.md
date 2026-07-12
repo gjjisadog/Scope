@@ -1,5 +1,47 @@
 # Findings & Decisions
 
+## Active Objective: Shared Live/Offline Analysis (2026-07-11)
+
+### Authoritative State
+- Current worktree: `/Users/wangxuwen/Documents/Scope-live-scope-shared-analysis` on branch `codex/live-scope-shared-analysis`.
+- Pre-existing unrelated dirty files are `AGENTS.md`, `CLAUDE.md`, and `.claude/skills/`; preserve them.
+- `DataSource` is the common offline contract and is already implemented by `ScopeRecordingDataSource`.
+- `LiveScopeState::display_snapshot` returns either the frozen snapshot or a newly generated immutable snapshot.
+- Live plotting currently bypasses the main offline plot/cache/analysis pipeline and renders directly in `src/app/live_ui.rs`.
+- The main analysis workers and export/annotation paths are concentrated in the large `src/app.rs`; extraction must proceed interface-first.
+
+### Initial Architecture Direction
+- Add an in-memory `SnapshotDataSource` backed by immutable `SampleBlock`/metadata.
+- Convert Live timestamps to a stable local range while retaining sample rate and gap boundaries needed by plotting/export.
+- Enter the existing offline dataset initialization path rather than duplicating analysis panels.
+- Introduce shared presentation/view state incrementally so acquisition semantics remain isolated.
+
+### GitNexus Impact Audit
+- `DataSource` has 10 direct implementers and medium change risk. The segmented-read and presentation hooks are additive default methods, so legacy implementations retain source compatibility; all-target compilation and full tests confirm this.
+- `LiveSnapshot` is critical-risk because it participates in buffer, trigger, state, and Live UI flows. Prefer a conversion layer over changing its existing fields/semantics.
+- Existing Live snapshots already preserve gap-separated `segments`; snapshot conversion must not silently draw across gaps.
+- Shared plot/export state is presently rooted in `ScopeApp`, while Live plotting reads `LiveSnapshot` directly. The first safe convergence point is the offline primary-source initialization path.
+
+### Shared Presentation
+- Added a serializable `ChannelPresentation` value object containing display name, RGBA color, visibility, scale, and pane.
+- Live state now uses one `BTreeMap<u16, ChannelPresentation>` instead of three independently mutable maps, eliminating drift between online display properties.
+- Snapshot-to-offline transition applies the same presentation values to the replay/analysis dataset.
+- `.scope` metadata now stores `ChannelPresentation` with a serde default for backward compatibility; replay restores presentation through the common `DataSource::channel_presentation` hook.
+
+### Shared Viewport, Gap, and Export
+- Offline cursor/X/Y/pane state now lives in shared `PlotViewport`; Live linked plots mirror X bounds and cursor clicks into the same type, then transfer it when opening a Capture for analysis.
+- `DataSource::read_range_segments` preserves discontinuities. Snapshot and `.scope` sources return gap-separated blocks, while legacy sources retain the default one-block behavior.
+- Mainline prepared plot series, cursor interpolation, annotation anchors, canvas/SVG line rendering, and label collision sampling consume segments without connecting across gaps.
+- The trigger-Capture integration test proves the frozen source reaches mainline measurement, FFT/THD, sequence analysis, pane/presentation initialization, and export-preview entry.
+
+### Final Verification Audit
+- `cargo fmt --all -- --check` and `git diff --check` passed.
+- `cargo clippy --all-targets --quiet` passed; remaining warnings are pre-existing application/vendor lint debt.
+- Normal tests passed: 86 library, 118 main-application, and 1 simulator test; 5 explicitly ignored tests remain in the application target.
+- The four release-relevant ignored performance baselines passed, including large source reads, FFT, plot loading, and PNG export.
+- Both optimized release binaries built successfully.
+- The synchronized 0.10.0 release-version test passed. PowerShell/WiX packaging execution remains Windows-host-only because PowerShell is unavailable on the current macOS machine.
+
 ## Requirements
 - Rebuild Live Scope around selected option 2: a dockable professional engineering workspace.
 - Keep live waveform viewing central while making channels, trigger/display/diagnostics, events, and link state easier to access.
