@@ -1,0 +1,1117 @@
+use std::{
+    collections::HashSet,
+    fs,
+    io::Write,
+    path::{Component, Path, PathBuf},
+};
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+pub const PROJECT_TYPE: &str = "scope-analyzer-project";
+pub const PROJECT_SCHEMA_VERSION: u32 = 1;
+pub const MAX_PROJECT_JSON_BYTES: usize = 10 * 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProjectSourceResolution {
+    Resolved(PathBuf),
+    Missing,
+    MetadataMismatch(PathBuf),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedProjectSource {
+    pub source_id: SourceId,
+    pub resolution: ProjectSourceResolution,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProjectId(pub String);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SourceId(pub String);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DatasetId(pub String);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CaptureId(pub String);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProjectSourceKind {
+    Csv,
+    Dat,
+    Scope,
+    CaptureAsset,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectFileRef {
+    pub relative_path: String,
+    #[serde(default)]
+    pub absolute_hint: String,
+    #[serde(default)]
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub modified_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub partial_crc32c: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectSource {
+    pub id: SourceId,
+    pub kind: ProjectSourceKind,
+    pub file: ProjectFileRef,
+    #[serde(default)]
+    pub required: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectChannelRef {
+    pub source_id: SourceId,
+    pub raw_name: String,
+    pub index_hint: usize,
+    #[serde(default)]
+    pub channel_id_hint: Option<u16>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectChannelState {
+    pub channel: ProjectChannelRef,
+    #[serde(default)]
+    pub display_name: String,
+    pub color: [u8; 4],
+    #[serde(default)]
+    pub visible: bool,
+    #[serde(default = "default_scale")]
+    pub scale: f32,
+    #[serde(default)]
+    pub pane: usize,
+    #[serde(default = "default_line_width")]
+    pub line_width: f32,
+    #[serde(default)]
+    pub line_pattern: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProjectDatasetRole {
+    Primary,
+    Imported,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectDataset {
+    pub id: DatasetId,
+    pub source_id: SourceId,
+    pub role: ProjectDatasetRole,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub line_pattern: String,
+    #[serde(default)]
+    pub time_offset: f64,
+    #[serde(default)]
+    pub channels: Vec<ProjectChannelState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectViewport {
+    pub initialized: bool,
+    pub view_start: f64,
+    pub view_end: f64,
+    pub y_min: f64,
+    pub y_max: f64,
+    #[serde(default)]
+    pub pane_y_bounds: Vec<[f64; 2]>,
+    #[serde(default)]
+    pub active_pane: usize,
+    pub cursor_a: f64,
+    pub cursor_b: f64,
+    #[serde(default)]
+    pub show_cursor_a: bool,
+    #[serde(default)]
+    pub show_cursor_b: bool,
+    #[serde(default)]
+    pub active_cursor: Option<String>,
+}
+
+impl Default for ProjectViewport {
+    fn default() -> Self {
+        Self {
+            initialized: false,
+            view_start: 0.0,
+            view_end: 1.0,
+            y_min: -1.0,
+            y_max: 1.0,
+            pane_y_bounds: Vec::new(),
+            active_pane: 0,
+            cursor_a: 0.25,
+            cursor_b: 0.75,
+            show_cursor_a: true,
+            show_cursor_b: true,
+            active_cursor: Some("a".to_owned()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectWorkspace {
+    #[serde(default = "default_layout_axis")]
+    pub layout_rows: usize,
+    #[serde(default = "default_layout_axis")]
+    pub layout_cols: usize,
+    #[serde(default)]
+    pub viewport: ProjectViewport,
+    #[serde(default = "default_true")]
+    pub show_channel_panel: bool,
+    #[serde(default = "default_true")]
+    pub show_analysis_panel: bool,
+    #[serde(default)]
+    pub selected_dataset_id: Option<DatasetId>,
+}
+
+impl Default for ProjectWorkspace {
+    fn default() -> Self {
+        Self {
+            layout_rows: default_layout_axis(),
+            layout_cols: default_layout_axis(),
+            viewport: ProjectViewport::default(),
+            show_channel_panel: true,
+            show_analysis_panel: true,
+            selected_dataset_id: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectPowerBindings {
+    pub voltage: [ProjectChannelRef; 3],
+    pub current: [ProjectChannelRef; 3],
+    #[serde(default = "default_scales")]
+    pub voltage_scales: [f64; 3],
+    #[serde(default = "default_scales")]
+    pub current_scales: [f64; 3],
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectDerivedCurve {
+    pub name: String,
+    pub script: String,
+    #[serde(default = "default_scale")]
+    pub gain: f32,
+    #[serde(default)]
+    pub offset: f32,
+    #[serde(default)]
+    pub visible: bool,
+    #[serde(default)]
+    pub pane: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectAnalysis {
+    #[serde(default = "default_harmonic_base")]
+    pub harmonic_base_hz: f64,
+    #[serde(default = "default_measurement_cycles")]
+    pub live_measurement_cycles: f64,
+    #[serde(default)]
+    pub fft_channel: Option<ProjectChannelRef>,
+    #[serde(default)]
+    pub sequence_channels: Vec<ProjectChannelRef>,
+    #[serde(default)]
+    pub pll_channels: Vec<ProjectChannelRef>,
+    #[serde(default)]
+    pub dq_channels: Vec<ProjectChannelRef>,
+    #[serde(default)]
+    pub power: Option<ProjectPowerBindings>,
+    #[serde(default)]
+    pub derived_curves: Vec<ProjectDerivedCurve>,
+}
+
+impl Default for ProjectAnalysis {
+    fn default() -> Self {
+        Self {
+            harmonic_base_hz: default_harmonic_base(),
+            live_measurement_cycles: default_measurement_cycles(),
+            fft_channel: None,
+            sequence_channels: Vec::new(),
+            pll_channels: Vec::new(),
+            dq_channels: Vec::new(),
+            power: None,
+            derived_curves: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ProjectTransport {
+    Tcp { address: String },
+    Serial { port: String, baud: u32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProjectTriggerMode {
+    Auto,
+    Normal,
+    Single,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProjectTriggerEdge {
+    Rising,
+    Falling,
+    Either,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectTriggerConfig {
+    pub mode: ProjectTriggerMode,
+    pub edge: ProjectTriggerEdge,
+    pub source_channel: u16,
+    pub level: f32,
+    pub hysteresis: f32,
+    pub pre_samples: usize,
+    pub post_samples: usize,
+    pub auto_timeout_samples: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectLiveProfile {
+    #[serde(default)]
+    pub transport: Option<ProjectTransport>,
+    pub sample_rate_hz: u32,
+    pub batch_samples: u16,
+    #[serde(default)]
+    pub channel_ids: Vec<u16>,
+    pub trigger: ProjectTriggerConfig,
+    #[serde(default = "default_history_entries")]
+    pub capture_history_entries: usize,
+    #[serde(default = "default_history_bytes")]
+    pub capture_history_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProjectCaptureOrigin {
+    RecordingTrigger,
+    CaptureAsset,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectCaptureRef {
+    pub id: CaptureId,
+    pub origin: ProjectCaptureOrigin,
+    pub source_id: SourceId,
+    #[serde(default)]
+    pub trigger_ordinal: Option<usize>,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub selected: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProjectAnnotationKind {
+    Text,
+    Arrow,
+    Rectangle,
+    Ink,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectAnnotation {
+    pub kind: ProjectAnnotationKind,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub points: Vec<[f32; 2]>,
+    pub color: [u8; 4],
+    #[serde(default = "default_line_width")]
+    pub width: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectExportState {
+    #[serde(default)]
+    pub format: String,
+    #[serde(default)]
+    pub dpi: u32,
+    #[serde(default)]
+    pub include_cursor_table: bool,
+    #[serde(default)]
+    pub canvas_width: usize,
+    #[serde(default)]
+    pub canvas_height: usize,
+    #[serde(default)]
+    pub annotations: Vec<ProjectAnnotation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScopeProjectDocument {
+    pub scope_project_type: String,
+    pub schema_version: u32,
+    pub created_by_version: String,
+    pub project_id: ProjectId,
+    #[serde(default)]
+    pub sources: Vec<ProjectSource>,
+    #[serde(default)]
+    pub datasets: Vec<ProjectDataset>,
+    #[serde(default)]
+    pub workspace: ProjectWorkspace,
+    #[serde(default)]
+    pub analysis: ProjectAnalysis,
+    #[serde(default)]
+    pub live_profile: Option<ProjectLiveProfile>,
+    #[serde(default)]
+    pub captures: Vec<ProjectCaptureRef>,
+    #[serde(default)]
+    pub export: ProjectExportState,
+}
+
+impl ScopeProjectDocument {
+    pub fn empty(project_id: ProjectId, created_by_version: impl Into<String>) -> Self {
+        Self {
+            scope_project_type: PROJECT_TYPE.to_owned(),
+            schema_version: PROJECT_SCHEMA_VERSION,
+            created_by_version: created_by_version.into(),
+            project_id,
+            sources: Vec::new(),
+            datasets: Vec::new(),
+            workspace: ProjectWorkspace::default(),
+            analysis: ProjectAnalysis::default(),
+            live_profile: None,
+            captures: Vec::new(),
+            export: ProjectExportState::default(),
+        }
+    }
+
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, ProjectError> {
+        if bytes.len() > MAX_PROJECT_JSON_BYTES {
+            return Err(ProjectError::TooLarge(bytes.len()));
+        }
+        let document: Self = serde_json::from_slice(bytes)?;
+        document.validate()?;
+        Ok(document)
+    }
+
+    pub fn to_pretty_json(&self) -> Result<Vec<u8>, ProjectError> {
+        self.validate()?;
+        Ok(serde_json::to_vec_pretty(self)?)
+    }
+
+    pub fn validate(&self) -> Result<(), ProjectError> {
+        if self.scope_project_type != PROJECT_TYPE {
+            return Err(ProjectError::WrongType(self.scope_project_type.clone()));
+        }
+        if self.schema_version != PROJECT_SCHEMA_VERSION {
+            return Err(ProjectError::UnsupportedSchema(self.schema_version));
+        }
+        validate_id("project", &self.project_id.0)?;
+        if self.created_by_version.trim().is_empty() {
+            return Err(ProjectError::InvalidField(
+                "createdByVersion must not be empty".to_owned(),
+            ));
+        }
+
+        let mut source_ids = HashSet::new();
+        for source in &self.sources {
+            validate_id("source", &source.id.0)?;
+            if !source_ids.insert(source.id.clone()) {
+                return Err(ProjectError::DuplicateId(source.id.0.clone()));
+            }
+            validate_project_path(&source.file.relative_path)?;
+        }
+
+        let mut dataset_ids = HashSet::new();
+        let mut primary_count = 0_usize;
+        for dataset in &self.datasets {
+            validate_id("dataset", &dataset.id.0)?;
+            if !dataset_ids.insert(dataset.id.clone()) {
+                return Err(ProjectError::DuplicateId(dataset.id.0.clone()));
+            }
+            if !source_ids.contains(&dataset.source_id) {
+                return Err(ProjectError::DanglingReference(dataset.source_id.0.clone()));
+            }
+            if dataset.role == ProjectDatasetRole::Primary {
+                primary_count += 1;
+            }
+            if !dataset.time_offset.is_finite() {
+                return Err(ProjectError::InvalidField(
+                    "dataset timeOffset must be finite".to_owned(),
+                ));
+            }
+            for channel in &dataset.channels {
+                validate_channel_ref(&channel.channel, &source_ids)?;
+                if !channel.scale.is_finite() || channel.scale == 0.0 {
+                    return Err(ProjectError::InvalidField(
+                        "channel scale must be finite and non-zero".to_owned(),
+                    ));
+                }
+                if !channel.line_width.is_finite() || channel.line_width <= 0.0 {
+                    return Err(ProjectError::InvalidField(
+                        "channel lineWidth must be positive".to_owned(),
+                    ));
+                }
+            }
+        }
+        if !self.datasets.is_empty() && primary_count != 1 {
+            return Err(ProjectError::InvalidField(
+                "a non-empty project must have exactly one primary dataset".to_owned(),
+            ));
+        }
+
+        validate_workspace(&self.workspace, &dataset_ids)?;
+        validate_analysis(&self.analysis, &source_ids)?;
+        if let Some(profile) = &self.live_profile {
+            validate_live_profile(profile)?;
+        }
+
+        let mut capture_ids = HashSet::new();
+        let mut selected_captures = 0_usize;
+        for capture in &self.captures {
+            validate_id("capture", &capture.id.0)?;
+            if !capture_ids.insert(capture.id.clone()) {
+                return Err(ProjectError::DuplicateId(capture.id.0.clone()));
+            }
+            if !source_ids.contains(&capture.source_id) {
+                return Err(ProjectError::DanglingReference(capture.source_id.0.clone()));
+            }
+            selected_captures += usize::from(capture.selected);
+        }
+        if selected_captures > 1 {
+            return Err(ProjectError::InvalidField(
+                "at most one Capture may be selected".to_owned(),
+            ));
+        }
+        for annotation in &self.export.annotations {
+            if annotation
+                .points
+                .iter()
+                .flatten()
+                .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+            {
+                return Err(ProjectError::InvalidField(
+                    "annotation points must be normalized finite values".to_owned(),
+                ));
+            }
+            if !annotation.width.is_finite() || annotation.width <= 0.0 {
+                return Err(ProjectError::InvalidField(
+                    "annotation width must be positive".to_owned(),
+                ));
+            }
+        }
+        if !self.export.annotations.is_empty()
+            && (self.export.canvas_width == 0 || self.export.canvas_height == 0)
+        {
+            return Err(ProjectError::InvalidField(
+                "annotation canvas dimensions must be non-zero".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn load_project(path: &Path) -> Result<ScopeProjectDocument, ProjectError> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > MAX_PROJECT_JSON_BYTES as u64 {
+        return Err(ProjectError::TooLarge(
+            usize::try_from(metadata.len()).unwrap_or(usize::MAX),
+        ));
+    }
+    ScopeProjectDocument::from_json_bytes(&fs::read(path)?)
+}
+
+pub fn save_project_atomic(
+    path: &Path,
+    document: &ScopeProjectDocument,
+) -> Result<(), ProjectError> {
+    let bytes = document.to_pretty_json()?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("project.scopeproj");
+    let temporary = parent.join(format!(".{file_name}.tmp"));
+    let backup = parent.join(format!(".{file_name}.bak"));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        if path.exists() {
+            let _ = fs::remove_file(&backup);
+            fs::rename(path, &backup)?;
+            if let Err(error) = fs::rename(&temporary, path) {
+                let _ = fs::rename(&backup, path);
+                return Err(error);
+            }
+            fs::remove_file(&backup)?;
+        } else {
+            fs::rename(&temporary, path)?;
+        }
+        Ok::<(), std::io::Error>(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temporary);
+        if path.exists() {
+            let _ = fs::remove_file(&backup);
+        }
+        return Err(ProjectError::Io(error));
+    }
+    Ok(())
+}
+
+pub fn resolve_project_sources(
+    project_path: &Path,
+    document: &ScopeProjectDocument,
+) -> Vec<ResolvedProjectSource> {
+    let project_dir = project_path.parent().unwrap_or_else(|| Path::new("."));
+    document
+        .sources
+        .iter()
+        .map(|source| {
+            let relative = project_dir.join(&source.file.relative_path);
+            let candidate = if relative.is_file() {
+                Some(relative)
+            } else if !source.file.absolute_hint.is_empty() {
+                let hint = PathBuf::from(&source.file.absolute_hint);
+                hint.is_file().then_some(hint)
+            } else {
+                None
+            };
+            let resolution = match candidate {
+                Some(path) if file_metadata_matches(&path, &source.file) => {
+                    ProjectSourceResolution::Resolved(path)
+                }
+                Some(path) => ProjectSourceResolution::MetadataMismatch(path),
+                None => ProjectSourceResolution::Missing,
+            };
+            ResolvedProjectSource {
+                source_id: source.id.clone(),
+                resolution,
+            }
+        })
+        .collect()
+}
+
+pub fn relocate_project_source(
+    project_path: &Path,
+    document: &mut ScopeProjectDocument,
+    source_id: &SourceId,
+    replacement: &Path,
+) -> Result<(), ProjectError> {
+    if !replacement.is_file() {
+        return Err(ProjectError::InvalidField(format!(
+            "replacement source does not exist: {}",
+            replacement.display()
+        )));
+    }
+    let source = document
+        .sources
+        .iter_mut()
+        .find(|source| &source.id == source_id)
+        .ok_or_else(|| ProjectError::DanglingReference(source_id.0.clone()))?;
+    let project_dir = project_path.parent().unwrap_or_else(|| Path::new("."));
+    source.file.relative_path = replacement
+        .strip_prefix(project_dir)
+        .ok()
+        .filter(|relative| {
+            !relative
+                .components()
+                .any(|component| component == Component::ParentDir)
+        })
+        .and_then(Path::to_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            replacement
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| ProjectError::UnsafePath(replacement.display().to_string()))?;
+    source.file.absolute_hint = replacement.to_string_lossy().into_owned();
+    let metadata = fs::metadata(replacement)?;
+    source.file.size_bytes = metadata.len();
+    source.file.modified_unix_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+    document.validate()
+}
+
+fn file_metadata_matches(path: &Path, expected: &ProjectFileRef) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    expected.size_bytes == 0 || expected.size_bytes == metadata.len()
+}
+
+#[derive(Debug, Error)]
+pub enum ProjectError {
+    #[error("project JSON exceeds the {MAX_PROJECT_JSON_BYTES}-byte limit: {0}")]
+    TooLarge(usize),
+    #[error("project JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("project I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("not a Scope Analyzer project: {0}")]
+    WrongType(String),
+    #[error("unsupported project schema version {0}")]
+    UnsupportedSchema(u32),
+    #[error("invalid project identifier: {0}")]
+    InvalidId(String),
+    #[error("duplicate project identifier: {0}")]
+    DuplicateId(String),
+    #[error("dangling project reference: {0}")]
+    DanglingReference(String),
+    #[error("unsafe project-relative path: {0}")]
+    UnsafePath(String),
+    #[error("invalid project field: {0}")]
+    InvalidField(String),
+}
+
+fn validate_id(label: &str, value: &str) -> Result<(), ProjectError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
+    {
+        return Err(ProjectError::InvalidId(format!("{label}:{value}")));
+    }
+    Ok(())
+}
+
+fn validate_project_path(value: &str) -> Result<(), ProjectError> {
+    let path = Path::new(value);
+    let has_windows_prefix =
+        value.as_bytes().get(1) == Some(&b':') && value.as_bytes()[0].is_ascii_alphabetic();
+    if value.is_empty()
+        || path.is_absolute()
+        || has_windows_prefix
+        || value.starts_with('\\')
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ProjectError::UnsafePath(value.to_owned()));
+    }
+    Ok(())
+}
+
+fn validate_channel_ref(
+    channel: &ProjectChannelRef,
+    source_ids: &HashSet<SourceId>,
+) -> Result<(), ProjectError> {
+    if !source_ids.contains(&channel.source_id) {
+        return Err(ProjectError::DanglingReference(channel.source_id.0.clone()));
+    }
+    if channel.raw_name.trim().is_empty() {
+        return Err(ProjectError::InvalidField(
+            "channel rawName must not be empty".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_workspace(
+    workspace: &ProjectWorkspace,
+    dataset_ids: &HashSet<DatasetId>,
+) -> Result<(), ProjectError> {
+    if workspace.layout_rows == 0 || workspace.layout_cols == 0 {
+        return Err(ProjectError::InvalidField(
+            "workspace layout axes must be non-zero".to_owned(),
+        ));
+    }
+    if let Some(selected) = &workspace.selected_dataset_id {
+        if !dataset_ids.contains(selected) {
+            return Err(ProjectError::DanglingReference(selected.0.clone()));
+        }
+    }
+    let viewport = &workspace.viewport;
+    let finite = [
+        viewport.view_start,
+        viewport.view_end,
+        viewport.y_min,
+        viewport.y_max,
+        viewport.cursor_a,
+        viewport.cursor_b,
+    ]
+    .into_iter()
+    .all(f64::is_finite);
+    if !finite || viewport.view_end <= viewport.view_start || viewport.y_max <= viewport.y_min {
+        return Err(ProjectError::InvalidField(
+            "workspace viewport bounds are invalid".to_owned(),
+        ));
+    }
+    if viewport
+        .pane_y_bounds
+        .iter()
+        .any(|bounds| !bounds[0].is_finite() || !bounds[1].is_finite() || bounds[1] <= bounds[0])
+    {
+        return Err(ProjectError::InvalidField(
+            "pane Y bounds are invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_analysis(
+    analysis: &ProjectAnalysis,
+    source_ids: &HashSet<SourceId>,
+) -> Result<(), ProjectError> {
+    if !analysis.harmonic_base_hz.is_finite() || analysis.harmonic_base_hz <= 0.0 {
+        return Err(ProjectError::InvalidField(
+            "harmonicBaseHz must be positive".to_owned(),
+        ));
+    }
+    if !analysis.live_measurement_cycles.is_finite()
+        || !(1.0..=100.0).contains(&analysis.live_measurement_cycles)
+    {
+        return Err(ProjectError::InvalidField(
+            "liveMeasurementCycles must be in 1..=100".to_owned(),
+        ));
+    }
+    let references = analysis
+        .fft_channel
+        .iter()
+        .chain(&analysis.sequence_channels)
+        .chain(&analysis.pll_channels)
+        .chain(&analysis.dq_channels);
+    for channel in references {
+        validate_channel_ref(channel, source_ids)?;
+    }
+    if let Some(power) = &analysis.power {
+        let mut unique = HashSet::new();
+        for channel in power.voltage.iter().chain(&power.current) {
+            validate_channel_ref(channel, source_ids)?;
+            if !unique.insert(channel.clone()) {
+                return Err(ProjectError::InvalidField(
+                    "power bindings must use six distinct channels".to_owned(),
+                ));
+            }
+        }
+        if power
+            .voltage_scales
+            .iter()
+            .chain(&power.current_scales)
+            .any(|scale| !scale.is_finite() || *scale == 0.0)
+        {
+            return Err(ProjectError::InvalidField(
+                "power scales must be finite and non-zero".to_owned(),
+            ));
+        }
+    }
+    for curve in &analysis.derived_curves {
+        if curve.name.trim().is_empty()
+            || curve.script.trim().is_empty()
+            || !curve.gain.is_finite()
+            || !curve.offset.is_finite()
+        {
+            return Err(ProjectError::InvalidField(
+                "derived curve definition is invalid".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_live_profile(profile: &ProjectLiveProfile) -> Result<(), ProjectError> {
+    if profile.sample_rate_hz == 0 || profile.batch_samples == 0 {
+        return Err(ProjectError::InvalidField(
+            "Live acquisition rate and batch must be non-zero".to_owned(),
+        ));
+    }
+    if profile.capture_history_entries == 0 || profile.capture_history_entries > 10_000 {
+        return Err(ProjectError::InvalidField(
+            "Capture history entry limit is invalid".to_owned(),
+        ));
+    }
+    if profile.capture_history_bytes == 0 || profile.capture_history_bytes > 4 * 1024 * 1024 * 1024
+    {
+        return Err(ProjectError::InvalidField(
+            "Capture history byte limit is invalid".to_owned(),
+        ));
+    }
+    if !profile.trigger.level.is_finite()
+        || !profile.trigger.hysteresis.is_finite()
+        || profile.trigger.hysteresis < 0.0
+    {
+        return Err(ProjectError::InvalidField(
+            "trigger level/hysteresis is invalid".to_owned(),
+        ));
+    }
+    if let Some(ProjectTransport::Serial { port, baud }) = &profile.transport {
+        if port.trim().is_empty() || *baud == 0 {
+            return Err(ProjectError::InvalidField(
+                "serial transport preset is invalid".to_owned(),
+            ));
+        }
+    }
+    if let Some(ProjectTransport::Tcp { address }) = &profile.transport {
+        if address.trim().is_empty() {
+            return Err(ProjectError::InvalidField(
+                "TCP transport preset is invalid".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_layout_axis() -> usize {
+    1
+}
+
+const fn default_scale() -> f32 {
+    1.0
+}
+
+const fn default_line_width() -> f32 {
+    1.5
+}
+
+const fn default_harmonic_base() -> f64 {
+    50.0
+}
+
+const fn default_measurement_cycles() -> f64 {
+    10.0
+}
+
+const fn default_scales() -> [f64; 3] {
+    [1.0; 3]
+}
+
+const fn default_history_entries() -> usize {
+    100
+}
+
+const fn default_history_bytes() -> u64 {
+    128 * 1024 * 1024
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temporary_dir(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "scope-project-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn source() -> ProjectSource {
+        ProjectSource {
+            id: SourceId("source-main".to_owned()),
+            kind: ProjectSourceKind::Csv,
+            file: ProjectFileRef {
+                relative_path: "data/main.csv".to_owned(),
+                absolute_hint: String::new(),
+                size_bytes: 123,
+                modified_unix_ms: None,
+                partial_crc32c: None,
+            },
+            required: true,
+        }
+    }
+
+    fn channel(index: usize, name: &str) -> ProjectChannelRef {
+        ProjectChannelRef {
+            source_id: SourceId("source-main".to_owned()),
+            raw_name: name.to_owned(),
+            index_hint: index,
+            channel_id_hint: None,
+        }
+    }
+
+    fn document() -> ScopeProjectDocument {
+        let mut document =
+            ScopeProjectDocument::empty(ProjectId("project-test".to_owned()), "0.11.0-test");
+        document.sources.push(source());
+        document.datasets.push(ProjectDataset {
+            id: DatasetId("dataset-main".to_owned()),
+            source_id: SourceId("source-main".to_owned()),
+            role: ProjectDatasetRole::Primary,
+            display_name: "Main".to_owned(),
+            enabled: true,
+            line_pattern: "solid".to_owned(),
+            time_offset: 0.0,
+            channels: Vec::new(),
+        });
+        document.workspace.selected_dataset_id = Some(DatasetId("dataset-main".to_owned()));
+        document.analysis.fft_channel = Some(channel(0, "Va"));
+        document
+    }
+
+    #[test]
+    fn project_v1_round_trips_with_type_and_schema_validation() {
+        let document = document();
+        let bytes = document.to_pretty_json().unwrap();
+        let decoded = ScopeProjectDocument::from_json_bytes(&bytes).unwrap();
+        assert_eq!(decoded, document);
+        assert!(String::from_utf8(bytes)
+            .unwrap()
+            .contains("\"schemaVersion\": 1"));
+    }
+
+    #[test]
+    fn project_rejects_duplicate_and_dangling_ids() {
+        let mut duplicate = document();
+        duplicate.sources.push(source());
+        assert!(matches!(
+            duplicate.validate(),
+            Err(ProjectError::DuplicateId(_))
+        ));
+
+        let mut dangling = document();
+        dangling.datasets[0].source_id = SourceId("missing".to_owned());
+        assert!(matches!(
+            dangling.validate(),
+            Err(ProjectError::DanglingReference(_))
+        ));
+    }
+
+    #[test]
+    fn project_rejects_parent_or_absolute_relative_paths() {
+        for unsafe_path in [
+            "../secret.csv",
+            "/tmp/data.csv",
+            r"C:\data\main.csv",
+            r"\\server\share\main.csv",
+        ] {
+            let mut document = document();
+            document.sources[0].file.relative_path = unsafe_path.to_owned();
+            assert!(matches!(
+                document.validate(),
+                Err(ProjectError::UnsafePath(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn project_rejects_non_finite_viewport_without_mutating_input() {
+        let mut document = document();
+        document.workspace.viewport.view_end = f64::NAN;
+        assert!(matches!(
+            document.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+        assert!(document.workspace.viewport.view_end.is_nan());
+    }
+
+    #[test]
+    fn project_rejects_oversized_json_before_parsing() {
+        let bytes = vec![b' '; MAX_PROJECT_JSON_BYTES + 1];
+        assert!(matches!(
+            ScopeProjectDocument::from_json_bytes(&bytes),
+            Err(ProjectError::TooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn project_requires_exactly_one_primary_dataset() {
+        let mut document = document();
+        document.datasets[0].role = ProjectDatasetRole::Imported;
+        assert!(matches!(
+            document.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+    }
+
+    #[test]
+    fn project_atomic_save_load_and_source_resolution_round_trip() {
+        let directory = temporary_dir("atomic");
+        let data_path = directory.join("data/main.csv");
+        fs::create_dir_all(data_path.parent().unwrap()).unwrap();
+        fs::write(&data_path, b"time,value\n0,1\n").unwrap();
+        let mut document = document();
+        document.sources[0].file.size_bytes = fs::metadata(&data_path).unwrap().len();
+        let project_path = directory.join("test.scopeproj");
+
+        save_project_atomic(&project_path, &document).unwrap();
+        assert_eq!(load_project(&project_path).unwrap(), document);
+        document.datasets[0].display_name = "Updated".to_owned();
+        save_project_atomic(&project_path, &document).unwrap();
+        assert_eq!(load_project(&project_path).unwrap(), document);
+        assert!(matches!(
+            resolve_project_sources(&project_path, &document)[0].resolution,
+            ProjectSourceResolution::Resolved(_)
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn relocation_updates_hint_and_detects_metadata_mismatch() {
+        let directory = temporary_dir("relocate");
+        let replacement = directory.join("replacement.csv");
+        fs::write(&replacement, b"replacement").unwrap();
+        let project_path = directory.join("test.scopeproj");
+        let mut document = document();
+
+        relocate_project_source(
+            &project_path,
+            &mut document,
+            &SourceId("source-main".to_owned()),
+            &replacement,
+        )
+        .unwrap();
+        assert_eq!(document.sources[0].file.relative_path, "replacement.csv");
+        fs::write(&replacement, b"changed-size").unwrap();
+        assert!(matches!(
+            resolve_project_sources(&project_path, &document)[0].resolution,
+            ProjectSourceResolution::MetadataMismatch(_)
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+}

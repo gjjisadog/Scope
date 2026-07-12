@@ -1,5 +1,6 @@
 use super::*;
 use scope_analyzer::live::{
+    bandwidth::{calculate_link_budget, BudgetSeverity, LinkBudgetResult, LinkBudgetTransport},
     protocol::{ChannelDescriptor, ChannelKind},
     session::ConnectionState,
     state::WorkspaceMode,
@@ -15,6 +16,33 @@ const LIVE_PLOT_ROW_MIN_HEIGHT: f32 = 92.0;
 const LIVE_PLOT_ROW_MAX_HEIGHT: f32 = 180.0;
 
 impl ScopeApp {
+    fn consume_bandwidth_expert_override(critical: bool, enabled: &mut bool) -> bool {
+        let used = critical && *enabled;
+        *enabled = false;
+        used
+    }
+
+    fn live_link_budget(&self) -> Result<LinkBudgetResult, String> {
+        let table = self.live.channel_table.as_ref().ok_or_else(|| {
+            self.live_text("等待通道表", "Waiting for channel table")
+                .to_owned()
+        })?;
+        let maximum_payload = self
+            .live
+            .hello_ack
+            .as_ref()
+            .and_then(|hello| usize::try_from(hello.max_payload).ok())
+            .unwrap_or(scope_analyzer::live::protocol::MAX_PAYLOAD_LEN);
+        let transport = match self.live.transport {
+            TransportConfig::Serial { baud, .. } => LinkBudgetTransport::Serial { baud },
+            TransportConfig::Tcp { .. } => LinkBudgetTransport::Tcp {
+                expected_bits_per_second: None,
+            },
+        };
+        calculate_link_budget(table, &self.live.acquisition, transport, maximum_payload)
+            .map_err(|error| error.to_string())
+    }
+
     pub(super) fn workspace_selector(&mut self, ui: &mut egui::Ui) {
         let offline_label = self.live_text("离线分析", "Offline analysis");
         let live_label = self.live_text("实时采集", "Live capture");
@@ -87,14 +115,33 @@ impl ScopeApp {
         } else {
             self.live_text("应用并开始", "Configure & Start")
         };
+        let budget_critical = self
+            .live_link_budget()
+            .is_ok_and(|budget| budget.severity == BudgetSeverity::Critical);
         if ui
-            .add_enabled(ready, egui::Button::new(start_label))
+            .add_enabled(
+                ready && (!budget_critical || self.live_bandwidth_expert_override),
+                egui::Button::new(start_label),
+            )
             .on_hover_text(self.live_text(
                 "应用当前采集参数并开始实时采集",
                 "Apply the current acquisition settings and start streaming",
             ))
             .clicked()
         {
+            let used_override = Self::consume_bandwidth_expert_override(
+                budget_critical,
+                &mut self.live_bandwidth_expert_override,
+            );
+            if used_override {
+                self.live_bandwidth_override_notice = Some(
+                    self.live_text(
+                        "已使用一次性专家覆盖启动临界带宽配置",
+                        "Critical bandwidth configuration started with one-shot expert override",
+                    )
+                    .to_owned(),
+                );
+            }
             let configure = self.live.acquisition.clone();
             let result = self.live.start_with_configuration(configure);
             self.apply_live_result(result);
@@ -318,6 +365,24 @@ impl ScopeApp {
                 .unwrap_or("Live Scope");
             let _ = ui.selectable_label(true, format!("Live — {device}"));
             ui.separator();
+            let analyze_label = self.live_text("分析捕获", "Analyze capture");
+            let analyze_hint = self.live_text(
+                "冻结当前触发捕获或实时历史并进入离线分析",
+                "Freeze the current trigger capture or live history and open offline analysis",
+            );
+            if ui
+                .add_enabled(
+                    self.live.has_analysis_snapshot()
+                        && self.live.channel_table.is_some()
+                        && self.live.acquisition.sample_rate_hz > 0,
+                    egui::Button::new(analyze_label),
+                )
+                .on_hover_text(analyze_hint)
+                .clicked()
+            {
+                self.analyze_live_capture();
+            }
+            ui.separator();
             if ui
                 .button("+")
                 .on_hover_text(self.live_text("打开录波", "Open recording"))
@@ -392,9 +457,9 @@ impl ScopeApp {
             .iter()
             .filter(|channel| {
                 self.live
-                    .channel_visibility
+                    .channel_presentations
                     .get(&channel.channel_id)
-                    .copied()
+                    .map(|presentation| presentation.visible)
                     .unwrap_or(true)
             })
             .count();
@@ -424,7 +489,14 @@ impl ScopeApp {
         let mut analog = Vec::new();
         let mut digital = Vec::new();
         for channel in channels {
+            let display_name = self
+                .live
+                .channel_presentations
+                .get(&channel.channel_id)
+                .map(|presentation| presentation.display_name.as_str())
+                .unwrap_or(&channel.name);
             if !filter.is_empty()
+                && !display_name.to_lowercase().contains(&filter)
                 && !channel.name.to_lowercase().contains(&filter)
                 && !channel.unit.to_lowercase().contains(&filter)
             {
@@ -466,9 +538,9 @@ impl ScopeApp {
             .iter()
             .filter(|channel| {
                 self.live
-                    .channel_visibility
+                    .channel_presentations
                     .get(&channel.channel_id)
-                    .copied()
+                    .map(|presentation| presentation.visible)
                     .unwrap_or(true)
             })
             .count();
@@ -500,23 +572,36 @@ impl ScopeApp {
         let mut acquired = self.live.acquisition.channel_mask & bit != 0;
         let mut visible = self
             .live
-            .channel_visibility
+            .channel_presentations
             .get(&channel.channel_id)
-            .copied()
+            .map(|presentation| presentation.visible)
             .unwrap_or(true);
         let mut scale = self
             .live
-            .channel_scales
+            .channel_presentations
             .get(&channel.channel_id)
-            .copied()
+            .map(|presentation| presentation.scale)
             .unwrap_or(1.0);
         let rgba = self
             .live
-            .channel_colors
+            .channel_presentations
             .get(&channel.channel_id)
-            .copied()
+            .map(|presentation| presentation.color)
             .unwrap_or([80, 140, 220, 255]);
         let mut color = Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3]);
+        let mut display_name = self
+            .live
+            .channel_presentations
+            .get(&channel.channel_id)
+            .map(|presentation| presentation.display_name.clone())
+            .unwrap_or_else(|| channel.name.clone());
+        let mut pane = self
+            .live
+            .channel_presentations
+            .get(&channel.channel_id)
+            .map(|presentation| presentation.pane)
+            .unwrap_or(0)
+            .min(self.scope_pane_count().saturating_sub(1));
 
         ui.push_id(("live_channel_row", channel.channel_id), |ui| {
             ui.horizontal(|ui| {
@@ -551,9 +636,11 @@ impl ScopeApp {
                     .on_hover_text(self.live_text("显示波形", "Show waveform"))
                     .changed()
                 {
-                    self.live
-                        .channel_visibility
-                        .insert(channel.channel_id, visible);
+                    if let Some(presentation) =
+                        self.live.channel_presentations.get_mut(&channel.channel_id)
+                    {
+                        presentation.visible = visible;
+                    }
                 }
                 if egui::color_picker::color_edit_button_srgba(
                     ui,
@@ -562,11 +649,35 @@ impl ScopeApp {
                 )
                 .changed()
                 {
-                    self.live
-                        .channel_colors
-                        .insert(channel.channel_id, color.to_array());
+                    if let Some(presentation) =
+                        self.live.channel_presentations.get_mut(&channel.channel_id)
+                    {
+                        presentation.color = color.to_array();
+                    }
                 }
-                ui.label(RichText::new(&channel.name).strong());
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut display_name)
+                            .desired_width(92.0)
+                            .hint_text(&channel.name),
+                    )
+                    .on_hover_text(format!(
+                        "{}: {}",
+                        self.live_text("原始名", "Source"),
+                        channel.name
+                    ))
+                    .changed()
+                {
+                    if let Some(presentation) =
+                        self.live.channel_presentations.get_mut(&channel.channel_id)
+                    {
+                        presentation.display_name = if display_name.trim().is_empty() {
+                            channel.name.clone()
+                        } else {
+                            display_name.clone()
+                        };
+                    }
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let value = latest
                         .map(|value| format!("{value:.3} {}", channel.unit))
@@ -586,7 +697,26 @@ impl ScopeApp {
                     )
                     .changed()
                 {
-                    self.live.channel_scales.insert(channel.channel_id, scale);
+                    if let Some(presentation) =
+                        self.live.channel_presentations.get_mut(&channel.channel_id)
+                    {
+                        presentation.scale = scale;
+                        presentation.sanitize();
+                    }
+                }
+                ui.label(RichText::new(self.live_text("窗格", "Pane")).small());
+                egui::ComboBox::from_id_source(("live_channel_pane", channel.channel_id))
+                    .selected_text(format!("{}", pane + 1))
+                    .width(48.0)
+                    .show_ui(ui, |ui| {
+                        for candidate in 0..self.scope_pane_count() {
+                            ui.selectable_value(&mut pane, candidate, format!("{}", candidate + 1));
+                        }
+                    });
+                if let Some(presentation) =
+                    self.live.channel_presentations.get_mut(&channel.channel_id)
+                {
+                    presentation.pane = pane;
                 }
             });
             ui.separator();
@@ -790,7 +920,7 @@ impl ScopeApp {
         {
             self.live.arm_trigger();
         }
-        if let Some(capture) = &self.live.last_capture {
+        if let Some(capture) = self.live.selected_trigger_capture() {
             ui.add_space(8.0);
             ui.label(format!(
                 "{}: {}{}",
@@ -870,6 +1000,88 @@ impl ScopeApp {
             self.live.configuration_applied = false;
         }
 
+        ui.add_space(10.0);
+        ui.label(RichText::new(self.live_text("采集带宽", "Acquisition bandwidth")).strong());
+        match self.live_link_budget() {
+            Ok(budget) => {
+                let (status, color) = match budget.severity {
+                    BudgetSeverity::Safe => (
+                        self.live_text("安全", "Safe"),
+                        Color32::from_rgb(67, 190, 115),
+                    ),
+                    BudgetSeverity::Warning => (
+                        self.live_text("警告", "Warning"),
+                        Color32::from_rgb(226, 170, 55),
+                    ),
+                    BudgetSeverity::Critical => (
+                        self.live_text("超出预算", "Critical"),
+                        Color32::from_rgb(220, 85, 75),
+                    ),
+                    BudgetSeverity::Unknown => (
+                        self.live_text("仅供参考", "Advisory"),
+                        Color32::from_gray(150),
+                    ),
+                };
+                ui.colored_label(color, RichText::new(status).strong());
+                egui::Grid::new("live_bandwidth_budget")
+                    .num_columns(2)
+                    .spacing([12.0, 5.0])
+                    .show(ui, |ui| {
+                        ui.label(self.live_text("帧大小", "Frame size"));
+                        ui.label(format!("{} B", budget.frame_bytes));
+                        ui.end_row();
+                        ui.label(self.live_text("链路流量", "Link traffic"));
+                        ui.label(format!("{:.1} KiB/s", budget.bytes_per_second / 1024.0));
+                        ui.end_row();
+                        ui.label(self.live_text("批次延迟", "Batch latency"));
+                        ui.label(format!("{:.2} ms", budget.batch_latency_seconds * 1000.0));
+                        ui.end_row();
+                        if let Some(utilization) = budget.utilization {
+                            ui.label(self.live_text("利用率", "Utilization"));
+                            ui.label(format!("{:.1}%", utilization * 100.0));
+                            ui.end_row();
+                        }
+                    });
+                if budget.severity != BudgetSeverity::Safe {
+                    if let Some(suggestion) = budget.suggested_batch_samples {
+                        if suggestion != self.live.acquisition.batch_samples
+                            && ui
+                                .add_enabled(
+                                    can_edit,
+                                    egui::Button::new(format!(
+                                        "{} {suggestion}",
+                                        self.live_text("采用安全批次", "Use safe batch")
+                                    )),
+                                )
+                                .clicked()
+                        {
+                            self.live.acquisition.batch_samples = suggestion;
+                            self.live.configuration_applied = false;
+                            self.live_bandwidth_expert_override = false;
+                        }
+                    }
+                }
+                if budget.severity == BudgetSeverity::Critical {
+                    let override_label =
+                        self.live_text("专家模式：仍允许开始", "Expert override: allow start");
+                    let override_help = self.live_text(
+                        "仅绕过主机侧带宽策略，不绕过设备或协议限制",
+                        "Bypasses only the host bandwidth policy, never device or protocol limits",
+                    );
+                    ui.checkbox(&mut self.live_bandwidth_expert_override, override_label)
+                        .on_hover_text(override_help);
+                } else {
+                    self.live_bandwidth_expert_override = false;
+                }
+            }
+            Err(message) => {
+                ui.label(RichText::new(message).color(Color32::from_gray(145)));
+                self.live_bandwidth_expert_override = false;
+            }
+        }
+
+        self.live_power_bindings_ui(ui, can_edit);
+
         ui.add_space(12.0);
         ui.label(RichText::new(self.live_text("工作区", "Workspace")).strong());
         let signal_panel_label = self.live_text("显示信号面板", "Show signals panel");
@@ -885,6 +1097,101 @@ impl ScopeApp {
             .changed()
         {
             self.live.set_display_paused(paused);
+        }
+    }
+
+    fn live_power_bindings_ui(&mut self, ui: &mut egui::Ui, can_edit: bool) {
+        let channels = self
+            .live
+            .channel_table
+            .as_ref()
+            .map(|table| {
+                table
+                    .channels
+                    .iter()
+                    .filter(|channel| {
+                        channel.kind == ChannelKind::Analog
+                            && self.live.acquisition.channel_mask & (1_u64 << channel.channel_id)
+                                != 0
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        ui.add_space(10.0);
+        ui.label(RichText::new(self.live_text("三相功率", "Three-phase power")).strong());
+        let mut changed = ui
+            .add_enabled(
+                can_edit && channels.len() >= 6,
+                egui::Checkbox::new(&mut self.power_enabled, "P / Q₁ / S / PF"),
+            )
+            .changed();
+        if !self.power_enabled || channels.len() < 6 {
+            if channels.len() < 6 {
+                ui.label(self.live_text(
+                    "至少选择 6 个模拟通道",
+                    "Select at least six analog channels",
+                ));
+            }
+            if changed {
+                self.live_measurement_cache = None;
+            }
+            return;
+        }
+        let available = channels
+            .iter()
+            .map(|channel| usize::from(channel.channel_id))
+            .collect::<Vec<_>>();
+        if self
+            .power_voltage_channels
+            .iter()
+            .chain(&self.power_current_channels)
+            .any(|channel| !available.contains(channel))
+        {
+            self.power_voltage_channels.copy_from_slice(&available[..3]);
+            self.power_current_channels
+                .copy_from_slice(&available[3..6]);
+            changed = true;
+        }
+        for (label, binding, id) in [
+            (
+                "Vabc",
+                &mut self.power_voltage_channels,
+                "live_power_voltage",
+            ),
+            (
+                "Iabc",
+                &mut self.power_current_channels,
+                "live_power_current",
+            ),
+        ] {
+            ui.horizontal(|ui| {
+                ui.label(label);
+                for (phase, selected) in binding.iter_mut().enumerate() {
+                    let selected_name = channels
+                        .iter()
+                        .find(|channel| usize::from(channel.channel_id) == *selected)
+                        .map(|channel| channel.name.as_str())
+                        .unwrap_or("-");
+                    egui::ComboBox::from_id_source((id, phase))
+                        .selected_text(selected_name)
+                        .width(68.0)
+                        .show_ui(ui, |ui| {
+                            for channel in &channels {
+                                changed |= ui
+                                    .selectable_value(
+                                        selected,
+                                        usize::from(channel.channel_id),
+                                        &channel.name,
+                                    )
+                                    .changed();
+                            }
+                        });
+                }
+            });
+        }
+        if changed {
+            self.live_measurement_cache = None;
         }
     }
 
@@ -937,9 +1244,11 @@ impl ScopeApp {
     fn live_bottom_dock(&mut self, ui: &mut egui::Ui) {
         let events_label = self.live_text("事件", "Events");
         let link_label = self.live_text("链路", "Link");
+        let measurements_label = self.live_text("测量", "Measurements");
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.live_bottom_tab, 0, events_label);
             ui.selectable_value(&mut self.live_bottom_tab, 1, link_label);
+            ui.selectable_value(&mut self.live_bottom_tab, 2, measurements_label);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .button("×")
@@ -951,14 +1260,435 @@ impl ScopeApp {
             });
         });
         ui.separator();
-        if self.live_bottom_tab == 1 {
-            self.live_stats_grid(ui, true);
-        } else {
-            self.live_event_table(ui);
+        match self.live_bottom_tab {
+            1 => self.live_stats_grid(ui, true),
+            2 => self.live_measurement_table(ui),
+            _ => self.live_event_table(ui),
         }
     }
 
-    fn live_event_table(&self, ui: &mut egui::Ui) {
+    fn live_measurement_input(&self) -> Result<LiveMeasurementInput, String> {
+        let snapshot = self
+            .live
+            .measurement_snapshot(MAX_AUTO_MEASURE_POINTS)
+            .ok_or_else(|| self.live_text("暂无实时样点", "No live samples").to_owned())?;
+        let end_time = snapshot
+            .segments
+            .last()
+            .and_then(|segment| segment.times.last())
+            .copied();
+        let table = self.live.channel_table.as_ref().ok_or_else(|| {
+            self.live_text("等待通道表", "Waiting for channel table")
+                .to_owned()
+        })?;
+        let segments = snapshot
+            .segments
+            .into_iter()
+            .map(|segment| SampleBlock {
+                times: segment.times,
+                channels: segment.channels,
+            })
+            .collect::<Vec<_>>();
+        let specs = snapshot
+            .channel_ids
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(column, channel_id)| {
+                let descriptor = table.channel(channel_id)?;
+                let presentation = self.live.channel_presentations.get(&channel_id);
+                Some(ChannelMeasurementSpec {
+                    channel_index: usize::from(channel_id),
+                    column,
+                    name: presentation
+                        .map(|value| value.display_name.clone())
+                        .unwrap_or_else(|| descriptor.name.clone()),
+                    unit: descriptor.unit.clone(),
+                    scale: f64::from(presentation.map_or(1.0, |value| value.scale)),
+                })
+            })
+            .take(12)
+            .collect::<Vec<_>>();
+        let power = if self.power_enabled {
+            let voltage_columns = self.power_voltage_channels.map(|channel| {
+                snapshot
+                    .channel_ids
+                    .iter()
+                    .position(|candidate| usize::from(*candidate) == channel)
+            });
+            let current_columns = self.power_current_channels.map(|channel| {
+                snapshot
+                    .channel_ids
+                    .iter()
+                    .position(|candidate| usize::from(*candidate) == channel)
+            });
+            if voltage_columns.iter().all(Option::is_some)
+                && current_columns.iter().all(Option::is_some)
+            {
+                let mut power = ThreePhasePowerSpec::new(
+                    voltage_columns.map(Option::unwrap),
+                    current_columns.map(Option::unwrap),
+                );
+                power.voltage_scales = self.power_voltage_channels.map(|channel| {
+                    self.live
+                        .channel_presentations
+                        .get(&(channel as u16))
+                        .map_or(1.0, |value| f64::from(value.scale))
+                });
+                power.current_scales = self.power_current_channels.map(|channel| {
+                    self.live
+                        .channel_presentations
+                        .get(&(channel as u16))
+                        .map_or(1.0, |value| f64::from(value.scale))
+                });
+                power.nominal_frequency_hz = self.harmonic_base_hz.max(0.001);
+                Some(power)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Ok(LiveMeasurementInput {
+            end_time,
+            segments,
+            specs,
+            power,
+            signature: self.live_measurement_signature(),
+        })
+    }
+
+    fn live_measurement_signature(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.live
+            .channel_table
+            .as_ref()
+            .map(|table| table.revision)
+            .hash(&mut hasher);
+        self.live.acquisition.channel_mask.hash(&mut hasher);
+        self.live.acquisition.sample_rate_hz.hash(&mut hasher);
+        for (channel_id, presentation) in &self.live.channel_presentations {
+            channel_id.hash(&mut hasher);
+            presentation.scale.to_bits().hash(&mut hasher);
+            presentation.display_name.hash(&mut hasher);
+        }
+        self.power_enabled.hash(&mut hasher);
+        self.power_voltage_channels.hash(&mut hasher);
+        self.power_current_channels.hash(&mut hasher);
+        self.harmonic_base_hz.to_bits().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[cfg(test)]
+    fn refresh_live_measurements(&mut self) -> Result<EngineeringMeasurementResult, String> {
+        let input = self.live_measurement_input()?;
+        let result = analyze_segments(&input.segments, &input.specs, input.power.as_ref())
+            .map_err(|error| error.to_string())?;
+        self.live_measurement_cache = Some(LiveMeasurementCache {
+            updated_at: Instant::now(),
+            end_time: input.end_time,
+            result: result.clone(),
+            signature: input.signature,
+        });
+        Ok(result)
+    }
+
+    fn poll_live_measurement_worker(&mut self) {
+        let Some(joined) = Self::take_finished_job(
+            &mut self.live_measurement_worker,
+            "Live measurement worker panicked.",
+        ) else {
+            return;
+        };
+        match joined {
+            Ok(result) => match result.result {
+                Ok(measurement)
+                    if self.live.measurement_snapshot(1).is_some()
+                        && result.signature == self.live_measurement_signature() =>
+                {
+                    self.live_measurement_cache = Some(LiveMeasurementCache {
+                        updated_at: Instant::now(),
+                        end_time: result.end_time,
+                        result: measurement,
+                        signature: result.signature,
+                    });
+                }
+                Ok(_) => {}
+                Err(error) => self.live.last_error = Some(error),
+            },
+            Err(error) => self.live.last_error = Some(error),
+        }
+    }
+
+    fn dispatch_live_measurement_worker(&mut self) -> Result<(), String> {
+        if self.live_measurement_worker.is_some()
+            || self
+                .live_measurement_last_dispatch
+                .is_some_and(|instant| instant.elapsed() < Duration::from_millis(250))
+            || self.live.display_paused
+                && self.live_measurement_cache.as_ref().is_some_and(|cache| {
+                    cache.end_time
+                        == self.live.measurement_snapshot(1).and_then(|snapshot| {
+                            snapshot
+                                .segments
+                                .last()
+                                .and_then(|segment| segment.times.last())
+                                .copied()
+                        })
+                })
+        {
+            return Ok(());
+        }
+        let input = self.live_measurement_input()?;
+        self.live_measurement_last_dispatch = Some(Instant::now());
+        Self::spawn_job(&mut self.live_measurement_worker, move || {
+            LiveMeasurementWorkerResult {
+                end_time: input.end_time,
+                signature: input.signature,
+                result: analyze_segments(&input.segments, &input.specs, input.power.as_ref())
+                    .map_err(|error| error.to_string()),
+            }
+        });
+        Ok(())
+    }
+
+    fn live_measurement_table(&mut self, ui: &mut egui::Ui) {
+        self.poll_live_measurement_worker();
+        if let Err(message) = self.dispatch_live_measurement_worker() {
+            ui.label(message);
+            return;
+        }
+        let signature = self.live_measurement_signature();
+        let Some((result, refresh_age)) = self
+            .live_measurement_cache
+            .as_ref()
+            .filter(|cache| cache.signature == signature)
+            .map(|cache| (cache.result.clone(), cache.updated_at.elapsed()))
+        else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(self.live_text("计算实时测量…", "Calculating Live measurements…"));
+            });
+            ui.ctx().request_repaint_after(Duration::from_millis(20));
+            return;
+        };
+        ui.label(
+            RichText::new(format!(
+                "{} {:.0} ms",
+                self.live_text("刷新于", "Updated"),
+                refresh_age.as_secs_f64() * 1000.0
+            ))
+            .small()
+            .color(Color32::from_gray(150)),
+        );
+        egui::ScrollArea::both().show(ui, |ui| {
+            egui::Grid::new("live_engineering_measurements")
+                .striped(true)
+                .num_columns(10)
+                .spacing([14.0, 5.0])
+                .show(ui, |ui| {
+                    for heading in [
+                        self.live_text("通道", "Channel"),
+                        "Avg",
+                        "RMS",
+                        "+Peak",
+                        "-Peak",
+                        "Abs",
+                        "Pk-Pk",
+                        "Freq",
+                        self.live_text("样点", "Samples"),
+                        self.live_text("质量", "Quality"),
+                    ] {
+                        ui.strong(heading);
+                    }
+                    ui.end_row();
+                    for statistics in &result.channels {
+                        ui.label(&statistics.name);
+                        for value in [
+                            statistics.mean,
+                            statistics.rms,
+                            statistics.positive_peak,
+                            statistics.negative_peak,
+                            statistics.absolute_peak,
+                            statistics.peak_to_peak,
+                        ] {
+                            ui.label(Self::format_measurement_value(value));
+                        }
+                        ui.label(Self::format_measurement_value(
+                            statistics.frequency.as_ref().map(|value| value.hz),
+                        ));
+                        ui.label(statistics.valid_samples.to_string());
+                        ui.label(Self::measurement_quality_label(statistics));
+                        ui.end_row();
+                    }
+                });
+        });
+        if let Some(power) = &result.power {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("3φ");
+                ui.label(format!("P {:.3}", power.active_power));
+                ui.label(format!("Q₁ {:.3}", power.fundamental_reactive_power));
+                ui.label(format!("S {:.3}", power.effective_apparent_power));
+                ui.label(format!(
+                    "PF {}",
+                    Self::format_measurement_value(power.true_power_factor)
+                ));
+                ui.label(&power.power_unit);
+            });
+        }
+        if self.live.connection_state == ConnectionState::Streaming && !self.live.display_paused {
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
+        }
+    }
+
+    fn live_event_table(&mut self, ui: &mut egui::Ui) {
+        let keep_selection_label = self.live_text("保持当前选择", "Keep current selection");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.live.keep_capture_selection, keep_selection_label);
+            let has_pinned = self
+                .live
+                .capture_history
+                .entries()
+                .iter()
+                .any(|entry| entry.pinned);
+            let clear_label = if has_pinned && self.live_confirm_clear_capture_history {
+                self.live_text("确认清除（含固定项）", "Confirm clear including pinned")
+            } else {
+                self.live_text("清除历史", "Clear history")
+            };
+            if ui.button(clear_label).clicked() {
+                if has_pinned && !self.live_confirm_clear_capture_history {
+                    self.live_confirm_clear_capture_history = true;
+                } else {
+                    self.live.capture_history.clear(true);
+                    self.live.last_capture = None;
+                    self.live_confirm_clear_capture_history = false;
+                }
+            }
+        });
+        let entries = self
+            .live
+            .capture_history
+            .entries()
+            .iter()
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>();
+        if !entries.is_empty() {
+            egui::ScrollArea::horizontal().show(ui, |ui| {
+                egui::Grid::new("live_capture_history")
+                    .num_columns(6)
+                    .striped(true)
+                    .spacing([14.0, 5.0])
+                    .show(ui, |ui| {
+                        for heading in ["#", "Pin", "Label", "Sample", "Mode", "Quality"] {
+                            ui.strong(heading);
+                        }
+                        ui.end_row();
+                        for entry in entries {
+                            let selected =
+                                self.live.capture_history.selected_id() == Some(entry.id);
+                            if ui
+                                .selectable_label(selected, entry.id.0.to_string())
+                                .clicked()
+                            {
+                                self.live.capture_history.select(entry.id);
+                                self.live.last_capture = match &entry.payload {
+                                    scope_analyzer::live::capture_history::CapturePayload::InMemory(
+                                        capture,
+                                    ) => Some((**capture).clone()),
+                                    _ => None,
+                                };
+                            }
+                            let mut pinned = entry.pinned;
+                            if ui.checkbox(&mut pinned, "").changed() {
+                                self.live.capture_history.set_pinned(entry.id, pinned);
+                            }
+                            ui.label(&entry.label);
+                            ui.label(entry.trigger_sample_index.to_string());
+                            ui.label(format!("{:?}", entry.trigger_config.mode));
+                            ui.label(if entry.quality.auto_timeout {
+                                "Auto"
+                            } else if entry.quality.incomplete_pre || entry.quality.incomplete_post
+                            {
+                                "Partial"
+                            } else {
+                                "OK"
+                            });
+                            ui.end_row();
+                        }
+                    });
+            });
+            ui.horizontal(|ui| {
+                let previous = ui.button(self.live_text("上一条", "Previous")).clicked();
+                let next = ui.button(self.live_text("下一条", "Next")).clicked();
+                if previous {
+                    self.live.capture_history.select_previous();
+                } else if next {
+                    self.live.capture_history.select_next();
+                }
+                if previous || next {
+                    self.live.last_capture =
+                        self.live.capture_history.selected().and_then(|entry| {
+                            match &entry.payload {
+                                scope_analyzer::live::capture_history::CapturePayload::InMemory(
+                                    capture,
+                                ) => Some((**capture).clone()),
+                                _ => None,
+                            }
+                        });
+                }
+                let remove = ui
+                    .add_enabled(
+                        self.live.capture_history.selected_id().is_some(),
+                        egui::Button::new(self.live_text("删除当前", "Remove selected")),
+                    )
+                    .clicked();
+                if remove {
+                    if let Some(id) = self.live.capture_history.selected_id() {
+                        self.live.capture_history.remove(id);
+                        self.live.last_capture =
+                            self.live.capture_history.selected().and_then(|entry| {
+                                match &entry.payload {
+                                scope_analyzer::live::capture_history::CapturePayload::InMemory(
+                                    capture,
+                                ) => Some((**capture).clone()),
+                                _ => None,
+                            }
+                            });
+                        self.project_dirty = true;
+                    }
+                }
+            });
+            if let Some(entry) = self.live.capture_history.selected().cloned() {
+                let mut label = entry.label;
+                let mut note = entry.note;
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.label(self.live_text("标签", "Label"));
+                    changed |= ui
+                        .add(egui::TextEdit::singleline(&mut label).desired_width(240.0))
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label(self.live_text("备注", "Note"));
+                    changed |= ui
+                        .add(
+                            egui::TextEdit::multiline(&mut note)
+                                .desired_width(420.0)
+                                .desired_rows(2),
+                        )
+                        .changed();
+                });
+                if changed {
+                    self.live
+                        .capture_history
+                        .set_metadata(entry.id, label, note, entry.pinned);
+                    self.project_dirty = true;
+                }
+            }
+            ui.separator();
+        }
         egui::ScrollArea::vertical().show(ui, |ui| {
             egui::Grid::new("live_event_table")
                 .num_columns(3)
@@ -992,6 +1722,13 @@ impl ScopeApp {
                         self.live.history_seconds
                     ));
                     ui.end_row();
+
+                    if let Some(notice) = &self.live_bandwidth_override_notice {
+                        ui.label(self.live_text("带宽策略", "Bandwidth policy"));
+                        ui.label(self.live_text("专家覆盖", "Expert override"));
+                        ui.label(notice);
+                        ui.end_row();
+                    }
 
                     ui.label(self.live_text("触发", "Trigger"));
                     ui.label(if self.live.trigger.is_armed() {
@@ -1128,9 +1865,9 @@ impl ScopeApp {
             .copied()
             .filter(|channel_id| {
                 self.live
-                    .channel_visibility
+                    .channel_presentations
                     .get(channel_id)
-                    .copied()
+                    .map(|presentation| presentation.visible)
                     .unwrap_or(true)
             })
             .collect::<Vec<_>>();
@@ -1142,6 +1879,22 @@ impl ScopeApp {
                 ));
             });
             return;
+        }
+
+        let snapshot_start = snapshot
+            .segments
+            .first()
+            .and_then(|segment| segment.times.first())
+            .copied();
+        let snapshot_end = snapshot
+            .segments
+            .last()
+            .and_then(|segment| segment.times.last())
+            .copied();
+        if !self.live.plot_viewport.initialized {
+            if let (Some(start), Some(end)) = (snapshot_start, snapshot_end) {
+                self.live.plot_viewport.reset_to_range(start, end);
+            }
         }
 
         let trigger_time = self.live_trigger_time();
@@ -1166,19 +1919,24 @@ impl ScopeApp {
                         .as_ref()
                         .and_then(|table| table.channel(channel_id))
                         .cloned();
-                    let name = descriptor
-                        .as_ref()
-                        .map(|channel| channel.name.as_str())
-                        .unwrap_or("-");
+                    let name = self
+                        .live
+                        .channel_presentations
+                        .get(&channel_id)
+                        .map(|presentation| presentation.display_name.as_str())
+                        .or_else(|| descriptor.as_ref().map(|channel| channel.name.as_str()))
+                        .unwrap_or("-")
+                        .to_owned();
                     let unit = descriptor
                         .as_ref()
                         .map(|channel| channel.unit.as_str())
-                        .unwrap_or("");
+                        .unwrap_or("")
+                        .to_owned();
                     let rgba = self
                         .live
-                        .channel_colors
+                        .channel_presentations
                         .get(&channel_id)
-                        .copied()
+                        .map(|presentation| presentation.color)
                         .unwrap_or([80, 140, 220, 255]);
                     let color = Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3]);
                     let latest = snapshot
@@ -1195,7 +1953,7 @@ impl ScopeApp {
                                 egui::vec2(LIVE_CHANNEL_LABEL_WIDTH, row_height),
                                 egui::Layout::top_down(egui::Align::Min),
                                 |ui| {
-                                    ui.colored_label(color, RichText::new(name).strong());
+                                    ui.colored_label(color, RichText::new(&name).strong());
                                     if !unit.is_empty() {
                                         ui.label(
                                             RichText::new(unit)
@@ -1207,9 +1965,9 @@ impl ScopeApp {
                                         RichText::new(format!(
                                             "×{:.3}",
                                             self.live
-                                                .channel_scales
+                                                .channel_presentations
                                                 .get(&channel_id)
-                                                .copied()
+                                                .map(|presentation| presentation.scale)
                                                 .unwrap_or(1.0)
                                         ))
                                         .small()
@@ -1225,7 +1983,7 @@ impl ScopeApp {
                                 },
                             );
                             let is_last = Some(channel_id) == last_visible;
-                            Plot::new(("live_scope_lane", channel_id))
+                            let plot_response = Plot::new(("live_scope_lane", channel_id))
                                 .height(row_height)
                                 .allow_drag(true)
                                 .allow_zoom(true)
@@ -1263,7 +2021,7 @@ impl ScopeApp {
                                         }
                                         let line = Line::new(points).color(color).width(1.4_f32);
                                         if segment_index == 0 {
-                                            plot_ui.line(line.name(name));
+                                            plot_ui.line(line.name(&name));
                                         } else {
                                             plot_ui.line(line);
                                         }
@@ -1275,7 +2033,56 @@ impl ScopeApp {
                                                 .width(1.5_f32),
                                         );
                                     }
+                                    if self.live.plot_viewport.show_cursor_a {
+                                        plot_ui.vline(
+                                            VLine::new(self.live.plot_viewport.cursor_a)
+                                                .color(Color32::from_rgb(238, 76, 82))
+                                                .width(1.3),
+                                        );
+                                    }
+                                    if self.live.plot_viewport.show_cursor_b {
+                                        plot_ui.vline(
+                                            VLine::new(self.live.plot_viewport.cursor_b)
+                                                .color(Color32::from_rgb(89, 181, 255))
+                                                .width(1.3),
+                                        );
+                                    }
                                 });
+                            let bounds = plot_response.transform.bounds();
+                            if bounds.min()[0].is_finite()
+                                && bounds.max()[0].is_finite()
+                                && bounds.max()[0] > bounds.min()[0]
+                            {
+                                self.live.plot_viewport.view_start = bounds.min()[0];
+                                self.live.plot_viewport.view_end = bounds.max()[0];
+                                self.live.plot_viewport.initialized = true;
+                            }
+                            if plot_response.response.clicked() {
+                                if let Some(position) =
+                                    plot_response.response.interact_pointer_pos()
+                                {
+                                    let time =
+                                        plot_response.transform.value_from_position(position).x;
+                                    let cursor = if (time - self.live.plot_viewport.cursor_a).abs()
+                                        <= (time - self.live.plot_viewport.cursor_b).abs()
+                                    {
+                                        CursorId::A
+                                    } else {
+                                        CursorId::B
+                                    };
+                                    match cursor {
+                                        CursorId::A => {
+                                            self.live.plot_viewport.cursor_a = time;
+                                            self.live.plot_viewport.show_cursor_a = true;
+                                        }
+                                        CursorId::B => {
+                                            self.live.plot_viewport.cursor_b = time;
+                                            self.live.plot_viewport.show_cursor_b = true;
+                                        }
+                                    }
+                                    self.live.plot_viewport.active_cursor = cursor;
+                                }
+                            }
                         });
                     });
                 }
@@ -1307,7 +2114,7 @@ impl ScopeApp {
     }
 
     fn live_trigger_time(&self) -> Option<f64> {
-        let capture = self.live.last_capture.as_ref()?;
+        let capture = self.live.selected_trigger_capture()?;
         let timestamp = capture.timestamps.get(capture.trigger_position).copied()?;
         let tick_hz = self.live.hello_ack.as_ref()?.tick_hz;
         Some(timestamp as f64 / tick_hz as f64)
@@ -1326,13 +2133,73 @@ impl ScopeApp {
     fn open_scope_recording(&mut self, path: PathBuf) {
         match scope_analyzer::live::scope_source::ScopeRecordingDataSource::open(&path) {
             Ok(source) => {
+                let trigger_events = source.trigger_records().to_vec();
+                let tick_hz = source.tick_hz();
                 let recent_path = path.clone();
                 self.set_source(Arc::new(source), path, SourceKind::Scope);
+                self.scope_trigger_events = trigger_events;
+                self.scope_trigger_tick_hz = tick_hz;
+                self.selected_scope_trigger = (!self.scope_trigger_events.is_empty()).then_some(0);
                 self.remember_recent_file(&recent_path);
                 self.live.workspace_mode = WorkspaceMode::Offline;
             }
             Err(error) => self.last_error = Some(error.to_string()),
         }
+    }
+
+    fn analyze_live_capture(&mut self) {
+        let live_viewport = self.live.plot_viewport.clone();
+        let Some(snapshot) = self.live.analysis_snapshot() else {
+            self.live.last_error = Some(
+                self.live_text("当前没有可分析的捕获", "No capture is available to analyze")
+                    .to_owned(),
+            );
+            return;
+        };
+        let Some(channel_table) = self.live.channel_table.clone() else {
+            self.live.last_error = Some(
+                self.live_text(
+                    "设备通道表尚不可用",
+                    "The device channel table is unavailable",
+                )
+                .to_owned(),
+            );
+            return;
+        };
+        let source_name = if self.live.selected_trigger_capture().is_some() {
+            self.live_text("实时触发捕获", "Live trigger capture")
+        } else {
+            self.live_text("实时冻结快照", "Live frozen snapshot")
+        };
+        let source =
+            match scope_analyzer::live::snapshot_source::SnapshotDataSource::from_live_snapshot(
+                source_name,
+                snapshot,
+                &channel_table,
+                f64::from(self.live.acquisition.sample_rate_hz),
+                &self.live.channel_presentations,
+            ) {
+                Ok(source) => source,
+                Err(error) => {
+                    self.live.last_error = Some(error.to_string());
+                    return;
+                }
+            };
+
+        self.set_source(
+            Arc::new(source),
+            PathBuf::from(format!("{source_name}.scope")),
+            SourceKind::Scope,
+        );
+        if live_viewport.initialized {
+            self.plot_viewport = live_viewport;
+            self.plot_viewport.set_pane_count(self.scope_pane_count());
+        }
+        self.live.workspace_mode = WorkspaceMode::Offline;
+        self.import_status = Some(self.live_text(
+            "已冻结实时捕获，可使用光标测量、FFT/THD、序分量和导出。",
+            "Live capture frozen. Cursor measurements, FFT/THD, sequence analysis, and export are available.",
+        ).to_owned());
     }
 
     fn apply_live_result(&mut self, result: Result<(), String>) {
@@ -1362,12 +2229,175 @@ impl ScopeApp {
 
 #[cfg(test)]
 mod tests {
-    use super::ScopeApp;
+    use super::{ScopeApp, WorkspaceMode};
+    use scope_analyzer::{
+        live::{
+            protocol::{ChannelDescriptor, ChannelKind, ChannelTable, HelloAck, WireFormat},
+            trigger::TriggerCapture,
+        },
+        plot_viewport::PlotViewport,
+        presentation::ChannelPresentation,
+    };
 
     #[test]
     fn compact_rate_keeps_toolbar_summary_short() {
         assert_eq!(ScopeApp::compact_rate(500), "0.5");
         assert_eq!(ScopeApp::compact_rate(100_000), "100");
         assert_eq!(ScopeApp::compact_rate(1_000_000), "1 M");
+    }
+
+    #[test]
+    fn critical_bandwidth_override_is_consumed_once() {
+        let mut enabled = true;
+        assert!(ScopeApp::consume_bandwidth_expert_override(
+            true,
+            &mut enabled
+        ));
+        assert!(!enabled);
+        assert!(!ScopeApp::consume_bandwidth_expert_override(
+            true,
+            &mut enabled
+        ));
+    }
+
+    #[test]
+    fn trigger_capture_enters_mainline_analysis_and_export_with_shared_presentation() {
+        let sample_rate_hz = 1_000_u32;
+        let sample_count = 256_usize;
+        let channel_ids = vec![0, 1, 2];
+        let channels = (0..3)
+            .map(|phase| {
+                (0..sample_count)
+                    .map(|index| {
+                        let angle = std::f32::consts::TAU * 50.0 * index as f32
+                            / sample_rate_hz as f32
+                            - std::f32::consts::TAU * phase as f32 / 3.0;
+                        angle.sin()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut app = ScopeApp::new_for_test();
+        app.scope_layout_cols = 2;
+        app.live.acquisition.sample_rate_hz = sample_rate_hz;
+        app.live.hello_ack = Some(HelloAck {
+            device_capabilities: 0,
+            max_payload: 1_048_576,
+            tick_hz: u64::from(sample_rate_hz),
+            channel_count: 3,
+            max_batch_samples: 512,
+            device_id: [7; 16],
+            firmware_name: "capture-test".to_owned(),
+        });
+        app.live.channel_table = Some(ChannelTable {
+            revision: 1,
+            channels: channel_ids
+                .iter()
+                .map(|channel_id| ChannelDescriptor {
+                    channel_id: *channel_id,
+                    kind: ChannelKind::Analog,
+                    wire_format: WireFormat::F32,
+                    scale: 1.0,
+                    offset: 0.0,
+                    unit: "V".to_owned(),
+                    name: format!("source-{channel_id}"),
+                })
+                .collect(),
+        });
+        for (index, channel_id) in channel_ids.iter().copied().enumerate() {
+            app.live.channel_presentations.insert(
+                channel_id,
+                ChannelPresentation {
+                    display_name: format!("Phase {}", ['A', 'B', 'C'][index]),
+                    color: [20 + index as u8 * 50, 80, 180, 255],
+                    visible: true,
+                    scale: 2.0,
+                    pane: usize::from(index > 0),
+                },
+            );
+        }
+        app.live.last_capture = Some(TriggerCapture {
+            channel_ids,
+            sample_indices: (0..sample_count as u64).collect(),
+            timestamps: (0..sample_count as u64).collect(),
+            channels,
+            trigger_position: sample_count / 2,
+            auto_timeout: false,
+        });
+        app.live.plot_viewport = PlotViewport::default();
+        app.live
+            .plot_viewport
+            .reset_to_range(0.0, (sample_count - 1) as f64 / sample_rate_hz as f64);
+
+        let live_rms = app.refresh_live_measurements().unwrap().channels[0]
+            .rms
+            .unwrap();
+        app.live_measurement_cache = None;
+        app.live_measurement_last_dispatch = None;
+        app.dispatch_live_measurement_worker().unwrap();
+        app.live.channel_presentations.get_mut(&0).unwrap().scale = 3.0;
+        while app
+            .live_measurement_worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        app.poll_live_measurement_worker();
+        assert!(app.live_measurement_cache.is_none());
+        app.live.channel_presentations.get_mut(&0).unwrap().scale = 2.0;
+        app.live_measurement_last_dispatch = None;
+        app.dispatch_live_measurement_worker().unwrap();
+        while app
+            .live_measurement_worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        app.poll_live_measurement_worker();
+        assert!(app.live_measurement_cache.is_some());
+
+        app.analyze_live_capture();
+
+        assert_eq!(app.live.workspace_mode, WorkspaceMode::Offline);
+        assert_eq!(app.display_names, vec!["Phase A", "Phase B", "Phase C"]);
+        assert_eq!(app.channel_scales, vec![2.0, 2.0, 2.0]);
+        assert_eq!(app.channel_panes, vec![0, 1, 1]);
+        let source = app.source.clone().expect("snapshot source");
+        let block = source
+            .read_range(0.0, 0.255, &[0, 1, 2], sample_count)
+            .unwrap();
+        let measurement = ScopeApp::auto_measure(&block.times, &block.channels[0]).unwrap();
+        assert!(measurement.statistics.max.is_some_and(|value| value > 0.9));
+        assert!(measurement.statistics.min.is_some_and(|value| value < -0.9));
+        let offline_rms =
+            ScopeApp::auto_measure_segments(&[block.clone()], &[(0, app.channel_scales[0])], None)
+                .unwrap()
+                .rows[0]
+                .1
+                .statistics
+                .rms
+                .unwrap();
+        assert!((live_rms - offline_rms).abs() < 1.0e-6);
+        let fft = crate::fft::analyze(
+            "Phase A".to_owned(),
+            &block.channels[0],
+            f64::from(sample_rate_hz),
+            50.0,
+            10,
+        )
+        .unwrap();
+        assert!(fft.thd_percent < 1.0);
+        let sequence = app.sequence_result().unwrap();
+        assert!(sequence.positive.amplitude > sequence.negative.amplitude * 10.0);
+
+        let plot_data = ScopeApp::load_plot_data(source, 0.0, 0.255, &[0, 1, 2], 3, 900.0).unwrap();
+        app.apply_plot_job_data(plot_data, None);
+        app.needs_plot_reload = false;
+        app.needs_compare_plot_reload = false;
+        app.export_waveform_png();
+        assert!(app.show_export_preview);
+        assert!(app.export_preview_dirty);
     }
 }

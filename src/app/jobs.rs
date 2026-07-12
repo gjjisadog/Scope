@@ -109,6 +109,7 @@ impl ScopeApp {
             || self.derived_curve_worker.is_some()
             || self.derived_measurement_worker.is_some()
             || self.import_worker.is_some()
+            || self.project_save_worker.is_some()
     }
 }
 

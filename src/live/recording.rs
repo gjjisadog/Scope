@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -11,9 +12,15 @@ use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::presentation::ChannelPresentation;
+
 use super::{
     buffer::{GapReason, LiveGap},
-    protocol::{crc32c, decode_sample_frame, ChannelTable, Frame, ProtocolError},
+    protocol::{
+        crc32c, decode_sample_frame, ChannelDescriptor, ChannelTable, Frame, Message,
+        ProtocolError, SampleBatch, WireFormat, MAX_BATCH_SAMPLES, MAX_PAYLOAD_LEN,
+        MSG_SAMPLE_BATCH,
+    },
     trigger::{TriggerCapture, TriggerConfig, TriggerEdge, TriggerEngine, TriggerMode},
 };
 
@@ -44,6 +51,8 @@ pub struct RecordingMetadata {
     pub batch_samples: u16,
     pub channel_mask: u64,
     pub client_version: String,
+    #[serde(default)]
+    pub channel_presentations: BTreeMap<u16, ChannelPresentation>,
 }
 
 impl RecordingMetadata {
@@ -55,6 +64,14 @@ impl RecordingMetadata {
             return format_error("recording acquisition parameters must be non-zero");
         }
         self.channel_table.validate()?;
+        if self.channel_presentations.keys().any(|channel_id| {
+            self.channel_table.channel(*channel_id).is_none()
+                || self.channel_mask & (1_u64 << channel_id) == 0
+        }) {
+            return format_error(
+                "recording channel presentations must reference selected table channels",
+            );
+        }
         if !self
             .channel_table
             .channels
@@ -121,6 +138,8 @@ pub enum RecordingError {
     WorkerFailed(String),
     #[error("scope recording worker panicked")]
     WorkerPanicked,
+    #[error("scope recording write cancelled")]
+    Cancelled,
 }
 
 pub struct ScopeWriter {
@@ -293,6 +312,243 @@ impl ScopeWriter {
         file.write_all(&checksum.to_le_bytes())?;
         Ok(offset)
     }
+}
+
+pub struct CaptureScopeContext<'a> {
+    pub source_table: &'a ChannelTable,
+    pub channel_presentations: &'a BTreeMap<u16, ChannelPresentation>,
+    pub tick_hz: u64,
+    pub sample_rate_hz: u32,
+    pub client_version: &'a str,
+}
+
+pub fn write_capture_scope_file(
+    path: &Path,
+    capture: &TriggerCapture,
+    config: &TriggerConfig,
+    context: CaptureScopeContext<'_>,
+) -> Result<(), RecordingError> {
+    write_capture_scope_file_with_cancel(path, capture, config, context, || false)
+}
+
+pub fn write_capture_scope_file_with_cancel<F>(
+    path: &Path,
+    capture: &TriggerCapture,
+    config: &TriggerConfig,
+    context: CaptureScopeContext<'_>,
+    mut is_cancelled: F,
+) -> Result<(), RecordingError>
+where
+    F: FnMut() -> bool,
+{
+    let CaptureScopeContext {
+        source_table,
+        channel_presentations,
+        tick_hz,
+        sample_rate_hz,
+        client_version,
+    } = context;
+    if is_cancelled() {
+        return Err(RecordingError::Cancelled);
+    }
+    if path.exists() {
+        return Ok(());
+    }
+    let sample_count = capture.sample_indices.len();
+    if sample_count == 0
+        || capture.timestamps.len() != sample_count
+        || capture.channels.len() != capture.channel_ids.len()
+        || capture
+            .channels
+            .iter()
+            .any(|channel| channel.len() != sample_count)
+    {
+        return format_error("capture columns are empty or unaligned");
+    }
+    let channels = capture
+        .channel_ids
+        .iter()
+        .map(|channel_id| {
+            let source = source_table.channel(*channel_id).ok_or_else(|| {
+                RecordingError::InvalidFormat(format!(
+                    "capture channel {channel_id} is absent from the source table"
+                ))
+            })?;
+            Ok(ChannelDescriptor {
+                channel_id: *channel_id,
+                kind: source.kind,
+                wire_format: WireFormat::F32,
+                scale: 1.0,
+                offset: 0.0,
+                unit: source.unit.clone(),
+                name: source.name.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, RecordingError>>()?;
+    let channel_table = ChannelTable {
+        revision: source_table.revision.max(1),
+        channels,
+    };
+    let channel_mask = capture
+        .channel_ids
+        .iter()
+        .fold(0_u64, |mask, channel_id| mask | (1_u64 << channel_id));
+    let bytes_per_sample = capture
+        .channel_ids
+        .len()
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| RecordingError::InvalidFormat("capture size overflow".to_owned()))?;
+    let fixed_payload = 20_usize + capture.channel_ids.len() * 2;
+    let payload_batch_limit = MAX_PAYLOAD_LEN
+        .saturating_sub(fixed_payload)
+        .checked_div(bytes_per_sample)
+        .unwrap_or(0);
+    let batch_samples = MAX_BATCH_SAMPLES
+        .min(payload_batch_limit)
+        .min(usize::from(u16::MAX));
+    if batch_samples == 0 {
+        return format_error("capture channel set cannot fit in an SCP1 SampleBatch");
+    }
+    let metadata = RecordingMetadata {
+        device_id: "scope-capture-asset".to_owned(),
+        firmware_name: "Scope Analyzer".to_owned(),
+        tick_hz,
+        channel_table,
+        sample_rate_hz,
+        batch_samples: u16::try_from(batch_samples)
+            .map_err(|_| RecordingError::InvalidFormat("batch size overflow".to_owned()))?,
+        channel_mask,
+        client_version: client_version.to_owned(),
+        channel_presentations: channel_presentations
+            .iter()
+            .filter(|(channel_id, _)| capture.channel_ids.contains(channel_id))
+            .map(|(channel_id, presentation)| (*channel_id, presentation.clone()))
+            .collect(),
+    };
+    let temporary = path.with_extension("scope.tmp");
+    let result = (|| {
+        let mut writer = ScopeWriter::create(&temporary, metadata)?;
+        let sample_period_ticks = capture
+            .timestamps
+            .windows(2)
+            .next()
+            .and_then(|pair| u32::try_from(pair[1].saturating_sub(pair[0])).ok())
+            .filter(|period| *period > 0)
+            .unwrap_or_else(|| {
+                u32::try_from((tick_hz / u64::from(sample_rate_hz.max(1))).max(1))
+                    .unwrap_or(u32::MAX)
+            });
+        for (sequence, start) in (0..sample_count).step_by(batch_samples).enumerate() {
+            if is_cancelled() {
+                return Err(RecordingError::Cancelled);
+            }
+            let end = (start + batch_samples).min(sample_count);
+            let mut sample_data = Vec::with_capacity((end - start) * bytes_per_sample);
+            for sample in start..end {
+                for channel in &capture.channels {
+                    sample_data.extend_from_slice(&channel[sample].to_le_bytes());
+                }
+            }
+            let message = Message::SampleBatch(SampleBatch {
+                channel_table_revision: source_table.revision.max(1),
+                first_sample_index: capture.sample_indices[start],
+                sample_period_ticks,
+                sample_count: u16::try_from(end - start).map_err(|_| {
+                    RecordingError::InvalidFormat("capture chunk is too large".to_owned())
+                })?,
+                channel_ids: capture.channel_ids.clone(),
+                sample_data,
+            });
+            let frame = Frame::new(
+                MSG_SAMPLE_BATCH,
+                0,
+                u32::try_from(sequence + 1).unwrap_or(u32::MAX),
+                1,
+                capture.timestamps[start],
+                message.encode_payload()?,
+            );
+            writer.write_sample_frame(&frame)?;
+        }
+        if is_cancelled() {
+            return Err(RecordingError::Cancelled);
+        }
+        writer.write_trigger(capture, config)?;
+        writer.finish()
+    })();
+    match result {
+        Ok(()) => {
+            std::fs::rename(&temporary, path)?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
+}
+
+pub struct LoadedCaptureAsset {
+    pub capture: TriggerCapture,
+    pub config: TriggerConfig,
+    pub metadata: RecordingMetadata,
+}
+
+pub fn read_capture_scope_file(path: &Path) -> Result<LoadedCaptureAsset, RecordingError> {
+    let recording = ScopeRecording::open(path)?;
+    let trigger =
+        recording.triggers().first().cloned().ok_or_else(|| {
+            RecordingError::InvalidFormat("capture asset has no trigger".to_owned())
+        })?;
+    let mut channel_ids = Vec::new();
+    let mut sample_indices = Vec::new();
+    let mut timestamps = Vec::new();
+    let mut channels: Vec<Vec<f32>> = Vec::new();
+    for record in recording.sample_records() {
+        let frame = recording.read_sample_frame(record)?;
+        let decoded = decode_sample_frame(&frame, &recording.metadata().channel_table)?;
+        if channel_ids.is_empty() {
+            channel_ids = decoded.channel_ids.clone();
+            channels = decoded.channels.iter().map(|_| Vec::new()).collect();
+        } else if channel_ids != decoded.channel_ids {
+            return format_error("capture asset changes channel order between batches");
+        }
+        for offset in 0..decoded.channels.first().map(Vec::len).unwrap_or(0) {
+            sample_indices.push(
+                decoded
+                    .first_sample_index
+                    .saturating_add(u64::try_from(offset).unwrap_or(u64::MAX)),
+            );
+            timestamps.push(
+                decoded.timestamp_ticks.saturating_add(
+                    u64::from(decoded.sample_period_ticks)
+                        .saturating_mul(u64::try_from(offset).unwrap_or(u64::MAX)),
+                ),
+            );
+        }
+        for (target, values) in channels.iter_mut().zip(decoded.channels) {
+            target.extend(values);
+        }
+    }
+    let trigger_position = sample_indices
+        .iter()
+        .position(|sample| *sample == trigger.trigger_sample_index)
+        .ok_or_else(|| {
+            RecordingError::InvalidFormat(
+                "capture asset trigger sample is absent from sample data".to_owned(),
+            )
+        })?;
+    Ok(LoadedCaptureAsset {
+        capture: TriggerCapture {
+            channel_ids,
+            sample_indices,
+            timestamps,
+            channels,
+            trigger_position,
+            auto_timeout: trigger.auto_timeout,
+        },
+        config: trigger.config,
+        metadata: recording.metadata().clone(),
+    })
 }
 
 impl Drop for ScopeWriter {
@@ -1000,6 +1256,17 @@ mod tests {
     }
 
     fn metadata() -> RecordingMetadata {
+        let mut channel_presentations = BTreeMap::new();
+        channel_presentations.insert(
+            0,
+            ChannelPresentation {
+                display_name: "Phase A".to_owned(),
+                color: [12, 34, 56, 255],
+                visible: true,
+                scale: 2.5,
+                pane: 1,
+            },
+        );
         RecordingMetadata {
             device_id: "sim-1".to_owned(),
             firmware_name: "scope-sim".to_owned(),
@@ -1020,6 +1287,7 @@ mod tests {
             batch_samples: 2,
             channel_mask: 1,
             client_version: "0.8.0-test".to_owned(),
+            channel_presentations,
         }
     }
 
@@ -1107,6 +1375,16 @@ mod tests {
         let source = ScopeRecordingDataSource::open(&path).unwrap();
         assert_eq!(source.metadata().sample_count, 4);
         assert_eq!(source.metadata().channels[0].name, "Ua");
+        assert_eq!(
+            source.channel_presentation(0),
+            Some(ChannelPresentation {
+                display_name: "Phase A".to_owned(),
+                color: [12, 34, 56, 255],
+                visible: true,
+                scale: 2.5,
+                pane: 1,
+            })
+        );
         let block = source.read_range(0.0, 0.3, &[0], 10).unwrap();
         assert_eq!(block.channels[0], vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(block.times, vec![0.0, 0.1, 0.2, 0.3]);
@@ -1122,6 +1400,108 @@ mod tests {
             .is_err());
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn companion_capture_writer_creates_replayable_scope_v1() {
+        let path = unique_path("capture_asset");
+        let metadata = metadata();
+        write_capture_scope_file(
+            &path,
+            &trigger_capture(),
+            &trigger_config(),
+            CaptureScopeContext {
+                source_table: &metadata.channel_table,
+                channel_presentations: &metadata.channel_presentations,
+                tick_hz: metadata.tick_hz,
+                sample_rate_hz: metadata.sample_rate_hz,
+                client_version: "0.11.0-test",
+            },
+        )
+        .unwrap();
+
+        let recording = ScopeRecording::open(&path).unwrap();
+        assert!(recording.clean_end());
+        assert_eq!(recording.triggers().len(), 1);
+        assert_eq!(recording.sample_records().len(), 1);
+        let loaded = read_capture_scope_file(&path).unwrap();
+        assert_eq!(loaded.capture, trigger_capture());
+        assert_eq!(loaded.config, trigger_config());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cancelled_companion_capture_write_removes_partial_asset() {
+        let path = unique_path("cancelled_capture_asset");
+        let metadata = metadata();
+        let sample_count = 10_000;
+        let capture = TriggerCapture {
+            channel_ids: vec![0],
+            sample_indices: (0..sample_count as u64).collect(),
+            timestamps: (0..sample_count as u64)
+                .map(|sample| sample * 100)
+                .collect(),
+            channels: vec![vec![1.0; sample_count]],
+            trigger_position: sample_count / 2,
+            auto_timeout: false,
+        };
+        let mut cancellation_checks = 0;
+        let error = write_capture_scope_file_with_cancel(
+            &path,
+            &capture,
+            &trigger_config(),
+            CaptureScopeContext {
+                source_table: &metadata.channel_table,
+                channel_presentations: &metadata.channel_presentations,
+                tick_hz: metadata.tick_hz,
+                sample_rate_hz: metadata.sample_rate_hz,
+                client_version: "0.11.0-test",
+            },
+            || {
+                cancellation_checks += 1;
+                cancellation_checks >= 3
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, RecordingError::Cancelled));
+        assert!(!path.exists());
+        assert!(!path.with_extension("scope.tmp").exists());
+    }
+
+    #[test]
+    fn scope_data_source_keeps_sample_index_gaps_segmented_for_plot_and_export() {
+        let path = unique_path("segmented_gap");
+        let mut writer = ScopeWriter::create(&path, metadata()).unwrap();
+        writer
+            .write_sample_frame(&sample_frame(1, 0, 0, &[1, 2]))
+            .unwrap();
+        writer
+            .write_sample_frame(&sample_frame(2, 4, 400, &[5, 6]))
+            .unwrap();
+        writer.finish().unwrap();
+
+        let source = ScopeRecordingDataSource::open(&path).unwrap();
+        let segments = source.read_range_segments(0.0, 0.5, &[0], 10).unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].times, vec![0.0, 0.1]);
+        assert_eq!(segments[1].times, vec![0.4, 0.5]);
+        assert_eq!(segments[0].channels[0], vec![1.0, 2.0]);
+        assert_eq!(segments[1].channels[0], vec![5.0, 6.0]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_recording_metadata_without_presentations_remains_readable() {
+        let mut value = serde_json::to_value(metadata()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("channel_presentations");
+        let decoded: RecordingMetadata = serde_json::from_value(value).unwrap();
+        assert!(decoded.channel_presentations.is_empty());
+        decoded.validate().unwrap();
     }
 
     #[test]

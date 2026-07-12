@@ -1,9 +1,12 @@
+pub mod bandwidth;
 pub mod buffer;
+pub mod capture_history;
 pub mod protocol;
 pub mod recording;
 pub mod scope_source;
 pub mod session;
 pub mod simulator;
+pub mod snapshot_source;
 pub mod state;
 pub mod transport;
 pub mod trigger;

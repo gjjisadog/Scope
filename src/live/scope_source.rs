@@ -80,18 +80,26 @@ impl ScopeRecordingDataSource {
         })
     }
 
+    pub fn trigger_records(&self) -> &[super::recording::TriggerRecord] {
+        self.recording.triggers()
+    }
+
+    pub fn tick_hz(&self) -> u64 {
+        self.recording.metadata().tick_hz
+    }
+
     fn record_end_ticks(
         record: &super::recording::SampleRecordIndex,
     ) -> Result<u64, RecordingError> {
         record.last_timestamp_ticks()
     }
 
-    fn read_full_range(
+    fn read_full_segments(
         &self,
         start_time: f64,
         end_time: f64,
         channels: &[usize],
-    ) -> DataResult<SampleBlock> {
+    ) -> DataResult<Vec<SampleBlock>> {
         if channels
             .iter()
             .any(|channel| *channel >= self.selected_channel_ids.len())
@@ -109,6 +117,8 @@ impl ScopeRecordingDataSource {
             times: Vec::new(),
             channels: channels.iter().map(|_| Vec::new()).collect(),
         };
+        let mut blocks = Vec::new();
+        let mut last_sample_index = None;
         let tick_hz = self.recording.metadata().tick_hz as f64;
         for record in self.recording.sample_records() {
             let record_start = record.timestamp_ticks as f64 / tick_hz;
@@ -140,13 +150,30 @@ impl ScopeRecordingDataSource {
                 if time < start_time || time > end_time {
                     continue;
                 }
+                let sample_index = decoded.first_sample_index + sample_offset as u64;
+                if last_sample_index
+                    .is_some_and(|previous: u64| previous.checked_add(1) != Some(sample_index))
+                    && !block.times.is_empty()
+                {
+                    blocks.push(std::mem::replace(
+                        &mut block,
+                        SampleBlock {
+                            times: Vec::new(),
+                            channels: channels.iter().map(|_| Vec::new()).collect(),
+                        },
+                    ));
+                }
                 block.times.push(time);
                 for (output, position) in block.channels.iter_mut().zip(&positions) {
                     output.push(decoded.channels[*position][sample_offset]);
                 }
+                last_sample_index = Some(sample_index);
             }
         }
-        Ok(block)
+        if !block.times.is_empty() {
+            blocks.push(block);
+        }
+        Ok(blocks)
     }
 
     fn decimate(block: SampleBlock, max_points: usize) -> SampleBlock {
@@ -174,6 +201,57 @@ impl ScopeRecordingDataSource {
                 .collect(),
         }
     }
+
+    fn decimate_segments(mut blocks: Vec<SampleBlock>, max_points: usize) -> Vec<SampleBlock> {
+        if blocks.is_empty() || max_points == 0 {
+            return Vec::new();
+        }
+        if blocks.len() > max_points {
+            blocks = blocks.split_off(blocks.len() - max_points);
+        }
+        let total_samples = blocks.iter().map(|block| block.times.len()).sum::<usize>();
+        if total_samples <= max_points {
+            return blocks;
+        }
+        let block_count = blocks.len();
+        let mut remaining_budget = max_points;
+        let mut remaining_samples = total_samples;
+        blocks
+            .into_iter()
+            .enumerate()
+            .map(|(index, block)| {
+                let remaining_blocks = block_count - index;
+                let reserved = remaining_blocks.saturating_sub(1);
+                let budget = block
+                    .times
+                    .len()
+                    .saturating_mul(remaining_budget)
+                    .div_ceil(remaining_samples.max(1))
+                    .max(1)
+                    .min(remaining_budget.saturating_sub(reserved).max(1));
+                remaining_budget = remaining_budget.saturating_sub(budget);
+                remaining_samples = remaining_samples.saturating_sub(block.times.len());
+                Self::decimate(block, budget)
+            })
+            .collect()
+    }
+
+    fn flatten(blocks: Vec<SampleBlock>, channel_count: usize) -> SampleBlock {
+        let sample_count = blocks.iter().map(|block| block.times.len()).sum();
+        let mut flattened = SampleBlock {
+            times: Vec::with_capacity(sample_count),
+            channels: (0..channel_count)
+                .map(|_| Vec::with_capacity(sample_count))
+                .collect(),
+        };
+        for block in blocks {
+            flattened.times.extend(block.times);
+            for (target, source) in flattened.channels.iter_mut().zip(block.channels) {
+                target.extend(source);
+            }
+        }
+        flattened
+    }
 }
 
 impl DataSource for ScopeRecordingDataSource {
@@ -185,6 +263,21 @@ impl DataSource for ScopeRecordingDataSource {
         &self.metadata
     }
 
+    fn channel_presentation(
+        &self,
+        channel_index: usize,
+    ) -> Option<crate::presentation::ChannelPresentation> {
+        self.selected_channel_ids
+            .get(channel_index)
+            .and_then(|channel_id| {
+                self.recording
+                    .metadata()
+                    .channel_presentations
+                    .get(channel_id)
+            })
+            .cloned()
+    }
+
     fn read_range(
         &self,
         start_time: f64,
@@ -192,8 +285,19 @@ impl DataSource for ScopeRecordingDataSource {
         channels: &[usize],
         max_points: usize,
     ) -> DataResult<SampleBlock> {
-        let block = self.read_full_range(start_time, end_time, channels)?;
-        Ok(Self::decimate(block, max_points))
+        let blocks = self.read_range_segments(start_time, end_time, channels, max_points)?;
+        Ok(Self::flatten(blocks, channels.len()))
+    }
+
+    fn read_range_segments(
+        &self,
+        start_time: f64,
+        end_time: f64,
+        channels: &[usize],
+        max_points: usize,
+    ) -> DataResult<Vec<SampleBlock>> {
+        let blocks = self.read_full_segments(start_time, end_time, channels)?;
+        Ok(Self::decimate_segments(blocks, max_points))
     }
 
     fn summarize_range(
@@ -203,7 +307,10 @@ impl DataSource for ScopeRecordingDataSource {
         channels: &[usize],
         target_bins: usize,
     ) -> DataResult<RangeSummary> {
-        let block = self.read_full_range(start_time, end_time, channels)?;
+        let block = Self::flatten(
+            self.read_full_segments(start_time, end_time, channels)?,
+            channels.len(),
+        );
         Ok(RangeSummary::from_samples(
             &block,
             channels.len(),

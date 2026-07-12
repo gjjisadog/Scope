@@ -1,7 +1,8 @@
 use std::{
-    collections::HashSet,
+    collections::{hash_map::DefaultHasher, HashSet},
     env,
     fs::{self, File, OpenOptions},
+    hash::{Hash, Hasher},
     io::{BufWriter, Write},
     ops::RangeInclusive,
     panic::{self, AssertUnwindSafe},
@@ -35,11 +36,18 @@ use crate::{
     svg_export::SvgCanvas,
     transforms,
 };
+use scope_analyzer::measurements::{
+    analyze_segments, ChannelMeasurementSpec, ChannelStatistics, EngineeringMeasurementResult,
+    ThreePhasePower, ThreePhasePowerSpec,
+};
+use scope_analyzer::plot_viewport::{CursorId, PlotViewport};
+use scope_analyzer::project as project_file;
 
 mod export;
 mod jobs;
 mod live_ui;
 mod plot;
+mod project_io;
 mod state;
 
 use export::{
@@ -317,8 +325,6 @@ enum UiText {
     NoChannelsSelected,
     CalculatingMeasurements,
     Channel,
-    Min,
-    Max,
     SamplesPrefix,
     Sequence,
     SequenceNeedsThreeAnalogChannels,
@@ -609,10 +615,6 @@ impl UiText {
             (CalculatingMeasurements, Language::En) => "Calculating measurements...",
             (Channel, Language::Zh) => "通道",
             (Channel, Language::En) => "Channel",
-            (Min, Language::Zh) => "最小",
-            (Min, Language::En) => "Min",
-            (Max, Language::Zh) => "最大",
-            (Max, Language::En) => "Max",
             (SamplesPrefix, Language::Zh) => "样本数:",
             (SamplesPrefix, Language::En) => "Samples:",
             (Sequence, Language::Zh) => "正负序",
@@ -1437,8 +1439,12 @@ struct RecentFiles {
 struct AutoMeasurement {
     first: f32,
     last: f32,
-    min: f32,
-    max: f32,
+    statistics: ChannelStatistics,
+}
+
+struct MeasurementBatch {
+    rows: Vec<(usize, AutoMeasurement)>,
+    power: Option<ThreePhasePower>,
 }
 
 #[derive(Clone, Debug)]
@@ -1448,6 +1454,60 @@ struct MeasurementCache {
     end: f64,
     channels: Vec<usize>,
     rows: Vec<(usize, AutoMeasurement)>,
+    power: Option<ThreePhasePower>,
+    power_voltage_channels: [usize; 3],
+    power_current_channels: [usize; 3],
+}
+
+#[derive(Clone, Debug)]
+struct LiveMeasurementCache {
+    updated_at: Instant,
+    end_time: Option<f64>,
+    result: EngineeringMeasurementResult,
+    signature: u64,
+}
+
+struct LiveMeasurementWorkerResult {
+    end_time: Option<f64>,
+    result: Result<EngineeringMeasurementResult, String>,
+    signature: u64,
+}
+
+struct LiveMeasurementInput {
+    end_time: Option<f64>,
+    segments: Vec<SampleBlock>,
+    specs: Vec<ChannelMeasurementSpec>,
+    power: Option<ThreePhasePowerSpec>,
+    signature: u64,
+}
+
+struct ProjectCaptureSaveSpec {
+    capture: Arc<scope_analyzer::live::trigger::TriggerCapture>,
+    trigger_config: scope_analyzer::live::trigger::TriggerConfig,
+    id: scope_analyzer::live::capture_history::CaptureId,
+    label: String,
+    note: String,
+    pinned: bool,
+    selected: bool,
+}
+
+struct ProjectSaveInput {
+    path: PathBuf,
+    asset_project_path: PathBuf,
+    document: project_file::ScopeProjectDocument,
+    captures: Vec<ProjectCaptureSaveSpec>,
+    channel_table: Option<scope_analyzer::live::protocol::ChannelTable>,
+    channel_presentations:
+        std::collections::BTreeMap<u16, scope_analyzer::presentation::ChannelPresentation>,
+    tick_hz: u64,
+    sample_rate_hz: u32,
+    autosave: bool,
+}
+
+struct ProjectSaveWorkerResult {
+    path: PathBuf,
+    autosave: bool,
+    result: Result<(), String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1528,6 +1588,9 @@ struct MeasurementJobKey {
     start: f64,
     end: f64,
     channels: Vec<usize>,
+    power_enabled: bool,
+    power_voltage_channels: [usize; 3],
+    power_current_channels: [usize; 3],
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1556,8 +1619,8 @@ struct ExportCurve<'a> {
     label: String,
     color: Color32,
     width: i32,
-    points: &'a [PlotPoint],
-    low_points: Option<&'a [PlotPoint]>,
+    segments: Vec<&'a [PlotPoint]>,
+    low_segments: Vec<&'a [PlotPoint]>,
 }
 
 struct PendingExportPaneLabels<'a> {
@@ -1796,7 +1859,10 @@ struct MeasurementJobResult {
     start: f64,
     end: f64,
     channels: Vec<usize>,
-    result: Result<Vec<(usize, AutoMeasurement)>, String>,
+    power_enabled: bool,
+    power_voltage_channels: [usize; 3],
+    power_current_channels: [usize; 3],
+    result: Result<MeasurementBatch, String>,
 }
 
 struct SequenceJobResult {
@@ -1849,12 +1915,6 @@ struct SummaryEnvelopeSeries {
     high: Arc<[PlotPoint]>,
     low: Arc<[PlotPoint]>,
     bounds: Option<(f64, f64)>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CursorId {
-    A,
-    B,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2195,6 +2255,22 @@ impl ScopeApp {
         let recent_display_configs = Self::load_recent_configs(ConfigSection::Display);
         let recent_shortcut_configs = Self::load_recent_configs(ConfigSection::Shortcut);
         let recent_dataset_configs = Self::load_recent_configs(ConfigSection::Dataset);
+        Self::from_recent_state(
+            recent_files,
+            recent_name_configs,
+            recent_display_configs,
+            recent_shortcut_configs,
+            recent_dataset_configs,
+        )
+    }
+
+    fn from_recent_state(
+        recent_files: Vec<PathBuf>,
+        recent_name_configs: Vec<PathBuf>,
+        recent_display_configs: Vec<PathBuf>,
+        recent_shortcut_configs: Vec<PathBuf>,
+        recent_dataset_configs: Vec<PathBuf>,
+    ) -> Self {
         Self {
             live: Self::default_live_state(),
             source: None,
@@ -2219,22 +2295,12 @@ impl ScopeApp {
             derived_panes: vec![0; DERIVED_CHANNEL_COUNT],
             repid_derived_curves: Vec::new(),
             pll_sync_source: PllSyncSource::Voltage,
-            active_scope_pane: 0,
+            plot_viewport: PlotViewport::default(),
             hovered_channel: None,
-            view_start: 0.0,
-            view_end: 1.0,
-            y_min: None,
-            y_max: None,
-            pane_y_bounds: Vec::new(),
             pane_y_bounds_cache_key: None,
             pane_y_bounds_cache: Vec::new(),
             pane_prepared_plot_cache_key: None,
             pane_prepared_plot_cache: PanePreparedPlotCache::default(),
-            cursor_a: 0.25,
-            cursor_b: 0.75,
-            show_cursor_a: true,
-            show_cursor_b: true,
-            active_cursor: CursorId::A,
             channel_filter: String::new(),
             show_help: false,
             show_options: false,
@@ -2246,6 +2312,27 @@ impl ScopeApp {
             live_inspector_tab: 0,
             live_bottom_tab: 0,
             live_channel_filter: String::new(),
+            live_bandwidth_expert_override: false,
+            live_bandwidth_override_notice: None,
+            live_measurement_cache: None,
+            live_measurement_worker: None,
+            live_measurement_last_dispatch: None,
+            live_confirm_clear_capture_history: false,
+            scope_trigger_events: Vec::new(),
+            scope_trigger_tick_hz: 0,
+            selected_scope_trigger: None,
+            project_path: None,
+            project_id: format!(
+                "project-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            ),
+            project_dirty: false,
+            project_last_autosave: Instant::now(),
+            project_save_worker: None,
+            project_save_cancel: None,
             show_export_preview: false,
             show_batch_export: false,
             export_preview_dirty: false,
@@ -2362,6 +2449,9 @@ impl ScopeApp {
             fft_channel_user_selected: false,
             sequence_channels: [0, 1, 2],
             sequence_channels_user_selected: false,
+            power_enabled: false,
+            power_voltage_channels: [0, 1, 2],
+            power_current_channels: [3, 4, 5],
             pll_source_channels: [0, 1, 2],
             dq_source_channels: [0, 1, 2],
             dq_source_channels_user_selected: false,
@@ -2377,6 +2467,11 @@ impl ScopeApp {
             zoom_box_start: None,
             zoom_box_current: None,
         }
+    }
+
+    #[cfg(test)]
+    fn new_for_test() -> Self {
+        Self::from_recent_state(Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
     }
 
     fn bump_data_generation(&mut self) {
@@ -2526,12 +2621,12 @@ impl ScopeApp {
         ));
         text.push_str(&format!(
             "view: {:.9}..{:.9}, cursors: X1={:.9}, X2={:.9}, visible=({}, {})\n",
-            self.view_start,
-            self.view_end,
-            self.cursor_a,
-            self.cursor_b,
-            self.show_cursor_a,
-            self.show_cursor_b
+            self.plot_viewport.view_start,
+            self.plot_viewport.view_end,
+            self.plot_viewport.cursor_a,
+            self.plot_viewport.cursor_b,
+            self.plot_viewport.show_cursor_a,
+            self.plot_viewport.show_cursor_b
         ));
         text.push_str(&format!(
             "layout: {}x{}, active_pane: {}\n",
@@ -2843,7 +2938,10 @@ impl ScopeApp {
         for pane in &mut self.channel_panes {
             *pane = (*pane).min(pane_count.saturating_sub(1));
         }
-        self.active_scope_pane = self.active_scope_pane.min(pane_count.saturating_sub(1));
+        self.plot_viewport.active_scope_pane = self
+            .plot_viewport
+            .active_scope_pane
+            .min(pane_count.saturating_sub(1));
 
         if self
             .editing_display_name
@@ -3034,30 +3132,74 @@ impl ScopeApp {
     }
 
     fn set_source(&mut self, source: Arc<dyn DataSource>, path: PathBuf, kind: SourceKind) {
+        self.scope_trigger_events.clear();
+        self.scope_trigger_tick_hz = 0;
+        self.selected_scope_trigger = None;
         self.bump_data_generation();
         let meta = source.metadata().clone();
+        let presentations = (0..meta.channels.len())
+            .map(|index| source.channel_presentation(index))
+            .collect::<Vec<_>>();
         self.primary_dataset_name = Self::default_dataset_name(&path);
         self.visible = meta
             .channels
             .iter()
-            .map(|channel| channel.default_visible)
+            .enumerate()
+            .map(|(index, channel)| {
+                presentations[index]
+                    .as_ref()
+                    .map(|presentation| presentation.visible)
+                    .unwrap_or(channel.default_visible)
+            })
             .collect();
         self.display_names = meta
             .channels
             .iter()
-            .map(|channel| channel.name.clone())
+            .enumerate()
+            .map(|(index, channel)| {
+                presentations[index]
+                    .as_ref()
+                    .map(|presentation| presentation.display_name.clone())
+                    .unwrap_or_else(|| channel.name.clone())
+            })
             .collect();
         self.editing_display_name = None;
         self.pending_display_name_focus = None;
         self.channel_colors = meta
             .channels
             .iter()
-            .map(|channel| Self::default_channel_color(channel.index))
+            .enumerate()
+            .map(|(index, channel)| {
+                presentations[index]
+                    .as_ref()
+                    .map(|presentation| {
+                        let color = presentation.color;
+                        Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3])
+                    })
+                    .unwrap_or_else(|| Self::default_channel_color(channel.index))
+            })
             .collect();
         self.line_widths = vec![DEFAULT_CHANNEL_LINE_WIDTH; meta.channels.len()];
         self.line_patterns = vec![ChannelLinePattern::Solid; meta.channels.len()];
-        self.channel_scales = vec![DEFAULT_CHANNEL_SCALE; meta.channels.len()];
-        self.channel_panes = vec![0; meta.channels.len()];
+        self.channel_scales = presentations
+            .iter()
+            .map(|presentation| {
+                presentation
+                    .as_ref()
+                    .map(|presentation| Self::sanitize_channel_scale(presentation.scale))
+                    .unwrap_or(DEFAULT_CHANNEL_SCALE)
+            })
+            .collect();
+        let max_pane = self.scope_pane_count().saturating_sub(1);
+        self.channel_panes = presentations
+            .iter()
+            .map(|presentation| {
+                presentation
+                    .as_ref()
+                    .map(|presentation| presentation.pane.min(max_pane))
+                    .unwrap_or(0)
+            })
+            .collect();
         let derived_count = self.derived_output_count();
         self.derived_visible = vec![false; derived_count];
         self.derived_colors = (0..derived_count)
@@ -3065,17 +3207,9 @@ impl ScopeApp {
             .collect();
         self.derived_line_patterns = vec![ChannelLinePattern::Solid; derived_count];
         self.derived_panes = vec![0; derived_count];
-        self.active_scope_pane = 0;
         self.hovered_channel = None;
-        self.view_start = meta.start_time;
-        self.view_end = meta.end_time;
-        self.y_min = None;
-        self.y_max = None;
-        let span = meta.duration();
-        self.cursor_a = meta.start_time + span * 0.33;
-        self.cursor_b = meta.start_time + span * 0.66;
-        self.show_cursor_a = true;
-        self.show_cursor_b = true;
+        self.plot_viewport
+            .reset_to_range(meta.start_time, meta.end_time);
         self.fft_results.clear();
         self.measurement_cache = None;
         self.needs_fft_reload = true;
@@ -3153,16 +3287,16 @@ impl ScopeApp {
         self.last_error = None;
         self.import_status = None;
         self.needs_compare_plot_reload = true;
-        self.y_min = None;
-        self.y_max = None;
+        self.plot_viewport.y_min = None;
+        self.plot_viewport.y_max = None;
     }
 
     fn clear_imported_datasets(&mut self) {
         self.bump_data_generation();
         self.imported_datasets.clear();
         self.needs_compare_plot_reload = false;
-        self.y_min = None;
-        self.y_max = None;
+        self.plot_viewport.y_min = None;
+        self.plot_viewport.y_max = None;
     }
 
     fn clear_all_datasets(&mut self) {
@@ -3184,7 +3318,7 @@ impl ScopeApp {
         let derived_count = self.derived_output_count();
         self.derived_visible = vec![false; derived_count];
         self.derived_panes = vec![0; derived_count];
-        self.active_scope_pane = 0;
+        self.plot_viewport.active_scope_pane = 0;
         self.hovered_channel = None;
         self.import_status = None;
         self.primary_selected_for_delete = false;
@@ -3202,8 +3336,8 @@ impl ScopeApp {
         self.needs_compare_plot_reload = false;
         self.needs_derived_reload = false;
         self.needs_fft_reload = false;
-        self.y_min = None;
-        self.y_max = None;
+        self.plot_viewport.y_min = None;
+        self.plot_viewport.y_max = None;
         self.time_sync_status.clear();
     }
 
@@ -3259,8 +3393,8 @@ impl ScopeApp {
                 self.fft_dataset_index = self.selected_fft_dataset_index();
                 self.fft_results.clear();
                 self.needs_fft_reload = true;
-                self.y_min = None;
-                self.y_max = None;
+                self.plot_viewport.y_min = None;
+                self.plot_viewport.y_max = None;
             }
         }
     }
@@ -5831,8 +5965,8 @@ impl ScopeApp {
         let labels = self.current_export_curve_labels(&selections);
         self.export_preview_selections = Some(selections);
         self.sync_export_label_overrides(&labels);
-        self.export_manual_start = self.view_start;
-        self.export_manual_end = self.view_end;
+        self.export_manual_start = self.plot_viewport.view_start;
+        self.export_manual_end = self.plot_viewport.view_end;
         self.export_preview_undo_stack.clear();
         self.export_preview_redo_stack.clear();
         self.export_preview_zoom_mode = ExportPreviewZoomMode::Fit;
@@ -5884,12 +6018,18 @@ impl ScopeApp {
         if self.batch_export_windows.is_empty() {
             self.batch_export_windows.push(BatchExportTimeWindow {
                 enabled: true,
-                start: self.view_start.min(self.view_end),
-                end: self.view_start.max(self.view_end),
+                start: self
+                    .plot_viewport
+                    .view_start
+                    .min(self.plot_viewport.view_end),
+                end: self
+                    .plot_viewport
+                    .view_start
+                    .max(self.plot_viewport.view_end),
             });
-            if self.show_cursor_a && self.show_cursor_b {
-                let start = self.cursor_a.min(self.cursor_b);
-                let end = self.cursor_a.max(self.cursor_b);
+            if self.plot_viewport.show_cursor_a && self.plot_viewport.show_cursor_b {
+                let start = self.plot_viewport.cursor_a.min(self.plot_viewport.cursor_b);
+                let end = self.plot_viewport.cursor_a.max(self.plot_viewport.cursor_b);
                 if end > start {
                     self.batch_export_windows.push(BatchExportTimeWindow {
                         enabled: true,
@@ -6009,7 +6149,9 @@ impl ScopeApp {
         &self,
         selections: &PlotSelections,
     ) -> Option<crate::word_export::CursorTable> {
-        if !self.export_cursor_table_enabled || !(self.show_cursor_a || self.show_cursor_b) {
+        if !self.export_cursor_table_enabled
+            || !(self.plot_viewport.show_cursor_a || self.plot_viewport.show_cursor_b)
+        {
             return None;
         }
         let labels = self.current_export_curve_labels(selections);
@@ -6018,13 +6160,13 @@ impl ScopeApp {
         }
 
         let mut headers = vec![self.tr("变量", "Variable").to_owned()];
-        if self.show_cursor_a {
+        if self.plot_viewport.show_cursor_a {
             headers.push("Y@X1".to_owned());
         }
-        if self.show_cursor_b {
+        if self.plot_viewport.show_cursor_b {
             headers.push("Y@X2".to_owned());
         }
-        if self.show_cursor_a && self.show_cursor_b {
+        if self.plot_viewport.show_cursor_a && self.plot_viewport.show_cursor_b {
             headers.push("ΔY".to_owned());
         }
 
@@ -6487,7 +6629,10 @@ impl ScopeApp {
         match self.export_pane_scope {
             ExportPaneScope::All => (0..pane_count).collect(),
             ExportPaneScope::Active => {
-                vec![self.active_scope_pane.min(pane_count.saturating_sub(1))]
+                vec![self
+                    .plot_viewport
+                    .active_scope_pane
+                    .min(pane_count.saturating_sub(1))]
             }
         }
     }
@@ -6497,7 +6642,9 @@ impl ScopeApp {
         selections: &PlotSelections,
         pane_count: usize,
     ) -> usize {
-        if !self.export_cursor_table_enabled || !(self.show_cursor_a || self.show_cursor_b) {
+        if !self.export_cursor_table_enabled
+            || !(self.plot_viewport.show_cursor_a || self.plot_viewport.show_cursor_b)
+        {
             return 0;
         }
         self.export_pane_indices(pane_count)
@@ -6579,9 +6726,11 @@ impl ScopeApp {
 
     fn export_time_range(&self) -> Result<(f64, f64), String> {
         let (start, end) = match self.export_time_range_mode {
-            ExportTimeRangeMode::View => (self.view_start, self.view_end),
+            ExportTimeRangeMode::View => {
+                (self.plot_viewport.view_start, self.plot_viewport.view_end)
+            }
             ExportTimeRangeMode::Cursor => {
-                if !(self.show_cursor_a && self.show_cursor_b) {
+                if !(self.plot_viewport.show_cursor_a && self.plot_viewport.show_cursor_b) {
                     return Err(self
                         .tr(
                             "请先显示 X1 和 X2 光标。",
@@ -6590,8 +6739,8 @@ impl ScopeApp {
                         .to_owned());
                 }
                 (
-                    self.cursor_a.min(self.cursor_b),
-                    self.cursor_a.max(self.cursor_b),
+                    self.plot_viewport.cursor_a.min(self.plot_viewport.cursor_b),
+                    self.plot_viewport.cursor_a.max(self.plot_viewport.cursor_b),
                 )
             }
             ExportTimeRangeMode::Manual => (
@@ -6604,8 +6753,14 @@ impl ScopeApp {
                 .tr("导出时间范围无效。", "The export time range is invalid.")
                 .to_owned());
         }
-        let view_start = self.view_start.min(self.view_end);
-        let view_end = self.view_start.max(self.view_end);
+        let view_start = self
+            .plot_viewport
+            .view_start
+            .min(self.plot_viewport.view_end);
+        let view_end = self
+            .plot_viewport
+            .view_start
+            .max(self.plot_viewport.view_end);
         let start = start.max(view_start);
         let end = end.min(view_end);
         if end <= start {
@@ -6961,28 +7116,28 @@ impl ScopeApp {
                     if ui.button(self.tr("添加当前视图", "Add Current View")).clicked() {
                         self.batch_export_windows.push(BatchExportTimeWindow {
                             enabled: true,
-                            start: self.view_start.min(self.view_end),
-                            end: self.view_start.max(self.view_end),
+                            start: self.plot_viewport.view_start.min(self.plot_viewport.view_end),
+                            end: self.plot_viewport.view_start.max(self.plot_viewport.view_end),
                         });
                     }
                     if ui
                         .add_enabled(
-                            self.show_cursor_a && self.show_cursor_b,
+                            self.plot_viewport.show_cursor_a && self.plot_viewport.show_cursor_b,
                             egui::Button::new(self.tr("添加 X1-X2", "Add X1-X2")),
                         )
                         .clicked()
                     {
                         self.batch_export_windows.push(BatchExportTimeWindow {
                             enabled: true,
-                            start: self.cursor_a.min(self.cursor_b),
-                            end: self.cursor_a.max(self.cursor_b),
+                            start: self.plot_viewport.cursor_a.min(self.plot_viewport.cursor_b),
+                            end: self.plot_viewport.cursor_a.max(self.plot_viewport.cursor_b),
                         });
                     }
                     if ui.button(self.tr("添加空窗口", "Add Window")).clicked() {
                         self.batch_export_windows.push(BatchExportTimeWindow {
                             enabled: true,
-                            start: self.view_start.min(self.view_end),
-                            end: self.view_start.max(self.view_end),
+                            start: self.plot_viewport.view_start.min(self.plot_viewport.view_end),
+                            end: self.plot_viewport.view_start.max(self.plot_viewport.view_end),
                         });
                     }
                 });
@@ -9649,7 +9804,7 @@ impl ScopeApp {
         let saved_manual_start = self.export_manual_start;
         let saved_manual_end = self.export_manual_end;
         let saved_pane_scope = self.export_pane_scope;
-        let saved_active_pane = self.active_scope_pane;
+        let saved_active_pane = self.plot_viewport.active_scope_pane;
         let saved_label_overrides = self.export_label_overrides.clone();
         let saved_label_positions = self.export_label_positions.clone();
         let saved_label_anchor_x = self.export_label_anchor_x.clone();
@@ -9689,7 +9844,7 @@ impl ScopeApp {
                         break;
                     }
                     self.export_pane_scope = *pane_scope;
-                    self.active_scope_pane =
+                    self.plot_viewport.active_scope_pane =
                         (*active_pane).min(source_pane_count.saturating_sub(1));
                     let file_name = format!(
                         "{}_waveform_w{:02}_{}_{}_{}_{}.png",
@@ -9713,7 +9868,7 @@ impl ScopeApp {
         self.export_manual_start = saved_manual_start;
         self.export_manual_end = saved_manual_end;
         self.export_pane_scope = saved_pane_scope;
-        self.active_scope_pane = saved_active_pane;
+        self.plot_viewport.active_scope_pane = saved_active_pane;
         self.export_label_overrides = saved_label_overrides;
         self.export_label_positions = saved_label_positions;
         self.export_label_anchor_x = saved_label_anchor_x;
@@ -9790,7 +9945,7 @@ impl ScopeApp {
         let saved_manual_start = self.export_manual_start;
         let saved_manual_end = self.export_manual_end;
         let saved_pane_scope = self.export_pane_scope;
-        let saved_active_pane = self.active_scope_pane;
+        let saved_active_pane = self.plot_viewport.active_scope_pane;
         let saved_label_overrides = self.export_label_overrides.clone();
         let saved_label_positions = self.export_label_positions.clone();
         let saved_label_anchor_x = self.export_label_anchor_x.clone();
@@ -9829,7 +9984,7 @@ impl ScopeApp {
                         break 'build;
                     }
                     self.export_pane_scope = *pane_scope;
-                    self.active_scope_pane =
+                    self.plot_viewport.active_scope_pane =
                         (*active_pane).min(source_pane_count.saturating_sub(1));
                     let caption = format!(
                         "图 {}：窗口 #{window_index} {start:.6}s - {end:.6}s {dataset_slug} {pane_slug}",
@@ -9850,7 +10005,7 @@ impl ScopeApp {
         self.export_manual_start = saved_manual_start;
         self.export_manual_end = saved_manual_end;
         self.export_pane_scope = saved_pane_scope;
-        self.active_scope_pane = saved_active_pane;
+        self.plot_viewport.active_scope_pane = saved_active_pane;
         self.export_label_overrides = saved_label_overrides;
         self.export_label_positions = saved_label_positions;
         self.export_label_anchor_x = saved_label_anchor_x;
@@ -9927,17 +10082,20 @@ impl ScopeApp {
                 match self.export_pane_scope {
                     ExportPaneScope::All => "current_all".to_owned(),
                     ExportPaneScope::Active => {
-                        format!("current_pane{:02}", self.active_scope_pane + 1)
+                        format!(
+                            "current_pane{:02}",
+                            self.plot_viewport.active_scope_pane + 1
+                        )
                     }
                 },
                 self.export_pane_scope,
-                self.active_scope_pane,
+                self.plot_viewport.active_scope_pane,
             )],
             BatchExportPaneMode::AllPanes => {
                 vec![(
                     "all_panes".to_owned(),
                     ExportPaneScope::All,
-                    self.active_scope_pane,
+                    self.plot_viewport.active_scope_pane,
                 )]
             }
             BatchExportPaneMode::EachPane => (0..pane_count)
@@ -10090,17 +10248,28 @@ impl ScopeApp {
             if !self.channel_in_scope_pane(*channel_index, pane_index, pane_count) {
                 continue;
             }
-            let (points, low_points) = if let Some(summary) = &self.prepared_plot_summary {
+            let (segments, low_segments) = if let Some(summary) = &self.prepared_plot_summary {
                 (
-                    summary.points.get(out_index),
-                    summary.envelope_low_points.get(out_index).map(Arc::as_ref),
+                    summary
+                        .points
+                        .get(out_index)
+                        .map(|points| vec![points.as_ref()])
+                        .unwrap_or_default(),
+                    summary
+                        .envelope_low_points
+                        .get(out_index)
+                        .map(|points| vec![points.as_ref()])
+                        .unwrap_or_default(),
                 )
             } else {
-                (self.prepared_plot_cache.points.get(out_index), None)
+                (
+                    Self::export_segments(&self.prepared_plot_cache, out_index),
+                    Vec::new(),
+                )
             };
-            let Some(points) = points else {
+            if segments.is_empty() {
                 continue;
-            };
+            }
             let default_label = self.channel_name(*channel_index);
             let label_index = *label_cursor;
             let label = self.export_label_for(*label_cursor, default_label);
@@ -10112,8 +10281,8 @@ impl ScopeApp {
                 width: (self.visible_line_width(*channel_index) * 2.2 * width_scale)
                     .round()
                     .max(3.0) as i32,
-                points,
-                low_points,
+                segments,
+                low_segments,
             });
         }
 
@@ -10127,17 +10296,29 @@ impl ScopeApp {
                 if !self.channel_in_scope_pane(*channel_index, pane_index, pane_count) {
                     continue;
                 }
-                let (points, low_points) = if let Some(summary) = &dataset.prepared_plot_summary {
+                let (segments, low_segments) = if let Some(summary) = &dataset.prepared_plot_summary
+                {
                     (
-                        summary.points.get(out_index),
-                        summary.envelope_low_points.get(out_index).map(Arc::as_ref),
+                        summary
+                            .points
+                            .get(out_index)
+                            .map(|points| vec![points.as_ref()])
+                            .unwrap_or_default(),
+                        summary
+                            .envelope_low_points
+                            .get(out_index)
+                            .map(|points| vec![points.as_ref()])
+                            .unwrap_or_default(),
                     )
                 } else {
-                    (dataset.prepared_plot_cache.points.get(out_index), None)
+                    (
+                        Self::export_segments(&dataset.prepared_plot_cache, out_index),
+                        Vec::new(),
+                    )
                 };
-                let Some(points) = points else {
+                if segments.is_empty() {
                     continue;
-                };
+                }
                 let default_label = format!(
                     "{}: {}",
                     self.dataset_label(dataset_index + 1),
@@ -10158,8 +10339,8 @@ impl ScopeApp {
                     width: (self.compare_line_width(*channel_index) * 2.0 * width_scale)
                         .round()
                         .max(3.0) as i32,
-                    points,
-                    low_points,
+                    segments,
+                    low_segments,
                 });
             }
         }
@@ -10182,14 +10363,14 @@ impl ScopeApp {
                 width: ((DEFAULT_CHANNEL_LINE_WIDTH + 0.2) * 2.0 * width_scale)
                     .round()
                     .max(3.0) as i32,
-                points,
-                low_points: None,
+                segments: vec![points.as_ref()],
+                low_segments: Vec::new(),
             });
         }
 
         for curve in &curves {
             let color = self.export_scope_color(curve.color);
-            for points in [Some(curve.points), curve.low_points].into_iter().flatten() {
+            for points in curve.segments.iter().chain(&curve.low_segments) {
                 for pair in points.windows(2) {
                     let Some((x0, y0)) =
                         Self::export_map_point(pair[0], plot, x_min, x_max, y_min, y_max)
@@ -10206,12 +10387,19 @@ impl ScopeApp {
             }
         }
 
-        if self.show_cursor_a {
-            self.draw_export_cursor(canvas, plot, self.cursor_a, "X1", x_min, x_max);
+        if self.plot_viewport.show_cursor_a {
+            self.draw_export_cursor(
+                canvas,
+                plot,
+                self.plot_viewport.cursor_a,
+                "X1",
+                x_min,
+                x_max,
+            );
             self.draw_export_cursor_markers(
                 canvas,
                 plot,
-                self.cursor_a,
+                self.plot_viewport.cursor_a,
                 &curves,
                 x_min,
                 x_max,
@@ -10219,12 +10407,19 @@ impl ScopeApp {
                 y_max,
             );
         }
-        if self.show_cursor_b {
-            self.draw_export_cursor(canvas, plot, self.cursor_b, "X2", x_min, x_max);
+        if self.plot_viewport.show_cursor_b {
+            self.draw_export_cursor(
+                canvas,
+                plot,
+                self.plot_viewport.cursor_b,
+                "X2",
+                x_min,
+                x_max,
+            );
             self.draw_export_cursor_markers(
                 canvas,
                 plot,
-                self.cursor_b,
+                self.plot_viewport.cursor_b,
                 &curves,
                 x_min,
                 x_max,
@@ -10245,6 +10440,44 @@ impl ScopeApp {
             y_min,
             y_max,
         });
+    }
+
+    fn export_segments(prepared: &PreparedPlotSeries, channel_index: usize) -> Vec<&[PlotPoint]> {
+        prepared
+            .segmented_points
+            .get(channel_index)
+            .filter(|segments| !segments.is_empty())
+            .map(|segments| segments.iter().map(Arc::as_ref).collect())
+            .or_else(|| {
+                prepared
+                    .points
+                    .get(channel_index)
+                    .map(|points| vec![points.as_ref()])
+            })
+            .unwrap_or_default()
+    }
+
+    fn interpolated_y_in_segments(segments: &[&[PlotPoint]], cursor_x: f64) -> Option<f64> {
+        segments
+            .iter()
+            .find_map(|points| Self::interpolated_y(points, cursor_x))
+    }
+
+    fn export_curve_target_in_segments(
+        &self,
+        segments: &[&[PlotPoint]],
+        target_x: f64,
+        x_min: f64,
+        x_max: f64,
+    ) -> Option<PlotPoint> {
+        segments
+            .iter()
+            .filter_map(|points| self.export_curve_target(points, target_x, x_min, x_max))
+            .min_by(|left, right| {
+                (left.x - target_x)
+                    .abs()
+                    .total_cmp(&(right.x - target_x).abs())
+            })
     }
 
     fn draw_export_variable_label_annotations<C: WaveformCanvas>(
@@ -10276,7 +10509,7 @@ impl ScopeApp {
                     .filter(|x| x.is_finite() && *x >= x_min && *x <= x_max)
                     .unwrap_or(default_target_x);
                 let Some((target_px, target_py)) = self
-                    .export_curve_target(curve.points, target_x, x_min, x_max)
+                    .export_curve_target_in_segments(&curve.segments, target_x, x_min, x_max)
                     .and_then(|point| {
                         Self::export_map_point(point, plot, x_min, x_max, y_min, y_max)
                     })
@@ -10448,7 +10681,7 @@ impl ScopeApp {
             return;
         }
         for curve in curves {
-            let Some(y) = Self::interpolated_y(curve.points, cursor_x) else {
+            let Some(y) = Self::interpolated_y_in_segments(&curve.segments, cursor_x) else {
                 continue;
             };
             let Some((px, py)) = Self::export_map_point(
@@ -10489,8 +10722,12 @@ impl ScopeApp {
         if !self.export_cursor_table_enabled {
             return;
         }
-        let use_x1 = self.show_cursor_a && self.cursor_a >= x_min && self.cursor_a <= x_max;
-        let use_x2 = self.show_cursor_b && self.cursor_b >= x_min && self.cursor_b <= x_max;
+        let use_x1 = self.plot_viewport.show_cursor_a
+            && self.plot_viewport.cursor_a >= x_min
+            && self.plot_viewport.cursor_a <= x_max;
+        let use_x2 = self.plot_viewport.show_cursor_b
+            && self.plot_viewport.cursor_b >= x_min
+            && self.plot_viewport.cursor_b <= x_max;
         if !(use_x1 || use_x2) || curves.is_empty() {
             return;
         }
@@ -10498,10 +10735,14 @@ impl ScopeApp {
         let mut rows = Vec::new();
         for curve in curves {
             let y1 = use_x1
-                .then(|| Self::interpolated_y(curve.points, self.cursor_a))
+                .then(|| {
+                    Self::interpolated_y_in_segments(&curve.segments, self.plot_viewport.cursor_a)
+                })
                 .flatten();
             let y2 = use_x2
-                .then(|| Self::interpolated_y(curve.points, self.cursor_b))
+                .then(|| {
+                    Self::interpolated_y_in_segments(&curve.segments, self.plot_viewport.cursor_b)
+                })
                 .flatten();
             if y1.is_some() || y2.is_some() {
                 rows.push((curve, y1, y2));
@@ -10543,7 +10784,7 @@ impl ScopeApp {
         );
 
         let delta_x = if use_x1 && use_x2 {
-            Some((self.cursor_b - self.cursor_a).abs())
+            Some((self.plot_viewport.cursor_b - self.plot_viewport.cursor_a).abs())
         } else {
             None
         };
@@ -10551,11 +10792,11 @@ impl ScopeApp {
             (true, true, Some(dx)) => {
                 format!(
                     "X1={:.6}s    X2={:.6}s    ΔX={dx:.6}s",
-                    self.cursor_a, self.cursor_b
+                    self.plot_viewport.cursor_a, self.plot_viewport.cursor_b
                 )
             }
-            (true, false, _) => format!("X1={:.6}s", self.cursor_a),
-            (false, true, _) => format!("X2={:.6}s", self.cursor_b),
+            (true, false, _) => format!("X1={:.6}s", self.plot_viewport.cursor_a),
+            (false, true, _) => format!("X2={:.6}s", self.plot_viewport.cursor_b),
             _ => String::new(),
         };
         canvas.text_styled(
@@ -11012,8 +11253,18 @@ impl ScopeApp {
         let mut penalty = 0.0;
         let expanded_rect = Self::inflate_rect(rect, 3);
         for curve in curves {
-            let step = (curve.points.len() / 500).max(1);
-            for point in curve.points.iter().step_by(step) {
+            let point_count = curve
+                .segments
+                .iter()
+                .map(|segment| segment.len())
+                .sum::<usize>();
+            let step = (point_count / 500).max(1);
+            for point in curve
+                .segments
+                .iter()
+                .flat_map(|segment| segment.iter())
+                .step_by(step)
+            {
                 let Some((px, py)) =
                     Self::export_map_point(*point, plot, x_min, x_max, y_min, y_max)
                 else {
@@ -11055,11 +11306,11 @@ impl ScopeApp {
         y_max: f64,
     ) -> Vec<[i32; 4]> {
         let mut rects = Vec::new();
-        if self.show_cursor_a {
+        if self.plot_viewport.show_cursor_a {
             self.collect_export_cursor_obstacles(
                 &mut rects,
                 plot,
-                self.cursor_a,
+                self.plot_viewport.cursor_a,
                 "X1",
                 curves,
                 x_min,
@@ -11068,11 +11319,11 @@ impl ScopeApp {
                 y_max,
             );
         }
-        if self.show_cursor_b {
+        if self.plot_viewport.show_cursor_b {
             self.collect_export_cursor_obstacles(
                 &mut rects,
                 plot,
-                self.cursor_b,
+                self.plot_viewport.cursor_b,
                 "X2",
                 curves,
                 x_min,
@@ -11555,11 +11806,11 @@ impl ScopeApp {
     }
 
     fn cursor_display_range(&self) -> Option<(f64, f64)> {
-        if !(self.show_cursor_a && self.show_cursor_b) {
+        if !(self.plot_viewport.show_cursor_a && self.plot_viewport.show_cursor_b) {
             return None;
         }
-        let start = self.cursor_a.min(self.cursor_b);
-        let end = self.cursor_a.max(self.cursor_b);
+        let start = self.plot_viewport.cursor_a.min(self.plot_viewport.cursor_b);
+        let end = self.plot_viewport.cursor_a.max(self.plot_viewport.cursor_b);
         (start.is_finite() && end.is_finite() && end > start).then_some((start, end))
     }
 
@@ -13168,6 +13419,30 @@ impl ScopeApp {
         }
     }
 
+    fn frame_plot_segments(
+        prepared: &PreparedPlotSeries,
+        channel_index: usize,
+        lightweight: bool,
+    ) -> Vec<Arc<[PlotPoint]>> {
+        let full = prepared.segmented_points.get(channel_index);
+        let reduced = prepared.segmented_lightweight_points.get(channel_index);
+        let selected = if lightweight {
+            reduced.filter(|segments| !segments.is_empty()).or(full)
+        } else {
+            full
+        };
+        selected
+            .filter(|segments| !segments.is_empty())
+            .map(|segments| segments.iter().map(Arc::clone).collect())
+            .or_else(|| {
+                prepared
+                    .points
+                    .get(channel_index)
+                    .map(|points| vec![Arc::clone(points)])
+            })
+            .unwrap_or_default()
+    }
+
     fn plot_summary_envelope(plot_ui: &mut PlotUi, draw: SummaryEnvelopeDraw<'_>) {
         if let Some(low_points) = draw.low_points {
             let mut envelope = Envelope::new(
@@ -13290,13 +13565,71 @@ impl ScopeApp {
             points.push(series);
             bounds.push(bounds_for_series);
         }
+        let segmented_points = points
+            .iter()
+            .map(|points| vec![Arc::clone(points)])
+            .collect();
+        let segmented_lightweight_points = lightweight_points
+            .iter()
+            .map(|points| vec![Arc::clone(points)])
+            .collect();
         PreparedPlotSeries {
             points,
             lightweight_points,
+            segmented_points,
+            segmented_lightweight_points,
             envelope_low_points: Vec::new(),
             envelope_low_lightweight_points: Vec::new(),
             bounds,
         }
+    }
+
+    fn prepare_segmented_sample_series(
+        &self,
+        blocks: &[SampleBlock],
+        channels: &[usize],
+        time_offset: f64,
+    ) -> PreparedPlotSeries {
+        let mut result = PreparedPlotSeries {
+            segmented_points: vec![Vec::new(); channels.len()],
+            segmented_lightweight_points: vec![Vec::new(); channels.len()],
+            bounds: vec![None; channels.len()],
+            ..PreparedPlotSeries::default()
+        };
+        let mut flattened = vec![Vec::<PlotPoint>::new(); channels.len()];
+        for block in blocks {
+            let prepared = self.prepare_sample_series(block, channels, time_offset);
+            for (channel_index, flattened_channel) in flattened.iter_mut().enumerate() {
+                let Some(points) = prepared.points.get(channel_index) else {
+                    continue;
+                };
+                if points.is_empty() {
+                    continue;
+                }
+                flattened_channel.extend(points.iter().copied());
+                result.segmented_points[channel_index].push(Arc::clone(points));
+                if let Some(lightweight) = prepared.lightweight_points.get(channel_index) {
+                    result.segmented_lightweight_points[channel_index]
+                        .push(Arc::clone(lightweight));
+                }
+                if let Some(Some((min, max))) = prepared.bounds.get(channel_index) {
+                    result.bounds[channel_index] = Some(
+                        result.bounds[channel_index]
+                            .map(|(current_min, current_max)| {
+                                (current_min.min(*min), current_max.max(*max))
+                            })
+                            .unwrap_or((*min, *max)),
+                    );
+                }
+            }
+        }
+        result.points = flattened.into_iter().map(Arc::from).collect();
+        result.lightweight_points = result
+            .points
+            .iter()
+            .map(Self::lightweight_plot_points)
+            .collect();
+        result
     }
 
     fn prepare_summary_series(
@@ -13326,9 +13659,19 @@ impl ScopeApp {
             envelope_low_points.push(envelope.low);
             bounds.push(envelope.bounds);
         }
+        let segmented_points = points
+            .iter()
+            .map(|points| vec![Arc::clone(points)])
+            .collect();
+        let segmented_lightweight_points = lightweight_points
+            .iter()
+            .map(|points| vec![Arc::clone(points)])
+            .collect();
         PreparedPlotSeries {
             points,
             lightweight_points,
+            segmented_points,
+            segmented_lightweight_points,
             envelope_low_points,
             envelope_low_lightweight_points,
             bounds,
@@ -13429,9 +13772,19 @@ impl ScopeApp {
             points.push(series);
             bounds.push(bounds_for_series);
         }
+        let segmented_points = points
+            .iter()
+            .map(|points| vec![Arc::clone(points)])
+            .collect();
+        let segmented_lightweight_points = lightweight_points
+            .iter()
+            .map(|points| vec![Arc::clone(points)])
+            .collect();
         PreparedPlotSeries {
             points,
             lightweight_points,
+            segmented_points,
+            segmented_lightweight_points,
             envelope_low_points: Vec::new(),
             envelope_low_lightweight_points: Vec::new(),
             bounds,
@@ -13501,13 +13854,15 @@ impl ScopeApp {
             .map_err(|error| error.to_string())?;
             Ok(Some(PlotJobData::Summary(summary)))
         } else {
-            let block = if let Some(cancel) = options.cancel {
-                source.read_range_cancellable(start_time, end_time, channels, max_points, cancel)
+            let blocks = if let Some(cancel) = options.cancel {
+                source.read_range_segments_cancellable(
+                    start_time, end_time, channels, max_points, cancel,
+                )
             } else {
-                source.read_range(start_time, end_time, channels, max_points)
+                source.read_range_segments(start_time, end_time, channels, max_points)
             }
             .map_err(|error| error.to_string())?;
-            Ok(Some(PlotJobData::Samples(block)))
+            Ok(Some(PlotJobData::SegmentedSamples(blocks)))
         }
     }
 
@@ -13533,9 +13888,10 @@ impl ScopeApp {
     fn apply_plot_job_data(&mut self, data: Option<PlotJobData>, key: Option<PlotCacheKey>) {
         let selected = Self::plot_job_channels_for_prepare(key.as_ref(), &self.selected_channels());
         match data {
-            Some(PlotJobData::Samples(block)) => {
-                self.prepared_plot_cache = self.prepare_sample_series(&block, &selected, 0.0);
-                self.plot_cache = block;
+            Some(PlotJobData::SegmentedSamples(blocks)) => {
+                self.prepared_plot_cache =
+                    self.prepare_segmented_sample_series(&blocks, &selected, 0.0);
+                self.plot_cache = Self::flatten_sample_blocks(blocks, selected.len());
                 self.plot_summary = None;
                 self.prepared_plot_summary = None;
                 self.plot_cache_key = key;
@@ -13557,6 +13913,23 @@ impl ScopeApp {
             }
         }
         self.clear_pane_prepared_plot_cache();
+    }
+
+    fn flatten_sample_blocks(blocks: Vec<SampleBlock>, channel_count: usize) -> SampleBlock {
+        let sample_count = blocks.iter().map(|block| block.times.len()).sum();
+        let mut flattened = SampleBlock {
+            times: Vec::with_capacity(sample_count),
+            channels: (0..channel_count)
+                .map(|_| Vec::with_capacity(sample_count))
+                .collect(),
+        };
+        for block in blocks {
+            flattened.times.extend(block.times);
+            for (target, source) in flattened.channels.iter_mut().zip(block.channels) {
+                target.extend(source);
+            }
+        }
+        flattened
     }
 
     fn plot_job_channels_for_prepare(
@@ -13835,8 +14208,8 @@ impl ScopeApp {
         }
         let generation = self.data_generation;
         let meta = source.metadata();
-        let start = self.view_start.max(meta.start_time);
-        let end = self.view_end.min(meta.end_time);
+        let start = self.plot_viewport.view_start.max(meta.start_time);
+        let end = self.plot_viewport.view_end.min(meta.end_time);
         if end <= start {
             self.apply_plot_job_data(None, None);
             self.needs_plot_reload = false;
@@ -13913,12 +14286,14 @@ impl ScopeApp {
         for dataset_result in result.datasets {
             let dataset_index = dataset_result.index;
             match dataset_result.result {
-                Ok(Some(PlotJobData::Samples(block))) => {
+                Ok(Some(PlotJobData::SegmentedSamples(blocks))) => {
                     let selected = dataset_result.key.channels.clone();
                     let time_offset = self.dataset_time_offset(dataset_index + 1);
-                    let prepared = self.prepare_sample_series(&block, &selected, time_offset);
+                    let prepared =
+                        self.prepare_segmented_sample_series(&blocks, &selected, time_offset);
+                    let flattened = Self::flatten_sample_blocks(blocks, selected.len());
                     if let Some(dataset) = self.imported_datasets.get_mut(dataset_index) {
-                        dataset.plot_cache = block;
+                        dataset.plot_cache = flattened;
                         dataset.plot_summary = None;
                         dataset.prepared_plot_cache = prepared;
                         dataset.prepared_plot_summary = None;
@@ -13994,8 +14369,8 @@ impl ScopeApp {
                 .map(|(_, _, channels, _)| channels.len())
                 .sum::<usize>();
         let generation = self.data_generation;
-        let view_start = self.view_start;
-        let view_end = self.view_end;
+        let view_start = self.plot_viewport.view_start;
+        let view_end = self.plot_viewport.view_end;
         let cache_plot_pixel_width = Self::plot_cache_pixel_width(plot_pixel_width);
         let software_performance_mode = self.software_rendering_performance_mode();
         let mut inputs = Vec::new();
@@ -14321,7 +14696,8 @@ impl ScopeApp {
     }
 
     fn reload_derived_curve_cache(&mut self) {
-        let key = self.derived_key_for_range(self.view_start, self.view_end);
+        let key =
+            self.derived_key_for_range(self.plot_viewport.view_start, self.plot_viewport.view_end);
         self.poll_derived_curve_worker(&key);
         if self.selected_derived_channels().is_empty() {
             self.derived_curve_cache = None;
@@ -14336,13 +14712,13 @@ impl ScopeApp {
     }
 
     fn visible_time_span(&self) -> f64 {
-        (self.view_end - self.view_start).max(f64::EPSILON)
+        (self.plot_viewport.view_end - self.plot_viewport.view_start).max(f64::EPSILON)
     }
 
     fn clear_y_overrides(&mut self) {
-        self.y_min = None;
-        self.y_max = None;
-        for bounds in &mut self.pane_y_bounds {
+        self.plot_viewport.y_min = None;
+        self.plot_viewport.y_max = None;
+        for bounds in &mut self.plot_viewport.pane_y_bounds {
             *bounds = None;
         }
         self.pane_y_bounds_cache_key = None;
@@ -14365,9 +14741,9 @@ impl ScopeApp {
 
     fn sync_pane_y_bounds_len(&mut self) {
         let pane_count = self.scope_pane_count();
-        self.pane_y_bounds.truncate(pane_count);
-        if self.pane_y_bounds.len() < pane_count {
-            self.pane_y_bounds.resize(pane_count, None);
+        self.plot_viewport.pane_y_bounds.truncate(pane_count);
+        if self.plot_viewport.pane_y_bounds.len() < pane_count {
+            self.plot_viewport.pane_y_bounds.resize(pane_count, None);
         }
         self.pane_y_bounds_cache.truncate(pane_count);
         if self.pane_y_bounds_cache.len() < pane_count {
@@ -14377,12 +14753,14 @@ impl ScopeApp {
     }
 
     fn current_scope_pane(&self) -> usize {
-        self.active_scope_pane
+        self.plot_viewport
+            .active_scope_pane
             .min(self.scope_pane_count().saturating_sub(1))
     }
 
     fn set_active_scope_pane(&mut self, pane_index: usize) {
-        self.active_scope_pane = pane_index.min(self.scope_pane_count().saturating_sub(1));
+        self.plot_viewport.active_scope_pane =
+            pane_index.min(self.scope_pane_count().saturating_sub(1));
     }
 
     fn assign_channel_to_active_pane(&mut self, channel_index: usize) {
@@ -14455,7 +14833,7 @@ impl ScopeApp {
         }
         let old_span = self.visible_time_span();
         let new_span = (old_span * factor).clamp(1.0 / sample_rate, duration);
-        let ratio = ((center - self.view_start) / old_span).clamp(0.0, 1.0);
+        let ratio = ((center - self.plot_viewport.view_start) / old_span).clamp(0.0, 1.0);
         let mut start = center - ratio * new_span;
         let mut end = start + new_span;
         if start < start_time {
@@ -14466,8 +14844,8 @@ impl ScopeApp {
             end = end_time;
             start = end - new_span;
         }
-        self.view_start = start.max(start_time);
-        self.view_end = end.min(end_time);
+        self.plot_viewport.view_start = start.max(start_time);
+        self.plot_viewport.view_end = end.min(end_time);
         self.defer_plot_reload();
     }
 
@@ -14485,9 +14863,9 @@ impl ScopeApp {
         let ratio = ((center - current_min) / old_span).clamp(0.0, 1.0);
         let next_bounds = (center - ratio * new_span, center + (1.0 - ratio) * new_span);
         if pane_count <= 1 {
-            self.y_min = Some(next_bounds.0);
-            self.y_max = Some(next_bounds.1);
-        } else if let Some(bounds) = self.pane_y_bounds.get_mut(pane_index) {
+            self.plot_viewport.y_min = Some(next_bounds.0);
+            self.plot_viewport.y_max = Some(next_bounds.1);
+        } else if let Some(bounds) = self.plot_viewport.pane_y_bounds.get_mut(pane_index) {
             *bounds = Some(next_bounds);
         }
         self.pane_y_bounds_cache_key = None;
@@ -14523,8 +14901,9 @@ impl ScopeApp {
         pane_selections: &[PanePlotSelections],
         pane_count: usize,
     ) -> PanePreparedPlotCacheKey {
-        let derived_key = (!self.selected_derived_channels().is_empty())
-            .then(|| self.derived_key_for_range(self.view_start, self.view_end));
+        let derived_key = (!self.selected_derived_channels().is_empty()).then(|| {
+            self.derived_key_for_range(self.plot_viewport.view_start, self.plot_viewport.view_end)
+        });
         PanePreparedPlotCacheKey {
             pane_count,
             selections: pane_selections.to_vec(),
@@ -14608,8 +14987,9 @@ impl ScopeApp {
         pane_selections: &[PanePlotSelections],
         pane_count: usize,
     ) -> PaneYBoundsCacheKey {
-        let derived_key = (!self.selected_derived_channels().is_empty())
-            .then(|| self.derived_key_for_range(self.view_start, self.view_end));
+        let derived_key = (!self.selected_derived_channels().is_empty()).then(|| {
+            self.derived_key_for_range(self.plot_viewport.view_start, self.plot_viewport.view_end)
+        });
         PaneYBoundsCacheKey {
             pane_count,
             selections: pane_selections.to_vec(),
@@ -14620,11 +15000,12 @@ impl ScopeApp {
                 .map(|dataset| dataset.plot_cache_key.clone())
                 .collect(),
             derived_key,
-            global_y_override: match (self.y_min, self.y_max) {
+            global_y_override: match (self.plot_viewport.y_min, self.plot_viewport.y_max) {
                 (Some(min), Some(max)) => Some((min.to_bits(), max.to_bits())),
                 _ => None,
             },
             pane_y_overrides: self
+                .plot_viewport
                 .pane_y_bounds
                 .iter()
                 .copied()
@@ -14666,7 +15047,7 @@ impl ScopeApp {
             return None;
         }
         if pane_count <= 1 {
-            if let (Some(min), Some(max)) = (self.y_min, self.y_max) {
+            if let (Some(min), Some(max)) = (self.plot_viewport.y_min, self.plot_viewport.y_max) {
                 if min.is_finite() && max.is_finite() && max > min {
                     return Some(vec![(min, max)]);
                 }
@@ -14694,7 +15075,7 @@ impl ScopeApp {
 
         if pane_count > 1 {
             for (pane_index, bound) in bounds.iter_mut().enumerate() {
-                if let Some(Some((min, max))) = self.pane_y_bounds.get(pane_index) {
+                if let Some(Some((min, max))) = self.plot_viewport.pane_y_bounds.get(pane_index) {
                     if min.is_finite() && max.is_finite() && max > min {
                         *bound = (*min, *max);
                     }
@@ -14710,7 +15091,7 @@ impl ScopeApp {
         pane_count: usize,
     ) -> Vec<(f64, f64)> {
         if pane_count <= 1 {
-            if let (Some(min), Some(max)) = (self.y_min, self.y_max) {
+            if let (Some(min), Some(max)) = (self.plot_viewport.y_min, self.plot_viewport.y_max) {
                 if min.is_finite() && max.is_finite() && max > min {
                     return vec![(min, max)];
                 }
@@ -14805,7 +15186,7 @@ impl ScopeApp {
             .collect::<Vec<_>>();
         if pane_count > 1 {
             for (pane_index, bound) in bounds.iter_mut().enumerate() {
-                if let Some(Some((min, max))) = self.pane_y_bounds.get(pane_index) {
+                if let Some(Some((min, max))) = self.plot_viewport.pane_y_bounds.get(pane_index) {
                     if min.is_finite() && max.is_finite() && max > min {
                         *bound = (*min, *max);
                     }
@@ -14822,8 +15203,8 @@ impl ScopeApp {
         let start_time = meta.start_time;
         let end_time = meta.end_time;
         let span = self.visible_time_span();
-        let mut start = self.view_start + delta_time;
-        let mut end = self.view_end + delta_time;
+        let mut start = self.plot_viewport.view_start + delta_time;
+        let mut end = self.plot_viewport.view_end + delta_time;
         if start < start_time {
             start = start_time;
             end = start + span;
@@ -14832,8 +15213,8 @@ impl ScopeApp {
             end = end_time;
             start = end - span;
         }
-        self.view_start = start.max(start_time);
-        self.view_end = end.min(end_time);
+        self.plot_viewport.view_start = start.max(start_time);
+        self.plot_viewport.view_end = end.min(end_time);
         self.defer_plot_reload();
     }
 
@@ -14841,10 +15222,10 @@ impl ScopeApp {
         if let Some(meta) = self.meta() {
             let start_time = meta.start_time;
             let end_time = meta.end_time;
-            self.view_start = start_time;
-            self.view_end = end_time;
-            self.y_min = None;
-            self.y_max = None;
+            self.plot_viewport.view_start = start_time;
+            self.plot_viewport.view_end = end_time;
+            self.plot_viewport.y_min = None;
+            self.plot_viewport.y_max = None;
             self.needs_plot_reload = true;
             self.needs_compare_plot_reload = true;
             self.needs_derived_reload = true;
@@ -14856,14 +15237,14 @@ impl ScopeApp {
             return;
         };
         let clamped = time.clamp(meta.start_time, meta.end_time);
-        match self.active_cursor {
+        match self.plot_viewport.active_cursor {
             CursorId::A => {
-                self.cursor_a = clamped;
-                self.show_cursor_a = true;
+                self.plot_viewport.cursor_a = clamped;
+                self.plot_viewport.show_cursor_a = true;
             }
             CursorId::B => {
-                self.cursor_b = clamped;
-                self.show_cursor_b = true;
+                self.plot_viewport.cursor_b = clamped;
+                self.plot_viewport.show_cursor_b = true;
             }
         }
         self.measurement_cache = None;
@@ -14878,12 +15259,12 @@ impl ScopeApp {
         let clamped = time.clamp(meta.start_time, meta.end_time);
         match cursor {
             CursorId::A => {
-                self.cursor_a = clamped;
-                self.show_cursor_a = true;
+                self.plot_viewport.cursor_a = clamped;
+                self.plot_viewport.show_cursor_a = true;
             }
             CursorId::B => {
-                self.cursor_b = clamped;
-                self.show_cursor_b = true;
+                self.plot_viewport.cursor_b = clamped;
+                self.plot_viewport.show_cursor_b = true;
             }
         }
         self.measurement_cache = None;
@@ -14922,8 +15303,8 @@ impl ScopeApp {
             }
         }
         if end > start {
-            self.view_start = start;
-            self.view_end = end;
+            self.plot_viewport.view_start = start;
+            self.plot_viewport.view_end = end;
             self.needs_plot_reload = true;
             self.needs_compare_plot_reload = true;
         }
@@ -14965,8 +15346,8 @@ impl ScopeApp {
         }
         let fft_channel = self.fft_channel;
 
-        let start = self.cursor_a.min(self.cursor_b);
-        let end = self.cursor_a.max(self.cursor_b);
+        let start = self.plot_viewport.cursor_a.min(self.plot_viewport.cursor_b);
+        let end = self.plot_viewport.cursor_a.max(self.plot_viewport.cursor_b);
         let sample_rate_hz = self.sample_rate_hz.max(1.0);
         let harmonic_base_hz = self.harmonic_base_hz.max(0.001);
         let channel_name = self.fft_channel_name(dataset_index, fft_channel);
@@ -15093,8 +15474,8 @@ impl ScopeApp {
         }
         let fft_channel = self.fft_channel;
 
-        let start = self.cursor_a.min(self.cursor_b);
-        let end = self.cursor_a.max(self.cursor_b);
+        let start = self.plot_viewport.cursor_a.min(self.plot_viewport.cursor_b);
+        let end = self.plot_viewport.cursor_a.max(self.plot_viewport.cursor_b);
         let sample_rate_hz = self.sample_rate_hz.max(1.0);
         let harmonic_base_hz = self.harmonic_base_hz.max(0.001);
         let channel_name = self.fft_channel_name(dataset_index, fft_channel);
@@ -15220,8 +15601,8 @@ impl ScopeApp {
         &self,
         dataset_index: usize,
     ) -> Option<(Arc<dyn DataSource>, f64, f64)> {
-        let start = self.cursor_a.min(self.cursor_b);
-        let end = self.cursor_a.max(self.cursor_b);
+        let start = self.plot_viewport.cursor_a.min(self.plot_viewport.cursor_b);
+        let end = self.plot_viewport.cursor_a.max(self.plot_viewport.cursor_b);
         if dataset_index == 0 {
             self.source.clone().map(|source| (source, start, end))
         } else {
@@ -15795,8 +16176,8 @@ impl ScopeApp {
             let next = Self::sanitize_channel_scale(scale);
             if (*current - next).abs() > f32::EPSILON {
                 *current = next;
-                self.y_min = None;
-                self.y_max = None;
+                self.plot_viewport.y_min = None;
+                self.plot_viewport.y_max = None;
                 self.measurement_cache = None;
                 self.derived_curve_cache = None;
                 self.derived_measurement_cache = None;
@@ -16036,13 +16417,13 @@ impl ScopeApp {
     }
 
     fn fit_to_cursors(&mut self) {
-        self.zoom_to_range(self.cursor_a, self.cursor_b);
+        self.zoom_to_range(self.plot_viewport.cursor_a, self.plot_viewport.cursor_b);
     }
 
     fn toggle_cursor_visibility(&mut self) {
-        let show = !(self.show_cursor_a || self.show_cursor_b);
-        self.show_cursor_a = show;
-        self.show_cursor_b = show;
+        let show = !(self.plot_viewport.show_cursor_a || self.plot_viewport.show_cursor_b);
+        self.plot_viewport.show_cursor_a = show;
+        self.plot_viewport.show_cursor_b = show;
     }
 
     fn sidebar_visibility_after_shortcuts(
@@ -16675,7 +17056,8 @@ impl ScopeApp {
         });
         self.scope_layout_rows = self.scope_layout_rows.clamp(1, MAX_SCOPE_LAYOUT_ROWS);
         self.scope_layout_cols = self.scope_layout_cols.clamp(1, MAX_SCOPE_LAYOUT_COLS);
-        self.active_scope_pane = self
+        self.plot_viewport.active_scope_pane = self
+            .plot_viewport
             .active_scope_pane
             .min(self.scope_pane_count().saturating_sub(1));
 
@@ -16708,7 +17090,8 @@ impl ScopeApp {
                         if response.clicked() {
                             self.scope_layout_rows = row;
                             self.scope_layout_cols = col;
-                            self.active_scope_pane = self
+                            self.plot_viewport.active_scope_pane = self
+                                .plot_viewport
                                 .active_scope_pane
                                 .min(self.scope_pane_count().saturating_sub(1));
                         }
@@ -16724,7 +17107,7 @@ impl ScopeApp {
             if ui.button(self.t(UiText::Single)).clicked() {
                 self.scope_layout_rows = 1;
                 self.scope_layout_cols = 1;
-                self.active_scope_pane = 0;
+                self.plot_viewport.active_scope_pane = 0;
             }
         });
     }
@@ -16980,6 +17363,7 @@ impl ScopeApp {
         ui.horizontal_wrapped(|ui| {
             self.workspace_selector(ui);
             ui.separator();
+            self.project_menu(ui);
             if self.live.workspace_mode == scope_analyzer::live::state::WorkspaceMode::Live {
                 self.live_toolbar(ui);
                 return;
@@ -17307,6 +17691,9 @@ impl ScopeApp {
                         ui.label("鼠标滚轮：以鼠标位置为中心缩放纵轴幅值范围。Ctrl + 滚轮/触摸板滚动：缩放横轴时间范围。");
                         ui.label("左侧变量栏：按数据组、模拟量/数字量和变量名组织。右键数据组可全选/全不选并配置线型；双击变量名可编辑显示名；右键变量名可配置变比。");
                         ui.label("变量名导入/导出：只保存和恢复显示名，不覆盖通道可见性、颜色、线宽、倍率、FFT 设置、语言、主题或快捷键。");
+                        ui.label("工程文件：顶部 Project 菜单可保存或恢复 .scopeproj。工程包含数据组、布局、光标、测量绑定、实时预设、Capture 资产和导出标注；恢复实时预设时不会自动连接设备。");
+                        ui.label("工程测量：Avg、真 RMS、正/负/绝对峰值、峰峰值和频率对离线、冻结 Capture 与 Live 使用同一算法。频率不会跨 gap；三相 Q₁ 为基波无功，PF=P/S。");
+                        ui.label("实时采集：底部测量页在后台刷新；事件页可选择、固定和分析多个 Capture。带宽助手按 SCP1 实际帧大小给出 Safe/Warning/Critical 和安全批次建议。");
                         ui.label("侧栏：左右侧栏都可以拖动调整宽度。窗口变窄时变量名会自动缩短或隐藏，右侧分析选择项会按空间自动横向或纵向排列。");
                         ui.label("默认快捷键：Ctrl+B 显示/隐藏左侧变量栏，Ctrl+Alt+B 显示/隐藏右侧分析栏。快捷键在输入框获得焦点时仍可生效。");
                         ui.label("左键点击波形：移动最近的光标。左键拖拽：框选时间范围并放大。右键点击：打开光标菜单。右键拖拽：平移当前视图。");
@@ -17372,6 +17759,9 @@ impl ScopeApp {
                         ui.label("Mouse wheel zooms the vertical axis around the pointer. Ctrl + wheel or touchpad scroll zooms the time axis.");
                         ui.label("The left channel list is organized by dataset, analog/digital type, and channel name. Right-click datasets or channels for related settings.");
                         ui.label("Name import/export only stores display names; it does not overwrite visibility, color, line width, scale, FFT, language, theme, or shortcut settings.");
+                        ui.label("Projects: use the top Project menu for .scopeproj files. Projects include datasets, layout, cursors, measurement bindings, Live presets, Capture assets, and export annotations; restoring a Live preset never connects automatically.");
+                        ui.label("Engineering measurements: Avg, true RMS, signed/absolute peaks, peak-to-peak, and frequency share one engine across Offline, frozen Capture, and Live. Frequency never bridges gaps; Q₁ is fundamental reactive power and PF=P/S.");
+                        ui.label("Live capture: Measurements refresh in a background worker; Events can select, pin, and analyze multiple Captures. The bandwidth assistant uses exact SCP1 frame sizes for Safe/Warning/Critical status and safe-batch suggestions.");
                         ui.label("Sidebars can be resized by dragging. When the window is narrow, channel names shorten or hide automatically, and analysis selectors switch between horizontal and vertical layouts based on available space.");
                         ui.label("Default sidebar shortcuts follow VS Code style: Ctrl+B toggles the left channel sidebar, and Ctrl+Alt+B toggles the right analysis sidebar. These shortcuts still work while text inputs are focused.");
                         ui.label("Left-click the plot to move the nearest cursor. Drag with the left button to zoom a time range. Right-click for the cursor menu; right-drag pans the current view.");
@@ -17624,8 +18014,8 @@ impl ScopeApp {
                     self.export_cursor_table_enabled = true;
                     self.export_pane_scope = ExportPaneScope::All;
                     self.export_time_range_mode = ExportTimeRangeMode::View;
-                    self.export_manual_start = self.view_start;
-                    self.export_manual_end = self.view_end;
+                    self.export_manual_start = self.plot_viewport.view_start;
+                    self.export_manual_end = self.plot_viewport.view_end;
                 }
                 ui.separator();
                 let old_sample_rate = self.sample_rate_hz;
@@ -17995,30 +18385,79 @@ impl ScopeApp {
         }
     }
 
+    fn auto_measure_segments(
+        segments: &[SampleBlock],
+        channel_scales: &[(usize, f32)],
+        power: Option<&ThreePhasePowerSpec>,
+    ) -> Result<MeasurementBatch, String> {
+        let specs = channel_scales
+            .iter()
+            .enumerate()
+            .map(|(column, (channel_index, scale))| ChannelMeasurementSpec {
+                channel_index: *channel_index,
+                column,
+                name: String::new(),
+                unit: String::new(),
+                scale: f64::from(*scale),
+            })
+            .collect::<Vec<_>>();
+        let result =
+            analyze_segments(segments, &specs, power).map_err(|error| error.to_string())?;
+        let power = result.power.clone();
+        let mut rows = Vec::with_capacity(result.channels.len());
+        for (column, statistics) in result.channels.into_iter().enumerate() {
+            let first = segments
+                .iter()
+                .find_map(|segment| segment.channels.get(column)?.first().copied());
+            let last = segments
+                .iter()
+                .rev()
+                .find_map(|segment| segment.channels.get(column)?.last().copied());
+            let (Some(first), Some(last)) = (first, last) else {
+                continue;
+            };
+            let scale = channel_scales[column].1;
+            rows.push((
+                statistics.channel_index,
+                AutoMeasurement {
+                    first: first * scale,
+                    last: last * scale,
+                    statistics,
+                },
+            ));
+        }
+        Ok(MeasurementBatch { rows, power })
+    }
+
+    #[cfg(test)]
     fn auto_measure(times: &[f64], samples: &[f32]) -> Option<AutoMeasurement> {
-        if times.len() < 2 || samples.len() < 2 {
-            return None;
-        }
-        let sample_count = times.len().min(samples.len());
-        let samples = &samples[..sample_count];
-        let mut min = f32::INFINITY;
-        let mut max = f32::NEG_INFINITY;
+        let block = SampleBlock {
+            times: times.to_vec(),
+            channels: vec![samples.to_vec()],
+        };
+        Self::auto_measure_segments(&[block], &[(0, DEFAULT_CHANNEL_SCALE)], None)
+            .ok()?
+            .rows
+            .pop()
+            .map(|(_, measurement)| measurement)
+    }
 
-        for &sample in samples {
-            min = min.min(sample);
-            max = max.max(sample);
-        }
+    fn format_measurement_value(value: Option<f64>) -> String {
+        value
+            .filter(|value| value.is_finite())
+            .map_or_else(|| "—".to_owned(), |value| format!("{value:.3}"))
+    }
 
-        if !min.is_finite() || !max.is_finite() {
-            return None;
+    fn measurement_quality_label(statistics: &ChannelStatistics) -> &'static str {
+        if !statistics.quality.is_valid() {
+            "Invalid"
+        } else if statistics.quality.low_amplitude {
+            "Low signal"
+        } else if statistics.quality.contains_gap {
+            "Gap"
+        } else {
+            "OK"
         }
-
-        Some(AutoMeasurement {
-            first: samples[0],
-            last: samples[sample_count - 1],
-            min,
-            max,
-        })
     }
 
     fn interpolated_y(points: &[PlotPoint], x: f64) -> Option<f64> {
@@ -18358,8 +18797,8 @@ impl ScopeApp {
                 );
                 *scale = Self::sanitize_channel_scale(*scale);
                 if scale_response.changed() && (*scale - old_scale).abs() > f32::EPSILON {
-                    self.y_min = None;
-                    self.y_max = None;
+                    self.plot_viewport.y_min = None;
+                    self.plot_viewport.y_max = None;
                     self.measurement_cache = None;
                     self.derived_curve_cache = None;
                     self.derived_measurement_cache = None;
@@ -18817,18 +19256,24 @@ impl ScopeApp {
             start: result.start,
             end: result.end,
             channels: result.channels.clone(),
+            power_enabled: result.power_enabled,
+            power_voltage_channels: result.power_voltage_channels,
+            power_current_channels: result.power_current_channels,
         };
         if &result_key != expected_key {
             return;
         }
         match result.result {
-            Ok(rows) => {
+            Ok(batch) => {
                 self.measurement_cache = Some(MeasurementCache {
                     dataset_index: result.dataset_index,
                     start: result.start,
                     end: result.end,
                     channels: result.channels,
-                    rows,
+                    rows: batch.rows,
+                    power: batch.power,
+                    power_voltage_channels: result.power_voltage_channels,
+                    power_current_channels: result.power_current_channels,
                 });
             }
             Err(error) => self.last_error = Some(error),
@@ -18854,6 +19299,29 @@ impl ScopeApp {
             .iter()
             .map(|channel| (*channel, self.channel_scale(*channel)))
             .collect::<Vec<_>>();
+        let power = key.power_enabled.then(|| {
+            let voltage_columns = key.power_voltage_channels.map(|channel| {
+                channels
+                    .iter()
+                    .position(|candidate| *candidate == channel)
+                    .expect("power voltage channels are included in the measurement request")
+            });
+            let current_columns = key.power_current_channels.map(|channel| {
+                channels
+                    .iter()
+                    .position(|candidate| *candidate == channel)
+                    .expect("power current channels are included in the measurement request")
+            });
+            let mut spec = ThreePhasePowerSpec::new(voltage_columns, current_columns);
+            spec.voltage_scales = key
+                .power_voltage_channels
+                .map(|channel| f64::from(self.channel_scale(channel)));
+            spec.current_scales = key
+                .power_current_channels
+                .map(|channel| f64::from(self.channel_scale(channel)));
+            spec.nominal_frequency_hz = self.harmonic_base_hz.max(0.001);
+            spec
+        });
         self.measurement_worker_key = Some(key.clone());
         let cancel_token = JobCancelToken::new();
         let worker_cancel = cancel_token.clone();
@@ -18862,10 +19330,13 @@ impl ScopeApp {
             let result = Self::worker_result("Measurement worker panicked.", || {
                 let data_cancel = worker_cancel.data_token();
                 if read_end <= read_start {
-                    Ok(Vec::new())
+                    Ok(MeasurementBatch {
+                        rows: Vec::new(),
+                        power: None,
+                    })
                 } else {
                     source
-                        .read_range_cancellable(
+                        .read_range_segments_cancellable(
                             read_start,
                             read_end,
                             &channels,
@@ -18873,32 +19344,14 @@ impl ScopeApp {
                             &data_cancel,
                         )
                         .map_err(|error| error.to_string())
-                        .map(|block| {
-                            let mut rows = Vec::new();
+                        .and_then(|blocks| {
                             if worker_cancel.is_cancelled() {
-                                return rows;
+                                return Ok(MeasurementBatch {
+                                    rows: Vec::new(),
+                                    power: None,
+                                });
                             }
-                            if !block.times.is_empty() {
-                                for (out_index, (channel_index, scale)) in
-                                    channel_scales.iter().enumerate()
-                                {
-                                    let Some(values) = block.channels.get(out_index) else {
-                                        continue;
-                                    };
-                                    let scaled_values =
-                                        if (*scale - DEFAULT_CHANNEL_SCALE).abs() <= f32::EPSILON {
-                                            values.clone()
-                                        } else {
-                                            values.iter().map(|value| *value * *scale).collect()
-                                        };
-                                    if let Some(measurement) =
-                                        Self::auto_measure(&block.times, &scaled_values)
-                                    {
-                                        rows.push((*channel_index, measurement));
-                                    }
-                                }
-                            }
-                            rows
+                            Self::auto_measure_segments(&blocks, &channel_scales, power.as_ref())
                         })
                 }
             });
@@ -18908,6 +19361,9 @@ impl ScopeApp {
                 start: key.start,
                 end: key.end,
                 channels: key.channels,
+                power_enabled: key.power_enabled,
+                power_voltage_channels: key.power_voltage_channels,
+                power_current_channels: key.power_current_channels,
                 result,
             }
         });
@@ -19004,20 +19460,25 @@ impl ScopeApp {
                     MAX_AUTO_MEASURE_POINTS,
                     Some(&data_cancel),
                 )
-                .map(|block| {
-                    let mut rows = Vec::new();
+                .and_then(|block| {
                     if worker_cancel.is_cancelled() {
-                        return rows;
+                        return Ok(Vec::new());
                     }
-                    for derived_index in &channels {
-                        let Some(values) = block.channels.get(*derived_index) else {
-                            continue;
-                        };
-                        if let Some(measurement) = Self::auto_measure(&block.times, values) {
-                            rows.push((*derived_index, measurement));
-                        }
-                    }
-                    rows
+                    let measurement_segments = channels
+                        .iter()
+                        .filter_map(|derived_index| block.channels.get(*derived_index).cloned())
+                        .collect::<Vec<_>>();
+                    let selected_block = SampleBlock {
+                        times: block.times,
+                        channels: measurement_segments,
+                    };
+                    let scales = channels
+                        .iter()
+                        .copied()
+                        .map(|channel| (channel, DEFAULT_CHANNEL_SCALE))
+                        .collect::<Vec<_>>();
+                    Self::auto_measure_segments(&[selected_block], &scales, None)
+                        .map(|batch| batch.rows)
                 })
             });
             DerivedMeasurementJobResult {
@@ -19168,7 +19629,7 @@ impl ScopeApp {
 
     fn measurements_panel(&mut self, ui: &mut egui::Ui) {
         let hidden_label = self.t(UiText::Hidden);
-        let dt = (self.cursor_b - self.cursor_a).abs();
+        let dt = (self.plot_viewport.cursor_b - self.plot_viewport.cursor_a).abs();
         let dataset_index = self.selected_fft_dataset_index();
         self.fft_dataset_index = dataset_index;
 
@@ -19177,14 +19638,22 @@ impl ScopeApp {
             ui.label(format!(
                 "{}: {:.5}s{}",
                 Self::cursor_label(CursorId::A),
-                self.cursor_a,
-                if self.show_cursor_a { "" } else { hidden_label }
+                self.plot_viewport.cursor_a,
+                if self.plot_viewport.show_cursor_a {
+                    ""
+                } else {
+                    hidden_label
+                }
             ));
             ui.label(format!(
                 "{}: {:.5}s{}",
                 Self::cursor_label(CursorId::B),
-                self.cursor_b,
-                if self.show_cursor_b { "" } else { hidden_label }
+                self.plot_viewport.cursor_b,
+                if self.plot_viewport.show_cursor_b {
+                    ""
+                } else {
+                    hidden_label
+                }
             ));
             ui.label(format!("dX: {:.5}s", dt));
             if dt > 0.0 {
@@ -19202,13 +19671,66 @@ impl ScopeApp {
         if self.source.is_none() {
             return;
         }
+        self.scope_trigger_navigation_ui(ui);
         let channel_options = self.fft_channel_options();
-        let channels = channel_options
+        let can_measure_power = channel_options.len() >= 6;
+        ui.horizontal(|ui| {
+            ui.add_enabled(
+                can_measure_power,
+                egui::Checkbox::new(&mut self.power_enabled, "3φ P/Q/S/PF"),
+            );
+            if !can_measure_power {
+                ui.label(self.t(UiText::SequenceNeedsThreeAnalogChannels));
+            }
+        });
+        if self.power_enabled && can_measure_power {
+            let options = channel_options
+                .iter()
+                .map(|channel| {
+                    (
+                        *channel,
+                        self.fft_channel_name(dataset_index, *channel),
+                        self.related_three_phase_channels_from_anchor(*channel, &channel_options),
+                    )
+                })
+                .collect::<Vec<_>>();
+            ui.horizontal(|ui| {
+                ui.label("Vabc");
+                if Self::three_phase_channel_selectors_ui(
+                    ui,
+                    "measurement_power_voltage",
+                    dataset_index,
+                    &options,
+                    &mut self.power_voltage_channels,
+                ) {
+                    self.measurement_cache = None;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Iabc");
+                if Self::three_phase_channel_selectors_ui(
+                    ui,
+                    "measurement_power_current",
+                    dataset_index,
+                    &options,
+                    &mut self.power_current_channels,
+                ) {
+                    self.measurement_cache = None;
+                }
+            });
+        }
+        let mut channels = channel_options
             .contains(&self.fft_channel)
             .then_some(self.fft_channel)
             .into_iter()
             .collect::<Vec<_>>();
         let derived_channels = self.selected_derived_channels();
+        if self.power_enabled && can_measure_power {
+            channels.extend(self.power_voltage_channels);
+            channels.extend(self.power_current_channels);
+            channels.sort_unstable();
+            channels.dedup();
+        }
         if channels.is_empty() && derived_channels.is_empty() {
             ui.label(self.t(UiText::NoChannelsSelected));
             return;
@@ -19219,14 +19741,17 @@ impl ScopeApp {
             .copied()
             .take(12_usize.saturating_sub(measurement_channels.len()))
             .collect::<Vec<_>>();
-        let start = self.cursor_a.min(self.cursor_b);
-        let end = self.cursor_a.max(self.cursor_b);
+        let start = self.plot_viewport.cursor_a.min(self.plot_viewport.cursor_b);
+        let end = self.plot_viewport.cursor_a.max(self.plot_viewport.cursor_b);
         let measurement_key = MeasurementJobKey {
             generation: self.data_generation,
             dataset_index,
             start,
             end,
             channels: measurement_channels.clone(),
+            power_enabled: self.power_enabled && can_measure_power,
+            power_voltage_channels: self.power_voltage_channels,
+            power_current_channels: self.power_current_channels,
         };
         let derived_measurement_key = self.derived_key_for_range(start, end);
         if !derived_measurement_channels.is_empty() {
@@ -19258,6 +19783,9 @@ impl ScopeApp {
                     && cache.start == start
                     && cache.end == end
                     && cache.channels == measurement_channels
+                    && cache.power.is_some() == measurement_key.power_enabled
+                    && cache.power_voltage_channels == measurement_key.power_voltage_channels
+                    && cache.power_current_channels == measurement_key.power_current_channels
             }
             None => false,
         };
@@ -19274,7 +19802,7 @@ impl ScopeApp {
         egui::ScrollArea::horizontal().show(ui, |ui| {
             egui::Grid::new("measurement_table")
                 .striped(true)
-                .num_columns(6)
+                .num_columns(12)
                 .spacing([10.0, 4.0])
                 .show(ui, |ui| {
                     Self::fixed_grid_label(
@@ -19308,17 +19836,26 @@ impl ScopeApp {
                     Self::fixed_grid_label(
                         ui,
                         MEASUREMENT_VALUE_COLUMN_WIDTH,
-                        RichText::new(self.t(UiText::Min)).strong(),
+                        RichText::new("Avg").strong(),
                         true,
                         false,
                     );
                     Self::fixed_grid_label(
                         ui,
                         MEASUREMENT_VALUE_COLUMN_WIDTH,
-                        RichText::new(self.t(UiText::Max)).strong(),
+                        RichText::new("RMS").strong(),
                         true,
                         false,
                     );
+                    for heading in ["+Peak", "-Peak", "Abs", "Pk-Pk", "Freq", "Quality"] {
+                        Self::fixed_grid_label(
+                            ui,
+                            MEASUREMENT_VALUE_COLUMN_WIDTH,
+                            RichText::new(heading).strong(),
+                            true,
+                            false,
+                        );
+                    }
                     ui.end_row();
 
                     for (channel_index, measurement) in &cache.rows {
@@ -19373,14 +19910,50 @@ impl ScopeApp {
                         Self::fixed_grid_label(
                             ui,
                             MEASUREMENT_VALUE_COLUMN_WIDTH,
-                            text(format!("{:.2}", measurement.min)),
+                            text(Self::format_measurement_value(measurement.statistics.mean)),
                             true,
                             false,
                         );
                         Self::fixed_grid_label(
                             ui,
                             MEASUREMENT_VALUE_COLUMN_WIDTH,
-                            text(format!("{:.2}", measurement.max)),
+                            text(Self::format_measurement_value(measurement.statistics.rms)),
+                            true,
+                            false,
+                        );
+                        for value in [
+                            measurement.statistics.positive_peak,
+                            measurement.statistics.negative_peak,
+                            measurement.statistics.absolute_peak,
+                            measurement.statistics.peak_to_peak,
+                        ] {
+                            Self::fixed_grid_label(
+                                ui,
+                                MEASUREMENT_VALUE_COLUMN_WIDTH,
+                                text(Self::format_measurement_value(value)),
+                                true,
+                                false,
+                            );
+                        }
+                        Self::fixed_grid_label(
+                            ui,
+                            MEASUREMENT_VALUE_COLUMN_WIDTH,
+                            text(Self::format_measurement_value(
+                                measurement
+                                    .statistics
+                                    .frequency
+                                    .as_ref()
+                                    .map(|value| value.hz),
+                            )),
+                            true,
+                            false,
+                        );
+                        Self::fixed_grid_label(
+                            ui,
+                            MEASUREMENT_VALUE_COLUMN_WIDTH,
+                            text(
+                                Self::measurement_quality_label(&measurement.statistics).to_owned(),
+                            ),
                             true,
                             false,
                         );
@@ -19423,14 +19996,51 @@ impl ScopeApp {
                             Self::fixed_grid_label(
                                 ui,
                                 MEASUREMENT_VALUE_COLUMN_WIDTH,
-                                text(format!("{:.2}", measurement.min)),
+                                text(Self::format_measurement_value(measurement.statistics.mean)),
                                 true,
                                 false,
                             );
                             Self::fixed_grid_label(
                                 ui,
                                 MEASUREMENT_VALUE_COLUMN_WIDTH,
-                                text(format!("{:.2}", measurement.max)),
+                                text(Self::format_measurement_value(measurement.statistics.rms)),
+                                true,
+                                false,
+                            );
+                            for value in [
+                                measurement.statistics.positive_peak,
+                                measurement.statistics.negative_peak,
+                                measurement.statistics.absolute_peak,
+                                measurement.statistics.peak_to_peak,
+                            ] {
+                                Self::fixed_grid_label(
+                                    ui,
+                                    MEASUREMENT_VALUE_COLUMN_WIDTH,
+                                    text(Self::format_measurement_value(value)),
+                                    true,
+                                    false,
+                                );
+                            }
+                            Self::fixed_grid_label(
+                                ui,
+                                MEASUREMENT_VALUE_COLUMN_WIDTH,
+                                text(Self::format_measurement_value(
+                                    measurement
+                                        .statistics
+                                        .frequency
+                                        .as_ref()
+                                        .map(|value| value.hz),
+                                )),
+                                true,
+                                false,
+                            );
+                            Self::fixed_grid_label(
+                                ui,
+                                MEASUREMENT_VALUE_COLUMN_WIDTH,
+                                text(
+                                    Self::measurement_quality_label(&measurement.statistics)
+                                        .to_owned(),
+                                ),
                                 true,
                                 false,
                             );
@@ -19439,6 +20049,90 @@ impl ScopeApp {
                     }
                 });
         });
+        if let Some(power) = &cache.power {
+            ui.add_space(8.0);
+            ui.label(RichText::new("3φ Power").strong());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("P: {:.3} {}", power.active_power, power.power_unit));
+                ui.label(format!("Q₁: {:.3} var", power.fundamental_reactive_power));
+                ui.label(format!("S: {:.3} VA", power.effective_apparent_power));
+                ui.label(format!(
+                    "PF: {}",
+                    Self::format_measurement_value(power.true_power_factor)
+                ));
+                ui.label(format!("f₁: {:.3} Hz", power.frequency_hz));
+                if power.quality.contains_gap {
+                    ui.colored_label(Color32::from_rgb(226, 170, 55), "Gap");
+                }
+            });
+        }
+    }
+
+    fn scope_trigger_navigation_ui(&mut self, ui: &mut egui::Ui) {
+        if self.scope_trigger_events.is_empty() || self.scope_trigger_tick_hz == 0 {
+            return;
+        }
+        let count = self.scope_trigger_events.len();
+        let mut selected = self.selected_scope_trigger.unwrap_or(0).min(count - 1);
+        let previous = selected;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(".scope Capture").strong());
+            if ui
+                .add_enabled(selected > 0, egui::Button::new("◀"))
+                .clicked()
+            {
+                selected -= 1;
+            }
+            egui::ComboBox::from_id_source("scope_trigger_event")
+                .selected_text(format!("{} / {}", selected + 1, count))
+                .show_ui(ui, |ui| {
+                    for (index, event) in self.scope_trigger_events.iter().enumerate() {
+                        ui.selectable_value(
+                            &mut selected,
+                            index,
+                            format!(
+                                "#{} · sample {}{}",
+                                index + 1,
+                                event.trigger_sample_index,
+                                if event.auto_timeout { " · Auto" } else { "" }
+                            ),
+                        );
+                    }
+                });
+            if ui
+                .add_enabled(selected + 1 < count, egui::Button::new("▶"))
+                .clicked()
+            {
+                selected += 1;
+            }
+        });
+        if selected != previous || self.selected_scope_trigger.is_none() {
+            self.select_scope_trigger_event(selected);
+        }
+    }
+
+    fn select_scope_trigger_event(&mut self, index: usize) {
+        let Some(event) = self.scope_trigger_events.get(index) else {
+            return;
+        };
+        let Some(source) = &self.source else {
+            return;
+        };
+        let meta = source.metadata();
+        let trigger_time = event.timestamp_ticks as f64 / self.scope_trigger_tick_hz as f64;
+        let sample_rate = meta.nominal_sample_rate_hz.max(1.0);
+        let start =
+            (trigger_time - event.config.pre_samples as f64 / sample_rate).max(meta.start_time);
+        let end = (trigger_time + event.config.post_samples as f64 / sample_rate)
+            .min(meta.end_time)
+            .max(start + 1.0 / sample_rate);
+        self.selected_scope_trigger = Some(index);
+        self.plot_viewport.reset_to_range(start, end);
+        self.plot_viewport.cursor_a = start;
+        self.plot_viewport.cursor_b = end;
+        self.measurement_cache = None;
+        self.needs_plot_reload = true;
+        self.needs_fft_reload = true;
     }
 
     fn sequence_panel(&mut self, ui: &mut egui::Ui, channel_options: &[usize]) {
@@ -19451,8 +20145,8 @@ impl ScopeApp {
 
         self.ensure_sequence_channels_for_options(channel_options);
 
-        let start = self.cursor_a.min(self.cursor_b);
-        let end = self.cursor_a.max(self.cursor_b);
+        let start = self.plot_viewport.cursor_a.min(self.plot_viewport.cursor_b);
+        let end = self.plot_viewport.cursor_a.max(self.plot_viewport.cursor_b);
         let sequence_key = SequenceJobKey {
             generation: self.data_generation,
             dataset_index: self.fft_dataset_index,
@@ -19897,7 +20591,10 @@ impl ScopeApp {
         let rows = self.scope_layout_rows.clamp(1, MAX_SCOPE_LAYOUT_ROWS);
         let cols = self.scope_layout_cols.clamp(1, MAX_SCOPE_LAYOUT_COLS);
         let pane_count = rows * cols;
-        self.active_scope_pane = self.active_scope_pane.min(pane_count.saturating_sub(1));
+        self.plot_viewport.active_scope_pane = self
+            .plot_viewport
+            .active_scope_pane
+            .min(pane_count.saturating_sub(1));
         self.sync_pane_y_bounds_len();
         let available = ui.available_size();
         let spacing = ui.spacing().item_spacing;
@@ -20005,13 +20702,13 @@ impl ScopeApp {
         }
         let response = plot.show(ui, |plot_ui| {
             plot_ui.set_plot_bounds(PlotBounds::from_min_max(
-                [self.view_start, plot_y_min],
-                [self.view_end, plot_y_max],
+                [self.plot_viewport.view_start, plot_y_min],
+                [self.plot_viewport.view_end, plot_y_max],
             ));
             Self::draw_scope_dashed_grid(
                 plot_ui,
-                self.view_start,
-                self.view_end,
+                self.plot_viewport.view_start,
+                self.plot_viewport.view_end,
                 plot_y_min,
                 plot_y_max,
                 grid_color,
@@ -20030,27 +20727,32 @@ impl ScopeApp {
                 if local_index >= prepared.primary_samples.points.len() {
                     continue;
                 }
-                let Some(points) = prepared.primary_samples.points.get(local_index) else {
-                    continue;
-                };
                 let channel_name = self.channel_name(*channel_index);
                 let legend_name =
                     self.plot_legend_name(0, &channel_name, show_dataset_prefix, None);
                 let line_color = self.plot_channel_color(*channel_index, 0, pane_index, pane_count);
-                if let Some(y) = preview_cursor_x.and_then(|x| Self::interpolated_y(points, x)) {
+                let segments = Self::frame_plot_segments(
+                    &prepared.primary_samples,
+                    local_index,
+                    lightweight_plot,
+                );
+                if let Some(y) = preview_cursor_x.and_then(|x| {
+                    segments
+                        .iter()
+                        .find_map(|segment| Self::interpolated_y(segment, x))
+                }) {
                     preview_intersections.push((y, line_color));
                 }
-                plot_ui.line(
-                    Line::new(Self::frame_plot_points(
-                        points,
-                        prepared.primary_samples.lightweight_points.get(local_index),
-                        lightweight_plot,
-                    ))
-                    .name(legend_name)
-                    .color(line_color)
-                    .style(self.channel_line_pattern(*channel_index).plot_style())
-                    .width(self.visible_line_width(*channel_index)),
-                );
+                for (segment_index, segment) in segments.into_iter().enumerate() {
+                    let mut line = Line::new(segment)
+                        .color(line_color)
+                        .style(self.channel_line_pattern(*channel_index).plot_style())
+                        .width(self.visible_line_width(*channel_index));
+                    if segment_index == 0 {
+                        line = line.name(legend_name.clone());
+                    }
+                    plot_ui.line(line);
+                }
             }
 
             if let (Some(summary), Some(prepared_summary)) =
@@ -20118,9 +20820,6 @@ impl ScopeApp {
                     if local_index >= prepared_imported.samples.points.len() {
                         continue;
                     }
-                    let Some(points) = prepared_imported.samples.points.get(local_index) else {
-                        continue;
-                    };
                     let channel_name = self.channel_name(*channel_index);
                     let legend_name = self.plot_legend_name(
                         dataset_index + 1,
@@ -20134,24 +20833,28 @@ impl ScopeApp {
                         pane_index,
                         pane_count,
                     );
-                    if let Some(y) = preview_cursor_x.and_then(|x| Self::interpolated_y(points, x))
-                    {
+                    let segments = Self::frame_plot_segments(
+                        &prepared_imported.samples,
+                        local_index,
+                        lightweight_plot,
+                    );
+                    if let Some(y) = preview_cursor_x.and_then(|x| {
+                        segments
+                            .iter()
+                            .find_map(|segment| Self::interpolated_y(segment, x))
+                    }) {
                         preview_intersections.push((y, line_color));
                     }
-                    plot_ui.line(
-                        Line::new(Self::frame_plot_points(
-                            points,
-                            prepared_imported
-                                .samples
-                                .lightweight_points
-                                .get(local_index),
-                            lightweight_plot,
-                        ))
-                        .name(legend_name)
-                        .color(line_color)
-                        .style(dataset_line_style)
-                        .width(self.compare_line_width(*channel_index)),
-                    );
+                    for (segment_index, segment) in segments.into_iter().enumerate() {
+                        let mut line = Line::new(segment)
+                            .color(line_color)
+                            .style(dataset_line_style)
+                            .width(self.compare_line_width(*channel_index));
+                        if segment_index == 0 {
+                            line = line.name(legend_name.clone());
+                        }
+                        plot_ui.line(line);
+                    }
                 }
 
                 if let (Some(summary), Some(prepared_imported)) =
@@ -20241,12 +20944,16 @@ impl ScopeApp {
             }
 
             let cursor_label_y = plot_y_max - (plot_y_max - plot_y_min) * 0.05;
-            if self.show_cursor_a {
+            if self.plot_viewport.show_cursor_a {
                 let color = Self::cursor_color(CursorId::A);
-                plot_ui.vline(VLine::new(self.cursor_a).color(color).width(2.5));
+                plot_ui.vline(
+                    VLine::new(self.plot_viewport.cursor_a)
+                        .color(color)
+                        .width(2.5),
+                );
                 plot_ui.text(
                     Text::new(
-                        PlotPoint::new(self.cursor_a, cursor_label_y),
+                        PlotPoint::new(self.plot_viewport.cursor_a, cursor_label_y),
                         RichText::new(Self::cursor_label(CursorId::A))
                             .strong()
                             .color(Color32::BLACK)
@@ -20255,12 +20962,16 @@ impl ScopeApp {
                     .anchor(egui::Align2::CENTER_TOP),
                 );
             }
-            if self.show_cursor_b {
+            if self.plot_viewport.show_cursor_b {
                 let color = Self::cursor_color(CursorId::B);
-                plot_ui.vline(VLine::new(self.cursor_b).color(color).width(2.5));
+                plot_ui.vline(
+                    VLine::new(self.plot_viewport.cursor_b)
+                        .color(color)
+                        .width(2.5),
+                );
                 plot_ui.text(
                     Text::new(
-                        PlotPoint::new(self.cursor_b, cursor_label_y),
+                        PlotPoint::new(self.plot_viewport.cursor_b, cursor_label_y),
                         RichText::new(Self::cursor_label(CursorId::B))
                             .strong()
                             .color(Color32::BLACK)
@@ -20324,22 +21035,22 @@ impl ScopeApp {
                 ui.close_menu();
             }
             ui.separator();
-            if self.show_cursor_a {
+            if self.plot_viewport.show_cursor_a {
                 if ui.button(self.t(UiText::HideCursorX1)).clicked() {
-                    self.show_cursor_a = false;
+                    self.plot_viewport.show_cursor_a = false;
                     ui.close_menu();
                 }
             } else if ui.button(self.t(UiText::ShowCursorX1)).clicked() {
-                self.show_cursor_a = true;
+                self.plot_viewport.show_cursor_a = true;
                 ui.close_menu();
             }
-            if self.show_cursor_b {
+            if self.plot_viewport.show_cursor_b {
                 if ui.button(self.t(UiText::HideCursorX2)).clicked() {
-                    self.show_cursor_b = false;
+                    self.plot_viewport.show_cursor_b = false;
                     ui.close_menu();
                 }
             } else if ui.button(self.t(UiText::ShowCursorX2)).clicked() {
-                self.show_cursor_b = true;
+                self.plot_viewport.show_cursor_b = true;
                 ui.close_menu();
             }
             let dataset_items = (0..=self.imported_datasets.len())
@@ -20414,7 +21125,8 @@ impl ScopeApp {
             } else {
                 smooth_scroll
             };
-            let center_x = hover_time.unwrap_or((self.view_start + self.view_end) * 0.5);
+            let center_x = hover_time
+                .unwrap_or((self.plot_viewport.view_start + self.plot_viewport.view_end) * 0.5);
             if let Some(factor) = self.pointer_zoom_factor(scroll, zoom_delta) {
                 let center_y = response
                     .response
@@ -20448,12 +21160,12 @@ impl ScopeApp {
         if response.response.clicked_by(PointerButton::Primary) {
             if let Some(time) = hover_time {
                 if let Some(cursor) = self.cursor_place_mode.take() {
-                    self.active_cursor = cursor;
+                    self.plot_viewport.active_cursor = cursor;
                     self.set_cursor(cursor, time);
                 } else {
-                    let distance_a = (time - self.cursor_a).abs();
-                    let distance_b = (time - self.cursor_b).abs();
-                    self.active_cursor = if distance_a <= distance_b {
+                    let distance_a = (time - self.plot_viewport.cursor_a).abs();
+                    let distance_b = (time - self.plot_viewport.cursor_b).abs();
+                    self.plot_viewport.active_cursor = if distance_a <= distance_b {
                         CursorId::A
                     } else {
                         CursorId::B
@@ -20590,6 +21302,19 @@ impl ScopeApp {
 
 impl eframe::App for ScopeApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let project_input = self.project_path.is_some()
+            && ctx.input(|input| {
+                input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::PointerButton { .. }
+                            | egui::Event::Key { .. }
+                            | egui::Event::Text(_)
+                            | egui::Event::Paste(_)
+                            | egui::Event::Cut
+                    )
+                })
+            });
         if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| {
             self.update_inner(ctx, frame);
         })) {
@@ -20604,6 +21329,16 @@ impl eframe::App for ScopeApp {
             self.cursor_place_mode = None;
             ctx.request_repaint();
         }
+        if project_input
+            && (self.source.is_some() || !self.live.capture_history.entries().is_empty())
+        {
+            self.project_dirty = true;
+        }
+        self.poll_project_save_worker();
+        if self.project_save_worker.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        self.autosave_project_if_due();
     }
 }
 
@@ -20623,13 +21358,38 @@ mod tests {
     }
 
     #[test]
+    fn prepared_plot_series_preserves_capture_gaps_as_separate_segments() {
+        let mut app = ScopeApp::new_for_test();
+        app.channel_scales = vec![1.0];
+        let blocks = vec![
+            SampleBlock {
+                times: vec![0.0, 0.1],
+                channels: vec![vec![1.0, 2.0]],
+            },
+            SampleBlock {
+                times: vec![1.0, 1.1],
+                channels: vec![vec![3.0, 4.0]],
+            },
+        ];
+
+        let prepared = app.prepare_segmented_sample_series(&blocks, &[0], 0.0);
+
+        assert_eq!(prepared.segmented_points.len(), 1);
+        assert_eq!(prepared.segmented_points[0].len(), 2);
+        assert_eq!(prepared.segmented_points[0][0][1].x, 0.1);
+        assert_eq!(prepared.segmented_points[0][1][0].x, 1.0);
+        assert_eq!(prepared.points[0].len(), 4);
+    }
+
+    #[test]
     fn opens_scope_recording_through_the_application_dispatch_path() {
         use scope_analyzer::live::{
             protocol::{
                 ChannelDescriptor, ChannelKind, ChannelTable, Frame, Message, SampleBatch,
                 WireFormat, MSG_SAMPLE_BATCH,
             },
-            recording::{RecordingMetadata, ScopeWriter},
+            recording::{RecordingMetadata, ScopeRecording, ScopeWriter},
+            trigger::{TriggerCapture, TriggerConfig},
         };
 
         let dir = unique_test_dir("scope_dispatch");
@@ -20654,6 +21414,7 @@ mod tests {
             batch_samples: 2,
             channel_mask: 1,
             client_version: "app-test".to_owned(),
+            channel_presentations: std::collections::BTreeMap::new(),
         };
         let payload = Message::SampleBatch(SampleBatch {
             channel_table_revision: 1,
@@ -20668,6 +21429,40 @@ mod tests {
         let frame = Frame::new(MSG_SAMPLE_BATCH, 0, 1, 7, 0, payload);
         let mut writer = ScopeWriter::create(&path, metadata).unwrap();
         writer.write_sample_frame(&frame).unwrap();
+        writer
+            .write_trigger(
+                &TriggerCapture {
+                    channel_ids: vec![0],
+                    sample_indices: vec![0, 1],
+                    timestamps: vec![0, 100],
+                    channels: vec![vec![2.0, 3.0]],
+                    trigger_position: 0,
+                    auto_timeout: false,
+                },
+                &TriggerConfig {
+                    pre_samples: 0,
+                    post_samples: 1,
+                    ..TriggerConfig::default()
+                },
+            )
+            .unwrap();
+        writer
+            .write_trigger(
+                &TriggerCapture {
+                    channel_ids: vec![0],
+                    sample_indices: vec![0, 1],
+                    timestamps: vec![0, 100],
+                    channels: vec![vec![2.0, 3.0]],
+                    trigger_position: 1,
+                    auto_timeout: true,
+                },
+                &TriggerConfig {
+                    pre_samples: 1,
+                    post_samples: 0,
+                    ..TriggerConfig::default()
+                },
+            )
+            .unwrap();
         writer.finish().unwrap();
 
         let opened = ScopeApp::open_waveform_file_with_cancel(&path, 48_000.0, None).unwrap();
@@ -20677,7 +21472,285 @@ mod tests {
         assert_eq!(opened.source.metadata().channels[0].name, "DSP-A");
         let block = opened.source.read_range(0.0, 0.1, &[0], 10).unwrap();
         assert_eq!(block.channels[0], vec![2.0, 3.0]);
+        let recording = ScopeRecording::open(&path).unwrap();
+        let mut app = ScopeApp::new_for_test();
+        app.set_source(opened.source, opened.path, opened.kind);
+        app.scope_trigger_events = recording.triggers().to_vec();
+        app.scope_trigger_tick_hz = recording.metadata().tick_hz;
+        app.selected_scope_trigger = Some(1);
+        let project_path = dir.join("recording.scopeproj");
+        app.save_project_to(&project_path).unwrap();
+        let document = project_file::load_project(&project_path).unwrap();
+        assert_eq!(document.captures.len(), 2);
+        assert_eq!(
+            document.captures[0].origin,
+            project_file::ProjectCaptureOrigin::RecordingTrigger
+        );
+        let mut restored = ScopeApp::new_for_test();
+        restored.open_project_from(&project_path).unwrap();
+        assert_eq!(restored.scope_trigger_events.len(), 2);
+        assert_eq!(restored.selected_scope_trigger, Some(1));
+        assert!(restored.scope_trigger_events[1].auto_timeout);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn scope_project_save_and_staged_restore_preserve_workspace_without_connecting() {
+        let dir = unique_test_dir("scope_project_round_trip");
+        let csv_path = dir.join("wave.csv");
+        fs::write(
+            &csv_path,
+            "time,Va,Vb,Vc,Ia,Ib,Ic\n0.0,1,2,3,4,5,6\n0.1,2,3,4,5,6,7\n",
+        )
+        .unwrap();
+        let opened = ScopeApp::open_waveform_file(&csv_path, 10.0).unwrap();
+        let mut app = ScopeApp::new_for_test();
+        app.set_source(opened.source, opened.path, opened.kind);
+        app.display_names[0] = "Voltage A".to_owned();
+        app.channel_scales[0] = 2.0;
+        app.scope_layout_rows = 2;
+        app.scope_layout_cols = 2;
+        app.power_enabled = true;
+        app.power_voltage_channels = [0, 1, 2];
+        app.power_current_channels = [3, 4, 5];
+        app.export_preview_size = [1000, 500];
+        app.export_text_annotations.push(ExportTextAnnotation {
+            text: "fault marker".to_owned(),
+            position: CanvasPoint::new(250, 125),
+            color: AnnotationColor {
+                r: 1,
+                g: 2,
+                b: 3,
+                a: 255,
+            },
+            scale: 2,
+        });
+        let project_path = dir.join("workspace.scopeproj");
+        app.save_project_to(&project_path).unwrap();
+
+        let mut restored = ScopeApp::new_for_test();
+        restored.open_project_from(&project_path).unwrap();
+
+        assert_eq!(restored.display_names[0], "Voltage A");
+        assert_eq!(restored.channel_scales[0], 2.0);
+        assert_eq!(
+            (restored.scope_layout_rows, restored.scope_layout_cols),
+            (2, 2)
+        );
+        assert!(restored.power_enabled);
+        assert_eq!(restored.export_text_annotations.len(), 1);
+        assert_eq!(restored.export_text_annotations[0].text, "fault marker");
+        assert_eq!(
+            restored.export_text_annotations[0].position,
+            CanvasPoint::new(250, 125)
+        );
+        assert_eq!(
+            restored.live.connection_state,
+            scope_analyzer::live::session::ConnectionState::Disconnected
+        );
+        assert_eq!(
+            restored.project_path.as_deref(),
+            Some(project_path.as_path())
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn background_project_save_completes_without_blocking_the_ui_owner() {
+        let dir = unique_test_dir("scope_project_background_save");
+        let csv_path = dir.join("wave.csv");
+        fs::write(&csv_path, "time,Va\n0.0,1\n0.1,2\n").unwrap();
+        let opened = ScopeApp::open_waveform_file(&csv_path, 10.0).unwrap();
+        let mut app = ScopeApp::new_for_test();
+        app.set_source(opened.source, opened.path, opened.kind);
+        app.project_dirty = true;
+        let project_path = dir.join("background.scopeproj");
+
+        app.start_project_save(project_path.clone(), false).unwrap();
+        assert!(app.project_save_worker.is_some());
+        assert!(app.project_dirty);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app
+            .project_save_worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        app.poll_project_save_worker();
+
+        assert!(app.project_save_worker.is_none());
+        assert_eq!(app.project_path.as_deref(), Some(project_path.as_path()));
+        assert!(!app.project_dirty);
+        assert!(project_path.is_file());
+        project_file::load_project(&project_path).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cancelling_background_project_save_never_publishes_project_json() {
+        let dir = unique_test_dir("scope_project_cancelled_save");
+        let csv_path = dir.join("wave.csv");
+        fs::write(&csv_path, "time,Va\n0.0,1\n0.1,2\n").unwrap();
+        let opened = ScopeApp::open_waveform_file(&csv_path, 10.0).unwrap();
+        let mut app = ScopeApp::new_for_test();
+        app.set_source(opened.source, opened.path, opened.kind);
+        app.project_dirty = true;
+        let project_path = dir.join("cancelled.scopeproj");
+
+        let input = app
+            .prepare_project_save(project_path.clone(), false)
+            .unwrap();
+        let cancel = JobCancelToken::new();
+        cancel.cancel();
+        let error = ScopeApp::write_project_input(input, &cancel).unwrap_err();
+
+        assert_eq!(error, "Project save cancelled.");
+        assert!(app.project_dirty);
+        assert!(app.project_path.is_none());
+        assert!(!project_path.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn newer_autosave_recovers_durable_state_without_becoming_the_project_path() {
+        let dir = unique_test_dir("scope_project_autosave_recovery");
+        let csv_path = dir.join("wave.csv");
+        fs::write(&csv_path, "time,Va\n0.0,1\n0.1,2\n").unwrap();
+        let opened = ScopeApp::open_waveform_file(&csv_path, 10.0).unwrap();
+        let mut app = ScopeApp::new_for_test();
+        app.set_source(opened.source, opened.path, opened.kind);
+        let project_path = dir.join("recovery.scopeproj");
+        app.save_project_to(&project_path).unwrap();
+        app.project_path = Some(project_path.clone());
+        app.display_names[0] = "Recovered voltage".to_owned();
+        app.project_dirty = true;
+
+        let autosave_path = project_path.with_extension("scopeproj.autosave");
+        let input = app
+            .prepare_project_save(autosave_path.clone(), true)
+            .unwrap();
+        ScopeApp::write_project_input(input, &JobCancelToken::new()).unwrap();
+        assert!(autosave_path.is_file());
+
+        let mut restored = ScopeApp::new_for_test();
+        restored.open_project_from(&project_path).unwrap();
+        assert_eq!(restored.display_names[0], "Recovered voltage");
+        assert_eq!(
+            restored.project_path.as_deref(),
+            Some(project_path.as_path())
+        );
+        assert!(!restored.project_dirty);
+        assert!(restored
+            .import_status
+            .as_deref()
+            .is_some_and(|status| status.contains("Recovered newer")));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn scope_project_materializes_and_restores_live_capture_assets() {
+        use scope_analyzer::live::{
+            protocol::{ChannelDescriptor, ChannelKind, ChannelTable, HelloAck, WireFormat},
+            trigger::{TriggerCapture, TriggerConfig},
+        };
+        let dir = unique_test_dir("scope_project_capture_asset");
+        let mut app = ScopeApp::new_for_test();
+        app.live.channel_table = Some(ChannelTable {
+            revision: 1,
+            channels: vec![ChannelDescriptor {
+                channel_id: 0,
+                kind: ChannelKind::Analog,
+                wire_format: WireFormat::F32,
+                scale: 1.0,
+                offset: 0.0,
+                unit: "V".to_owned(),
+                name: "Va".to_owned(),
+            }],
+        });
+        app.live.hello_ack = Some(HelloAck {
+            device_capabilities: 0,
+            max_payload: 4096,
+            tick_hz: 1_000,
+            channel_count: 1,
+            max_batch_samples: 128,
+            device_id: [0; 16],
+            firmware_name: "test".to_owned(),
+        });
+        let capture = TriggerCapture {
+            channel_ids: vec![0],
+            sample_indices: vec![10, 11, 12],
+            timestamps: vec![1_000, 1_100, 1_200],
+            channels: vec![vec![-1.0, 0.5, 1.0]],
+            trigger_position: 1,
+            auto_timeout: false,
+        };
+        app.live
+            .capture_history
+            .insert_live(capture.clone(), TriggerConfig::default(), 1, true)
+            .unwrap();
+        app.live.last_capture = Some(capture.clone());
+        let project_path = dir.join("capture.scopeproj");
+        app.project_dirty = true;
+        app.start_project_save(project_path.clone(), false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app
+            .project_save_worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        app.poll_project_save_worker();
+        assert!(app.project_save_worker.is_none());
+        assert!(!app.project_dirty);
+        let project_json = fs::read_to_string(&project_path).unwrap();
+        assert!(project_json.len() < 100_000);
+        assert!(!project_json.contains("sampleData"));
+
+        let mut restored = ScopeApp::new_for_test();
+        restored.open_project_from(&project_path).unwrap();
+
+        assert_eq!(restored.live.capture_history.entries().len(), 1);
+        assert_eq!(restored.live.selected_trigger_capture(), Some(&capture));
+        assert!(restored.source.is_none());
+        assert!(dir
+            .join("capture.scopeproj.assets/captures/capture-1.scope")
+            .is_file());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_project_stage_does_not_mutate_the_active_workspace() {
+        let dir = unique_test_dir("scope_project_stage_failure");
+        let active_path = dir.join("active.csv");
+        let primary_path = dir.join("primary.csv");
+        let imported_path = dir.join("imported.csv");
+        for path in [&active_path, &primary_path, &imported_path] {
+            fs::write(path, "time,value\n0.0,1\n0.1,2\n").unwrap();
+        }
+
+        let mut project_app = ScopeApp::new_for_test();
+        let primary = ScopeApp::open_waveform_file(&primary_path, 10.0).unwrap();
+        project_app.set_source(primary.source, primary.path, primary.kind);
+        let imported = ScopeApp::open_waveform_file(&imported_path, 10.0).unwrap();
+        project_app.add_imported_dataset(imported.source, imported.path, imported.kind);
+        let project_path = dir.join("staged.scopeproj");
+        project_app.save_project_to(&project_path).unwrap();
+        fs::write(&imported_path, b"not a waveform file").unwrap();
+
+        let mut active = ScopeApp::new_for_test();
+        let opened = ScopeApp::open_waveform_file(&active_path, 10.0).unwrap();
+        active.set_source(opened.source, opened.path, opened.kind);
+        active.display_names[0] = "ACTIVE-WORKSPACE".to_owned();
+
+        assert!(active.open_project_from(&project_path).is_err());
+        assert_eq!(active.loaded_path.as_deref(), Some(active_path.as_path()));
+        assert_eq!(active.display_names[0], "ACTIVE-WORKSPACE");
+        assert!(active.imported_datasets.is_empty());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -21091,7 +22164,7 @@ mod tests {
                 ScopeApp::load_plot_data(Arc::new(source), start_time, end_time, &[3], 1, 1200.0)
                     .unwrap();
             assert!(
-                matches!(plot_data, Some(PlotJobData::Samples(_))),
+                matches!(plot_data, Some(PlotJobData::SegmentedSamples(_))),
                 "{file}: medium DAT full view should use raw sampled plot data"
             );
         }
