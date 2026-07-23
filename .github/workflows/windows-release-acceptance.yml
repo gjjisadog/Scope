@@ -1,0 +1,188 @@
+name: Windows release acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      previous_msi:
+        description: "Optional path to the previous MSI on the self-hosted runner"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# This job intentionally targets a controlled self-hosted runner. The runner
+# contract is part of the release evidence: Rust/Cargo caches, WiX 3.14,
+# signtool with an installed certificate, pinned Mesa and ANGLE runtimes, and
+# an RDP session must already be present. A public hosted runner must not be
+# treated as proof of the offline/native acceptance matrix.
+jobs:
+  package-and-admin-acceptance:
+    name: Package and elevated Windows acceptance
+    runs-on: [self-hosted, windows, x64, scope-release, rdp]
+    environment: scope-release
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      SCOPE_PACKAGE_OFFLINE: "1"
+      CARGO_NET_OFFLINE: "true"
+      SCOPE_SIGN_CERT_SHA1: ${{ secrets.SCOPE_SIGN_CERT_SHA1 }}
+      # These are controlled runner paths outside GITHUB_WORKSPACE. checkout@v4
+      # cleans ignored workspace files, so release runtimes must not live in target/.
+      MESA_RUNTIME_DIR: ${{ vars.SCOPE_MESA_RUNTIME_DIR }}
+      ANGLE_RUNTIME_DIR: ${{ vars.SCOPE_ANGLE_RUNTIME_DIR }}
+      ANGLE_RUNTIME_SOURCE_SHA256: ${{ vars.SCOPE_ANGLE_RUNTIME_SOURCE_SHA256 }}
+      ANGLE_RUNTIME_MANIFEST_SHA256: ${{ vars.SCOPE_ANGLE_RUNTIME_MANIFEST_SHA256 }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Verify preloaded Rust toolchain
+        run: |
+          $rustc = (& rustc --version)
+          $cargo = (& cargo --version)
+          if ($rustc -notmatch 'rustc 1\.96\.0') {
+            throw "The scope-release runner must preload rustc 1.96.0; got $rustc"
+          }
+          if ($cargo -notmatch 'cargo 1\.96\.0') {
+            throw "The scope-release runner must preload cargo 1.96.0; got $cargo"
+          }
+
+      - name: Verify release runner contract
+        run: |
+          $requiredCommands = @("candle.exe", "light.exe", "signtool.exe")
+          foreach ($name in $requiredCommands) {
+            if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
+              throw "$name is required on the scope-release runner."
+            }
+          }
+          if ([string]::IsNullOrWhiteSpace($env:SCOPE_SIGN_CERT_SHA1)) {
+            throw "SCOPE_SIGN_CERT_SHA1 must identify the installed release certificate."
+          }
+          if ($env:ANGLE_RUNTIME_SOURCE_SHA256 -notmatch '^[0-9a-fA-F]{64}$') {
+            throw "SCOPE_ANGLE_RUNTIME_SOURCE_SHA256 must be a 64-character hexadecimal SHA256 value."
+          }
+          if ($env:ANGLE_RUNTIME_MANIFEST_SHA256 -notmatch '^[0-9a-fA-F]{64}$') {
+            throw "SCOPE_ANGLE_RUNTIME_MANIFEST_SHA256 must pin the controlled ANGLE preload manifest."
+          }
+          function Assert-ControlledRuntimeDir([string]$Name, [string]$Path) {
+            if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path $Path)) {
+              throw "$Name must name an existing controlled runtime directory."
+            }
+            $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+            $resolved = [IO.Path]::GetFullPath($Path)
+            if ($resolved.StartsWith($workspace, [System.StringComparison]::OrdinalIgnoreCase)) {
+              throw "$Name must be outside GITHUB_WORKSPACE because checkout cleans ignored workspace files."
+            }
+            return $resolved
+          }
+          $mesaRoot = Assert-ControlledRuntimeDir "MESA_RUNTIME_DIR" $env:MESA_RUNTIME_DIR
+          $mesa = @($mesaRoot, (Join-Path $mesaRoot "x64")) |
+            Where-Object { Test-Path (Join-Path $_ "opengl32.dll") } |
+            Select-Object -First 1
+          if (-not $mesa) {
+            throw "MESA_RUNTIME_DIR must contain the runtime DLLs directly or under x64."
+          }
+          foreach ($name in @("mesa-runtime-manifest.json", "opengl32.dll", "libgallium_wgl.dll", "libEGL.dll", "libGLESv2.dll", "libGLESv1_CM.dll")) {
+            if (-not (Test-Path (Join-Path $mesa $name))) {
+              throw "Pinned Mesa runtime preload is missing $name under $mesa."
+            }
+          }
+          $angleRoot = Assert-ControlledRuntimeDir "ANGLE_RUNTIME_DIR" $env:ANGLE_RUNTIME_DIR
+          $angle = @($angleRoot, (Join-Path $angleRoot "x64")) |
+            Where-Object { Test-Path (Join-Path $_ "libEGL.dll") } |
+            Select-Object -First 1
+          if (-not $angle) {
+            throw "ANGLE_RUNTIME_DIR must contain the runtime DLLs directly or under x64."
+          }
+          foreach ($name in @("libEGL.dll", "libGLESv2.dll")) {
+            if (-not (Test-Path (Join-Path $angle $name))) {
+              throw "Pinned ANGLE runtime preload is missing $name under $angle."
+            }
+          }
+          $angleManifestPath = Join-Path $angle "angle-runtime-preload-manifest.json"
+          if (-not (Test-Path $angleManifestPath)) {
+            throw "Controlled ANGLE preload is missing angle-runtime-preload-manifest.json."
+          }
+          $actualManifestSha256 = (Get-FileHash -Path $angleManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualManifestSha256 -ne $env:ANGLE_RUNTIME_MANIFEST_SHA256.ToLowerInvariant()) {
+            throw "Controlled ANGLE preload manifest does not match SCOPE_ANGLE_RUNTIME_MANIFEST_SHA256."
+          }
+          $angleManifest = Get-Content -Raw $angleManifestPath | ConvertFrom-Json
+          if ($angleManifest.schemaVersion -ne 1 -or $angleManifest.runtime -ne "ANGLE" -or
+              [string]$angleManifest.sourceArchiveSha256 -notmatch '^[0-9a-fA-F]{64}$' -or
+              ([string]$angleManifest.sourceArchiveSha256).ToLowerInvariant() -ne $env:ANGLE_RUNTIME_SOURCE_SHA256.ToLowerInvariant()) {
+            throw "Controlled ANGLE preload manifest does not bind the expected ANGLE source archive."
+          }
+
+      - name: Run release preflight
+        run: ./scripts/release-check.ps1
+
+      - name: Build offline signed ZIP and MSI
+        run: ./scripts/package-windows.ps1 -OfflinePackage -RequireSignature
+
+      - name: Verify release evidence binds checkout
+        run: |
+          $release = Get-Content -Raw "dist\release-evidence.json" | ConvertFrom-Json
+          $head = (& git rev-parse HEAD).Trim()
+          if ([string]::IsNullOrWhiteSpace($release.sourceCommit) -or
+              $release.sourceCommit -eq "unknown" -or
+              $release.sourceCommit -ne $head -or
+              $release.sourceDirty -eq $true) {
+            throw "Release evidence sourceCommit does not match the checked-out source."
+          }
+          $provenance = Get-Content -Raw "dist\ScopeAnalyzer-0.12.0-win-x64\build-provenance.json" | ConvertFrom-Json
+          $lockHash = (Get-FileHash -Path "Cargo.lock" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $toolchainHash = (Get-FileHash -Path "rust-toolchain.toml" -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($provenance.sourceCommit -ne $head -or $provenance.sourceDirty -eq $true -or
+              $provenance.cargoLockSha256 -ne $lockHash -or
+              $provenance.toolchainSha256 -ne $toolchainHash) {
+            throw "Build provenance does not bind the checked-out source, lockfile, or toolchain pin."
+          }
+
+      - name: Run elevated lifecycle and renderer acceptance
+        run: |
+          $params = @{
+            MsiPath = "dist\ScopeAnalyzer-0.12.0-win-x64.msi"
+            ZipPath = "dist\ScopeAnalyzer-0.12.0-win-x64.zip"
+            ReleaseEvidencePath = "dist\release-evidence.json"
+            OutputPath = "dist\windows-acceptance.json"
+            RequireSignature = $true
+            RequireMesaRuntime = $true
+            RequireAngleRuntime = $true
+            RequireRdpSession = $true
+          }
+          $previous = "${{ inputs.previous_msi }}"
+          if (-not [string]::IsNullOrWhiteSpace($previous)) {
+            $params.PreviousMsiPath = $previous
+          }
+          & ./scripts/windows-acceptance.ps1 @params
+
+      - name: Publish standard-user handoff
+        run: |
+          @"
+          The elevated evidence is in dist/windows-acceptance.json.
+          Deploy the MSI once with an administrator, then run this command from a
+          non-administrator RDP session and archive the second evidence file:
+
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-acceptance.ps1 `
+            -MsiPath dist\ScopeAnalyzer-0.12.0-win-x64.msi `
+            -ZipPath dist\ScopeAnalyzer-0.12.0-win-x64.zip `
+            -ReleaseEvidencePath dist\release-evidence.json `
+            -SkipMsiLifecycle -RequireStandardUser -RequireSignature `
+            -RequireMesaRuntime -RequireAngleRuntime -RequireRdpSession `
+            -OutputPath dist\windows-acceptance-standard-user.json
+          "@ | Set-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding UTF8
+
+      - name: Upload release evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: scope-windows-release-evidence
+          if-no-files-found: error
+          path: |
+            dist/ScopeAnalyzer-0.12.0-win-x64.zip
+            dist/ScopeAnalyzer-0.12.0-win-x64.msi
+            dist/release-evidence.json
+            dist/windows-acceptance.json
+            dist/ScopeAnalyzer-0.12.0-win-x64/build-provenance.json

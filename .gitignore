@@ -5,3 +5,5 @@ runtime/
 /.vscode/
 *.log
 *.tmp
+**/.DS_Store
+**/__pycache__/

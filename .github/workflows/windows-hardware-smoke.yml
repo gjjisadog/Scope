@@ -1,0 +1,96 @@
+name: Windows hardware capture smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      serial_port:
+        description: "SCP1 device serial port, for example COM3"
+        required: true
+        type: string
+      baud:
+        description: "SCP1 serial baud rate"
+        required: false
+        default: "921600"
+        type: string
+      duration_ms:
+        description: "Capture duration in milliseconds"
+        required: false
+        default: "3000"
+        type: string
+
+permissions:
+  contents: read
+
+# This runner must be physically connected to the device under test. The
+# resulting evidence is hardware-only: the workflow never starts the protocol
+# simulator and the tool records the device identity and firmware in the .scope
+# metadata.
+jobs:
+  hardware-smoke:
+    name: SCP1 hardware capture smoke
+    runs-on: [self-hosted, windows, x64, scope-hardware]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Verify preloaded Rust toolchain
+        run: |
+          $rustc = (& rustc --version)
+          $cargo = (& cargo --version)
+          if ($rustc -notmatch 'rustc 1\.96\.0') {
+            throw "The scope-hardware runner must preload rustc 1.96.0; got $rustc"
+          }
+          if ($cargo -notmatch 'cargo 1\.96\.0') {
+            throw "The scope-hardware runner must preload cargo 1.96.0; got $cargo"
+          }
+
+      - name: Build hardware smoke tools offline
+        run: cargo build --locked --offline --release --bin scope-hardware-smoke --bin scope-cli
+
+      - name: Capture from physical SCP1 device
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $tool = "target\release\scope-hardware-smoke.exe"
+          $args = @(
+            "--serial-port", "${{ inputs.serial_port }}",
+            "--baud", "${{ inputs.baud }}",
+            "--duration-ms", "${{ inputs.duration_ms }}",
+            "--channels", "1",
+            "--output", "dist\hardware-smoke.scope"
+          )
+          & $tool @args | Tee-Object -FilePath "dist\hardware-smoke.json"
+          if ($LASTEXITCODE -ne 0) {
+            throw "scope-hardware-smoke failed with exit code $LASTEXITCODE"
+          }
+          $evidence = Get-Content -Raw "dist\hardware-smoke.json" | ConvertFrom-Json
+          if (-not $evidence.ok -or -not $evidence.result.cleanEnd -or $evidence.result.sampleCount -le 0 -or
+              [string]::IsNullOrWhiteSpace($evidence.result.deviceId) -or
+              [string]::IsNullOrWhiteSpace($evidence.result.firmwareName)) {
+            throw "Hardware smoke evidence is not a clean non-empty recording with device identity."
+          }
+
+      - name: Validate captured recording with the release CLI
+        run: |
+          & target\release\scope-cli.exe validate-recording --input dist\hardware-smoke.scope | Tee-Object -FilePath dist\hardware-recording-validation.json
+          if ($LASTEXITCODE -ne 0) {
+            throw "scope-cli validate-recording failed with exit code $LASTEXITCODE"
+          }
+          $validation = Get-Content -Raw dist\hardware-recording-validation.json | ConvertFrom-Json
+          if (-not $validation.ok -or $validation.result.valid -ne $true -or
+              -not $validation.result.cleanEnd -or $validation.result.recoveredTail -eq $true -or
+              $validation.result.sampleFrames -le 0) {
+            throw "Validated recording evidence is not clean and non-empty."
+          }
+
+      - name: Upload hardware evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: scope-hardware-smoke-evidence
+          if-no-files-found: error
+          path: |
+            dist/hardware-smoke.scope
+            dist/hardware-smoke.json
+            dist/hardware-recording-validation.json

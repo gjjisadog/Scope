@@ -1,0 +1,25 @@
+{
+  "scopeProjectType": "scope-analyzer-project",
+  "schemaVersion": 1,
+  "createdByVersion": "0.11.0-fixture",
+  "projectId": "compatibility-fixture",
+  "sources": [
+    {
+      "id": "source-main",
+      "kind": "csv",
+      "file": {
+        "relativePath": "data/main.csv"
+      },
+      "required": true
+    }
+  ],
+  "datasets": [
+    {
+      "id": "dataset-main",
+      "sourceId": "source-main",
+      "role": "primary",
+      "displayName": "Main",
+      "enabled": true
+    }
+  ]
+}

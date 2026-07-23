@@ -187,6 +187,7 @@ impl ScopeApp {
             document.workspace.layout_rows = self.scope_layout_rows;
             document.workspace.layout_cols = self.scope_layout_cols;
             document.analysis.harmonic_base_hz = self.harmonic_base_hz;
+            document.compare = project_file::ProjectCompare::default();
             document.live_profile = Some(project_live_profile(&self.live));
             document.export = project_export_state(self);
             document.validate().map_err(|error| error.to_string())?;
@@ -401,6 +402,7 @@ impl ScopeApp {
                 pane: self.derived_panes.get(index).copied().unwrap_or(0),
             })
             .collect();
+        document.compare = self.compare_config.clone();
         document.export = project_export_state(self);
         document.live_profile = Some(project_live_profile(&self.live));
         document.validate().map_err(|error| error.to_string())?;
@@ -509,6 +511,7 @@ impl ScopeApp {
         let mut document =
             project_file::load_project(restore_path).map_err(|error| error.to_string())?;
         let mut resolutions = project_file::resolve_project_sources(path, &document);
+        let mut relocated_sources = false;
         for resolution in &mut resolutions {
             if !matches!(
                 resolution.resolution,
@@ -540,6 +543,7 @@ impl ScopeApp {
                 &replacement,
             )
             .map_err(|error| error.to_string())?;
+            relocated_sources = true;
         }
         resolutions = project_file::resolve_project_sources(path, &document);
         let mut staged = Vec::new();
@@ -605,19 +609,29 @@ impl ScopeApp {
         }
         apply_project_workspace(self, &document);
         apply_project_analysis(self, &document);
+        apply_project_compare(self, &document);
         apply_project_export(self, &document.export);
         apply_live_profile(&mut self.live, document.live_profile.as_ref())?;
         restore_project_captures(&mut self.live, &document, &resolutions)?;
-        self.project_path = Some(path.to_path_buf());
-        self.project_id = document.project_id.0;
-        self.project_dirty = false;
-        self.project_last_autosave = Instant::now();
+        self.finish_project_restore(path, document.project_id.0, relocated_sources);
         self.import_status = Some(if restore_path == autosave {
             format!("Recovered newer project autosave: {}", autosave.display())
         } else {
             format!("Project restored: {}", path.display())
         });
         Ok(())
+    }
+
+    pub(super) fn finish_project_restore(
+        &mut self,
+        path: &Path,
+        project_id: String,
+        relocated_sources: bool,
+    ) {
+        self.project_path = Some(path.to_path_buf());
+        self.project_id = project_id;
+        self.project_dirty = relocated_sources;
+        self.project_last_autosave = Instant::now();
     }
 
     pub(super) fn autosave_project_if_due(&mut self) {
@@ -962,6 +976,12 @@ fn apply_project_analysis(app: &mut ScopeApp, document: &project_file::ScopeProj
     app.needs_derived_reload = true;
 }
 
+fn apply_project_compare(app: &mut ScopeApp, document: &project_file::ScopeProjectDocument) {
+    app.compare_config = document.compare.clone();
+    app.compare_result = None;
+    app.compare_status = None;
+}
+
 fn project_export_state(app: &ScopeApp) -> project_file::ProjectExportState {
     let width = app.export_preview_size[0];
     let height = app.export_preview_size[1];
@@ -1221,10 +1241,17 @@ fn restore_project_captures(
             live.channel_presentations
                 .extend(asset.metadata.channel_presentations.clone());
         }
+        let capture_id = capture_history_id_from_project_ref(capture_ref)?;
         let capture = asset.capture.clone();
         let outcome = live
             .capture_history
-            .insert_live(asset.capture, asset.config, 0, capture_ref.selected)
+            .insert_live_with_id(
+                capture_id,
+                asset.capture,
+                asset.config,
+                0,
+                capture_ref.selected,
+            )
             .map_err(|error| error.to_string())?;
         live.capture_history.set_metadata(
             outcome.id,
@@ -1240,6 +1267,30 @@ fn restore_project_captures(
         live.last_capture = live.selected_trigger_capture().cloned();
     }
     Ok(())
+}
+
+fn capture_history_id_from_project_ref(
+    capture_ref: &project_file::ProjectCaptureRef,
+) -> Result<scope_analyzer::live::capture_history::CaptureId, String> {
+    let Some(value) = capture_ref.id.0.strip_prefix("capture-") else {
+        return Err(format!(
+            "Capture asset {} does not use a persisted numeric capture ID",
+            capture_ref.id.0
+        ));
+    };
+    let id = value.parse::<u64>().map_err(|_| {
+        format!(
+            "Capture asset {} does not use a persisted numeric capture ID",
+            capture_ref.id.0
+        )
+    })?;
+    if id == 0 || value != id.to_string() {
+        return Err(format!(
+            "Capture asset {} does not use a persisted numeric capture ID",
+            capture_ref.id.0
+        ));
+    }
+    Ok(scope_analyzer::live::capture_history::CaptureId(id))
 }
 
 fn parse_line_pattern(value: &str) -> ChannelLinePattern {

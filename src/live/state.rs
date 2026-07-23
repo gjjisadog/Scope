@@ -391,7 +391,9 @@ impl LiveScopeState {
         })
     }
 
-    pub fn poll(&mut self) {
+    /// Polls pending session events and reports whether a new capture was
+    /// successfully retained in history.
+    pub fn poll(&mut self) -> bool {
         let recording_error = self
             .recording
             .as_mut()
@@ -409,14 +411,18 @@ impl LiveScopeState {
                 events.push(event);
             }
         }
+        let mut capture_history_changed = false;
         for event in events {
-            if let Err(error) = self.handle_event(event) {
-                self.last_error = Some(error);
+            match self.handle_event(event) {
+                Ok(changed) => capture_history_changed |= changed,
+                Err(error) => self.last_error = Some(error),
             }
         }
+        capture_history_changed
     }
 
-    fn handle_event(&mut self, event: SessionEvent) -> Result<(), String> {
+    fn handle_event(&mut self, event: SessionEvent) -> Result<bool, String> {
+        let mut capture_history_changed = false;
         match event {
             SessionEvent::State(state) => {
                 self.connection_state = state;
@@ -495,13 +501,14 @@ impl LiveScopeState {
                         .unwrap_or_default()
                         .as_millis()
                         .min(u128::from(u64::MAX)) as u64;
-                    if let Err(error) = self.capture_history.insert_live(
+                    match self.capture_history.insert_live(
                         capture.clone(),
                         self.trigger.config().clone(),
                         created_unix_ms,
                         !self.keep_capture_selection,
                     ) {
-                        self.last_error = Some(error.to_string());
+                        Ok(_) => capture_history_changed = true,
+                        Err(error) => self.last_error = Some(error.to_string()),
                     }
                     self.last_capture = Some(capture);
                 }
@@ -525,7 +532,7 @@ impl LiveScopeState {
             }
             SessionEvent::Error(error) => self.last_error = Some(error),
         }
-        Ok(())
+        Ok(capture_history_changed)
     }
 
     fn rebuild_buffer(&mut self) -> Result<(), String> {
@@ -613,6 +620,7 @@ mod tests {
     use crate::{
         data::{DataSource, SampleBlock},
         live::{
+            protocol::DecodedSampleBatch,
             scope_source::ScopeRecordingDataSource,
             simulator::{SimulatorConfig, SimulatorHandle},
         },
@@ -629,6 +637,37 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         panic!("timed out waiting for live scope state");
+    }
+
+    #[test]
+    fn trigger_capture_reports_a_history_change() {
+        let mut state = LiveScopeState::default();
+        state.buffer = Some(LiveBuffer::new(vec![0], 8, 1_000).unwrap());
+        state
+            .set_trigger_config(TriggerConfig {
+                mode: TriggerMode::Auto,
+                source_channel: 0,
+                pre_samples: 0,
+                post_samples: 0,
+                auto_timeout_samples: 1,
+                ..TriggerConfig::default()
+            })
+            .unwrap();
+
+        let changed = state
+            .handle_event(SessionEvent::Batch(DecodedSampleBatch {
+                revision: 1,
+                first_sample_index: 0,
+                sample_period_ticks: 1,
+                timestamp_ticks: 0,
+                channel_ids: vec![0],
+                channels: vec![vec![0.0]],
+                raw_frame: Vec::new(),
+            }))
+            .unwrap();
+
+        assert!(changed);
+        assert_eq!(state.capture_history.entries().len(), 1);
     }
 
     #[test]

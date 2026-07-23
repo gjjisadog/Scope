@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use std::{
     collections::{hash_map::DefaultHasher, HashSet},
     env,
@@ -36,6 +38,9 @@ use crate::{
     svg_export::SvgCanvas,
     transforms,
 };
+use scope_analyzer::compare::{
+    compare, AlignmentSpec, CompareRequest, Series, SeriesSegment, Tolerance,
+};
 use scope_analyzer::measurements::{
     analyze_segments, ChannelMeasurementSpec, ChannelStatistics, EngineeringMeasurementResult,
     ThreePhasePower, ThreePhasePowerSpec,
@@ -69,6 +74,9 @@ const SOFTWARE_MAX_DRAW_POINTS_PER_CHANNEL: usize = 3_000;
 const SOFTWARE_MAX_TOTAL_DRAW_POINTS: usize = 24_000;
 const SOFTWARE_MIN_DRAW_POINTS_PER_CHANNEL: usize = 128;
 const MAX_RAW_PLOT_SOURCE_SAMPLES: usize = 250_000;
+// Comparison evidence must never be silently decimated.  Keep the same explicit
+// input ceiling as the CLI, rather than reusing the much smaller plot cache cap.
+const MAX_COMPARE_SOURCE_SAMPLES: u64 = 10_000_000;
 const LAYOUT_RESIZE_DRAW_POINTS_PER_CHANNEL: usize = 384;
 const LAYOUT_RESIZE_ACTIVE_GRACE: Duration = Duration::from_millis(180);
 const MAX_SCOPE_LEGEND_SERIES: usize = 32;
@@ -1473,6 +1481,11 @@ struct LiveMeasurementWorkerResult {
     signature: u64,
 }
 
+struct CompareMetricsJobResult {
+    generation: u64,
+    result: Result<scope_analyzer::compare::CompareResult, String>,
+}
+
 struct LiveMeasurementInput {
     end_time: Option<f64>,
     segments: Vec<SampleBlock>,
@@ -2315,6 +2328,11 @@ impl ScopeApp {
             live_bandwidth_expert_override: false,
             live_bandwidth_override_notice: None,
             live_measurement_cache: None,
+            compare_config: project_file::ProjectCompare::default(),
+            compare_result: None,
+            compare_status: None,
+            compare_metrics_worker: None,
+            compare_metrics_cancel: None,
             live_measurement_worker: None,
             live_measurement_last_dispatch: None,
             live_confirm_clear_capture_history: false,
@@ -2501,6 +2519,10 @@ impl ScopeApp {
         self.import_worker = None;
         self.import_cancel = None;
         self.measurement_cache = None;
+        self.compare_result = None;
+        self.compare_status = None;
+        self.compare_metrics_worker = None;
+        self.compare_metrics_cancel = None;
         self.sequence_cache = None;
         self.derived_curve_cache = None;
         self.prepared_derived_curve_cache = PreparedPlotSeries::default();
@@ -2533,10 +2555,10 @@ impl ScopeApp {
     }
 
     fn startup_log_paths() -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        paths.push(Self::app_home_dir().join("ScopeAnalyzer-startup.log"));
-        paths.push(env::temp_dir().join("ScopeAnalyzer-startup.log"));
-        paths
+        vec![
+            Self::app_home_dir().join("ScopeAnalyzer-startup.log"),
+            env::temp_dir().join("ScopeAnalyzer-startup.log"),
+        ]
     }
 
     fn log_directory() -> PathBuf {
@@ -3135,6 +3157,9 @@ impl ScopeApp {
         self.scope_trigger_events.clear();
         self.scope_trigger_tick_hz = 0;
         self.selected_scope_trigger = None;
+        self.compare_config = project_file::ProjectCompare::default();
+        self.compare_result = None;
+        self.compare_status = None;
         self.bump_data_generation();
         let meta = source.metadata().clone();
         let presentations = (0..meta.channels.len())
@@ -3212,6 +3237,8 @@ impl ScopeApp {
             .reset_to_range(meta.start_time, meta.end_time);
         self.fft_results.clear();
         self.measurement_cache = None;
+        self.compare_result = None;
+        self.compare_status = None;
         self.needs_fft_reload = true;
         self.plot_cache = SampleBlock::default();
         self.plot_summary = None;
@@ -3294,6 +3321,9 @@ impl ScopeApp {
     fn clear_imported_datasets(&mut self) {
         self.bump_data_generation();
         self.imported_datasets.clear();
+        self.compare_config = project_file::ProjectCompare::default();
+        self.compare_result = None;
+        self.compare_status = None;
         self.needs_compare_plot_reload = false;
         self.plot_viewport.y_min = None;
         self.plot_viewport.y_max = None;
@@ -3329,6 +3359,9 @@ impl ScopeApp {
         self.fft_results.clear();
         self.fft_dataset_index = 0;
         self.measurement_cache = None;
+        self.compare_config = project_file::ProjectCompare::default();
+        self.compare_result = None;
+        self.compare_status = None;
         self.derived_curve_cache = None;
         self.prepared_derived_curve_cache = PreparedPlotSeries::default();
         self.derived_measurement_cache = None;
@@ -4640,10 +4673,8 @@ impl ScopeApp {
             || lowered.contains("logic")
         {
             LocalCsvRole::Digital
-        } else if let Some(role) = Self::local_indexed_csv_role(path) {
-            role
         } else {
-            return None;
+            Self::local_indexed_csv_role(path)?
         };
         Some((role, Self::local_csv_merge_key(&stem)))
     }
@@ -6170,16 +6201,67 @@ impl ScopeApp {
             headers.push("ΔY".to_owned());
         }
 
-        let value_columns = headers.len().saturating_sub(1);
         let rows = labels
             .into_iter()
-            .map(|label| {
-                let mut row = vec![label.name];
-                row.extend(std::iter::repeat("--".to_owned()).take(value_columns));
-                row
+            .filter_map(|label| {
+                let out_index = match label.source {
+                    ExportCurveLabelSource::Primary(channel_index) => selections
+                        .primary
+                        .iter()
+                        .position(|channel| *channel == channel_index),
+                    ExportCurveLabelSource::Imported {
+                        dataset_index,
+                        channel_index,
+                    } => selections.imported.get(dataset_index).and_then(|channels| {
+                        channels
+                            .iter()
+                            .position(|channel| *channel == channel_index)
+                    }),
+                    ExportCurveLabelSource::Derived(derived_index) => selections
+                        .derived
+                        .iter()
+                        .position(|channel| *channel == derived_index),
+                }?;
+                let prepared = match label.source {
+                    ExportCurveLabelSource::Primary(_) => self
+                        .prepared_plot_summary
+                        .as_ref()
+                        .unwrap_or(&self.prepared_plot_cache),
+                    ExportCurveLabelSource::Imported { dataset_index, .. } => self
+                        .imported_datasets
+                        .get(dataset_index)
+                        .and_then(|dataset| dataset.prepared_plot_summary.as_ref())
+                        .or_else(|| {
+                            self.imported_datasets
+                                .get(dataset_index)
+                                .map(|dataset| &dataset.prepared_plot_cache)
+                        })?,
+                    ExportCurveLabelSource::Derived(_) => &self.prepared_derived_curve_cache,
+                };
+                let (y1, y2) = Self::export_cursor_values_for_series(
+                    prepared,
+                    out_index,
+                    self.plot_viewport
+                        .show_cursor_a
+                        .then_some(self.plot_viewport.cursor_a),
+                    self.plot_viewport
+                        .show_cursor_b
+                        .then_some(self.plot_viewport.cursor_b),
+                );
+                (y1.is_some() || y2.is_some()).then_some((label.name, y1, y2))
             })
-            .collect();
-        Some(crate::word_export::CursorTable { headers, rows })
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            return None;
+        }
+        Some(crate::word_export::CursorTable {
+            headers,
+            rows: Self::export_cursor_table_rows(
+                rows,
+                self.plot_viewport.show_cursor_a,
+                self.plot_viewport.show_cursor_b,
+            ),
+        })
     }
 
     fn build_word_report_figure(
@@ -6219,6 +6301,10 @@ impl ScopeApp {
             sample_rate: self.export_report_sample_rate(),
             time_range_summary: range_summary,
             include_cursor_tables: self.export_cursor_table_enabled,
+            compare_summary: self
+                .compare_result
+                .as_ref()
+                .map(|result| result.evidence_line()),
             figures,
         }
     }
@@ -6402,8 +6488,27 @@ impl ScopeApp {
             self.draw_export_rectangle_annotations(canvas);
             self.draw_export_ink_strokes(canvas);
         }
+        self.draw_compare_evidence_annotation(canvas, scene);
 
         label_layout
+    }
+
+    fn draw_compare_evidence_annotation<C: WaveformCanvas>(
+        &self,
+        canvas: &mut C,
+        scene: &ExportWaveformRenderScene,
+    ) {
+        let Some(result) = &self.compare_result else {
+            return;
+        };
+        canvas.text_styled(
+            scene.margin,
+            2,
+            &result.evidence_line(),
+            Rgba::rgb(24, 63, 110),
+            scene.resolution_scale,
+            TextStyle::Bold,
+        );
     }
 
     #[allow(unreachable_code)]
@@ -6722,6 +6827,44 @@ impl ScopeApp {
             .filter(|value| value.is_finite())
             .map(|value| format!("{value:.3}"))
             .unwrap_or_else(|| "--".to_owned())
+    }
+
+    fn export_cursor_values_for_series(
+        prepared: &PreparedPlotSeries,
+        out_index: usize,
+        cursor_a: Option<f64>,
+        cursor_b: Option<f64>,
+    ) -> (Option<f64>, Option<f64>) {
+        let segments = Self::export_segments(prepared, out_index);
+        (
+            cursor_a.and_then(|cursor| Self::interpolated_y_in_segments(&segments, cursor)),
+            cursor_b.and_then(|cursor| Self::interpolated_y_in_segments(&segments, cursor)),
+        )
+    }
+
+    fn export_cursor_table_rows(
+        rows: Vec<(String, Option<f64>, Option<f64>)>,
+        use_x1: bool,
+        use_x2: bool,
+    ) -> Vec<Vec<String>> {
+        rows.into_iter()
+            .map(|(label, y1, y2)| {
+                let mut row = vec![label];
+                if use_x1 {
+                    row.push(Self::format_export_cursor_value(y1));
+                }
+                if use_x2 {
+                    row.push(Self::format_export_cursor_value(y2));
+                }
+                if use_x1 && use_x2 {
+                    row.push(Self::format_export_cursor_value(match (y1, y2) {
+                        (Some(a), Some(b)) => Some(b - a),
+                        _ => None,
+                    }));
+                }
+                row
+            })
+            .collect()
     }
 
     fn export_time_range(&self) -> Result<(f64, f64), String> {
@@ -9241,14 +9384,13 @@ impl ScopeApp {
                     ctx.request_repaint();
                 }
             }
-            if response.drag_stopped_by(PointerButton::Primary) {
-                if self
+            if response.drag_stopped_by(PointerButton::Primary)
+                && self
                     .export_preview_text_drag
                     .as_ref()
                     .is_some_and(|drag| drag.text_index == index)
-                {
-                    self.export_preview_text_drag = None;
-                }
+            {
+                self.export_preview_text_drag = None;
             }
         }
     }
@@ -9312,7 +9454,7 @@ impl ScopeApp {
         let editor_id = ui
             .id()
             .with(("export_preview_inline_label_editor", label_index));
-        let width = label_rect.width().max(180.0).min(520.0);
+        let width = label_rect.width().clamp(180.0, 520.0);
         let editor_pos = egui::pos2(
             label_rect
                 .left()
@@ -9385,7 +9527,7 @@ impl ScopeApp {
     ) -> egui::Rect {
         let text_w = Canvas::text_width(&annotation.text, annotation.scale).max(120) as f32;
         let text_h = Canvas::text_height(annotation.scale).max(18) as f32;
-        let width = (text_w * scale).max(160.0).min(520.0);
+        let width = (text_w * scale).clamp(160.0, 520.0);
         let height = (text_h * scale).max(28.0);
         let desired_pos = egui::pos2(
             image_rect.left() + annotation.position.x as f32 * scale,
@@ -13549,9 +13691,9 @@ impl ScopeApp {
             let mut series = Vec::with_capacity(len);
             let mut min = f64::INFINITY;
             let mut max = f64::NEG_INFINITY;
-            for i in 0..len {
+            for (i, value) in values.iter().take(len).enumerate() {
                 let x = block.times[i] + time_offset;
-                let y = self.scaled_value(*channel_index, values[i]);
+                let y = self.scaled_value(*channel_index, *value);
                 if !x.is_finite() || !y.is_finite() {
                     continue;
                 }
@@ -13756,9 +13898,9 @@ impl ScopeApp {
             let mut series = Vec::with_capacity(len);
             let mut min = f64::INFINITY;
             let mut max = f64::NEG_INFINITY;
-            for i in 0..len {
+            for (i, value) in values.iter().take(len).enumerate() {
                 let x = block.times[i] + time_offset;
-                let y = values[i] as f64;
+                let y = *value as f64;
                 if !x.is_finite() || !y.is_finite() {
                     continue;
                 }
@@ -15520,15 +15662,15 @@ impl ScopeApp {
                         &data_cancel,
                     )
                     .map_err(|error| error.to_string())
-                    .and_then(|block| {
+                    .map(|block| {
                         if worker_cancel.is_cancelled() {
-                            return Ok(Vec::new());
+                            return Vec::new();
                         }
                         let Some(samples) = block.channels.first() else {
-                            return Ok(Vec::new());
+                            return Vec::new();
                         };
                         if skip_digital_by_samples && Self::samples_look_digital(samples) {
-                            return Ok(Vec::new());
+                            return Vec::new();
                         }
                         let scaled_samples =
                             if (channel_scale - DEFAULT_CHANNEL_SCALE).abs() <= f32::EPSILON {
@@ -15539,7 +15681,7 @@ impl ScopeApp {
                                     .map(|sample| *sample * channel_scale)
                                     .collect()
                             };
-                        Ok(fft::analyze(
+                        fft::analyze(
                             channel_name,
                             &scaled_samples,
                             sample_rate_hz,
@@ -15547,7 +15689,7 @@ impl ScopeApp {
                             10,
                         )
                         .map(|result| vec![(fft_channel, result)])
-                        .unwrap_or_default())
+                        .unwrap_or_default()
                     })
             });
             FftJobResult { generation, result }
@@ -19238,6 +19380,552 @@ impl ScopeApp {
         });
     }
 
+    fn comparison_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Reference / Compare");
+        if self.source.is_none() {
+            ui.label("Load a primary dataset first.");
+            return;
+        }
+        if self.imported_datasets.is_empty() {
+            ui.label("Import a second dataset to compare against the primary dataset.");
+            return;
+        }
+
+        let primary_id = project_file::DatasetId("dataset-primary".to_owned());
+        if self.compare_config.reference_dataset_id.as_ref() != Some(&primary_id) {
+            self.compare_config.reference_dataset_id = Some(primary_id);
+        }
+        let valid_test_ids = (0..self.imported_datasets.len())
+            .map(|index| project_file::DatasetId(format!("dataset-imported-{index}")))
+            .collect::<Vec<_>>();
+        if !valid_test_ids.contains(
+            self.compare_config
+                .test_dataset_id
+                .as_ref()
+                .unwrap_or(&valid_test_ids[0]),
+        ) {
+            self.compare_config.test_dataset_id = Some(valid_test_ids[0].clone());
+        }
+        let mut test_dataset_index = self
+            .compare_config
+            .test_dataset_id
+            .as_ref()
+            .and_then(|id| valid_test_ids.iter().position(|candidate| candidate == id))
+            .unwrap_or(0);
+        let mut enabled = self.compare_config.enabled;
+        ui.checkbox(&mut enabled, "Enable comparison metrics");
+        let labels = (0..self.imported_datasets.len())
+            .map(|index| self.dataset_label(index + 1))
+            .collect::<Vec<_>>();
+        ui.horizontal(|ui| {
+            ui.label("Test dataset");
+            egui::ComboBox::from_id_source("compare_test_dataset")
+                .selected_text(labels[test_dataset_index].clone())
+                .show_ui(ui, |ui| {
+                    for (index, label) in labels.iter().enumerate() {
+                        ui.selectable_value(&mut test_dataset_index, index, label);
+                    }
+                });
+        });
+
+        let reference_options = self.analog_channel_options_for_dataset(0);
+        let test_options = self.analog_channel_options_for_dataset(test_dataset_index + 1);
+        if reference_options.is_empty() || test_options.is_empty() {
+            ui.label("Both datasets need at least one analog channel.");
+            return;
+        }
+        let mapping = self.compare_config.channel_mappings.first();
+        let mut reference_channel = mapping
+            .map(|mapping| mapping.reference.index_hint)
+            .filter(|channel| reference_options.contains(channel))
+            .unwrap_or(reference_options[0]);
+        let mut test_channel = mapping
+            .map(|mapping| mapping.test.index_hint)
+            .filter(|channel| test_options.contains(channel))
+            .unwrap_or(test_options[0]);
+        ui.horizontal(|ui| {
+            ui.label("Reference channel");
+            egui::ComboBox::from_id_source("compare_reference_channel")
+                .selected_text(self.fft_channel_name(0, reference_channel))
+                .show_ui(ui, |ui| {
+                    for channel in &reference_options {
+                        ui.selectable_value(
+                            &mut reference_channel,
+                            *channel,
+                            self.fft_channel_name(0, *channel),
+                        );
+                    }
+                });
+        });
+        ui.horizontal(|ui| {
+            ui.label("Test channel");
+            egui::ComboBox::from_id_source("compare_test_channel")
+                .selected_text(self.fft_channel_name(test_dataset_index + 1, test_channel))
+                .show_ui(ui, |ui| {
+                    for channel in &test_options {
+                        ui.selectable_value(
+                            &mut test_channel,
+                            *channel,
+                            self.fft_channel_name(test_dataset_index + 1, *channel),
+                        );
+                    }
+                });
+        });
+
+        let mut alignment_kind = match self.compare_config.alignment {
+            project_file::ProjectCompareAlignment::ManualOffset { .. } => 0,
+            project_file::ProjectCompareAlignment::Anchor { .. } => 1,
+            project_file::ProjectCompareAlignment::TriggerPoint { .. } => 2,
+            project_file::ProjectCompareAlignment::ThresholdEvent { .. } => 3,
+            project_file::ProjectCompareAlignment::FundamentalPhase { .. } => 4,
+        };
+        let alignment_labels = [
+            "Manual offset",
+            "Anchor points",
+            "Trigger point",
+            "Threshold event",
+            "Fundamental phase",
+        ];
+        ui.horizontal(|ui| {
+            ui.label("Alignment");
+            egui::ComboBox::from_id_source("compare_alignment_kind")
+                .selected_text(alignment_labels[alignment_kind])
+                .show_ui(ui, |ui| {
+                    for (index, label) in alignment_labels.iter().enumerate() {
+                        ui.selectable_value(&mut alignment_kind, index, *label);
+                    }
+                });
+        });
+        let current_alignment = self.compare_config.alignment;
+        let alignment = match alignment_kind {
+            0 => {
+                let mut seconds = match current_alignment {
+                    project_file::ProjectCompareAlignment::ManualOffset { seconds } => seconds,
+                    project_file::ProjectCompareAlignment::Anchor {
+                        reference_time,
+                        test_time,
+                    }
+                    | project_file::ProjectCompareAlignment::TriggerPoint {
+                        reference_time,
+                        test_time,
+                        ..
+                    }
+                    | project_file::ProjectCompareAlignment::ThresholdEvent {
+                        reference_time,
+                        test_time,
+                        ..
+                    } => reference_time - test_time,
+                    alignment @ project_file::ProjectCompareAlignment::FundamentalPhase {
+                        ..
+                    } => Self::manual_offset_for_compare_alignment(alignment),
+                };
+                ui.horizontal(|ui| {
+                    ui.label("Offset (s)");
+                    ui.add(egui::DragValue::new(&mut seconds).speed(0.001));
+                });
+                project_file::ProjectCompareAlignment::ManualOffset { seconds }
+            }
+            1..=3 => {
+                let (mut reference_time, mut test_time, mut confidence) = match current_alignment {
+                    project_file::ProjectCompareAlignment::Anchor {
+                        reference_time,
+                        test_time,
+                    } => (reference_time, test_time, 1.0),
+                    project_file::ProjectCompareAlignment::TriggerPoint {
+                        reference_time,
+                        test_time,
+                        confidence,
+                    }
+                    | project_file::ProjectCompareAlignment::ThresholdEvent {
+                        reference_time,
+                        test_time,
+                        confidence,
+                    } => (reference_time, test_time, confidence),
+                    project_file::ProjectCompareAlignment::ManualOffset { seconds } => {
+                        (seconds, 0.0, 1.0)
+                    }
+                    project_file::ProjectCompareAlignment::FundamentalPhase { .. } => {
+                        (0.0, 0.0, 1.0)
+                    }
+                };
+                ui.horizontal(|ui| {
+                    ui.label("Reference time (s)");
+                    ui.add(egui::DragValue::new(&mut reference_time).speed(0.001));
+                    ui.label("Test time (s)");
+                    ui.add(egui::DragValue::new(&mut test_time).speed(0.001));
+                });
+                if alignment_kind != 1 {
+                    ui.horizontal(|ui| {
+                        ui.label("Confidence");
+                        ui.add(
+                            egui::DragValue::new(&mut confidence)
+                                .speed(0.01)
+                                .clamp_range(0.0..=1.0),
+                        );
+                    });
+                }
+                match alignment_kind {
+                    1 => project_file::ProjectCompareAlignment::Anchor {
+                        reference_time,
+                        test_time,
+                    },
+                    2 => project_file::ProjectCompareAlignment::TriggerPoint {
+                        reference_time,
+                        test_time,
+                        confidence,
+                    },
+                    _ => project_file::ProjectCompareAlignment::ThresholdEvent {
+                        reference_time,
+                        test_time,
+                        confidence,
+                    },
+                }
+            }
+            _ => {
+                let (
+                    mut reference_phase_radians,
+                    mut test_phase_radians,
+                    mut period_seconds,
+                    mut confidence,
+                ) = match current_alignment {
+                    project_file::ProjectCompareAlignment::FundamentalPhase {
+                        reference_phase_radians,
+                        test_phase_radians,
+                        period_seconds,
+                        confidence,
+                    } => (
+                        reference_phase_radians,
+                        test_phase_radians,
+                        period_seconds,
+                        confidence,
+                    ),
+                    _ => (0.0, 0.0, 0.02, 1.0),
+                };
+                ui.horizontal(|ui| {
+                    ui.label("Reference phase (rad)");
+                    ui.add(egui::DragValue::new(&mut reference_phase_radians).speed(0.01));
+                    ui.label("Test phase (rad)");
+                    ui.add(egui::DragValue::new(&mut test_phase_radians).speed(0.01));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Period (s)");
+                    ui.add(egui::DragValue::new(&mut period_seconds).speed(0.001));
+                    ui.label("Confidence");
+                    ui.add(
+                        egui::DragValue::new(&mut confidence)
+                            .speed(0.01)
+                            .clamp_range(0.0..=1.0),
+                    );
+                });
+                project_file::ProjectCompareAlignment::FundamentalPhase {
+                    reference_phase_radians,
+                    test_phase_radians,
+                    period_seconds,
+                    confidence,
+                }
+            }
+        };
+        let mut use_absolute = self.compare_config.tolerance.absolute.is_some();
+        let mut absolute = self.compare_config.tolerance.absolute.unwrap_or(0.0);
+        let mut use_relative = self.compare_config.tolerance.relative.is_some();
+        let mut relative = self.compare_config.tolerance.relative.unwrap_or(0.0);
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut use_absolute, "Abs tol");
+            ui.add_enabled(
+                use_absolute,
+                egui::DragValue::new(&mut absolute).speed(0.001),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut use_relative, "Rel tol");
+            ui.add_enabled(
+                use_relative,
+                egui::DragValue::new(&mut relative).speed(0.001),
+            );
+        });
+        let mut relative_floor = self.compare_config.relative_floor;
+        ui.horizontal(|ui| {
+            ui.label("Relative floor");
+            ui.add(egui::DragValue::new(&mut relative_floor).speed(0.001));
+        });
+
+        self.compare_config.enabled = enabled;
+        self.compare_config.test_dataset_id = Some(valid_test_ids[test_dataset_index].clone());
+        self.compare_config.alignment = alignment;
+        self.compare_config.tolerance = project_file::ProjectCompareTolerance {
+            absolute: use_absolute.then_some(absolute),
+            relative: use_relative.then_some(relative),
+        };
+        self.compare_config.relative_floor = relative_floor;
+        self.update_compare_mapping(test_dataset_index, reference_channel, test_channel);
+        self.poll_compare_metrics_worker();
+        if ui.button("Run comparison").clicked() {
+            self.start_compare_metrics_worker(test_dataset_index, reference_channel, test_channel);
+        }
+        if let Some(status) = &self.compare_status {
+            ui.label(status);
+        }
+        if let Some(result) = &self.compare_result {
+            ui.separator();
+            ui.label(result.evidence_line());
+            ui.label(format!(
+                "Valid: {} | Invalid: {}",
+                result.summary.valid_points, result.summary.invalid_points
+            ));
+            ui.label(format!("RMS error: {:.6}", result.summary.rms_error));
+            ui.label(format!(
+                "Max abs: {:.6} | Max rel: {:.3}%",
+                result.summary.max_absolute_error,
+                result.summary.max_relative_error * 100.0
+            ));
+            ui.label(format!(
+                "Exceedance intervals: {}",
+                result.summary.exceedance_intervals.len()
+            ));
+        }
+    }
+
+    fn update_compare_mapping(
+        &mut self,
+        test_dataset_index: usize,
+        reference_channel: usize,
+        test_channel: usize,
+    ) {
+        let reference_name = self
+            .dataset_meta_by_index(0)
+            .and_then(|meta| meta.channels.get(reference_channel))
+            .map(|channel| channel.name.clone())
+            .unwrap_or_else(|| format!("CH{reference_channel}"));
+        let test_name = self
+            .dataset_meta_by_index(test_dataset_index + 1)
+            .and_then(|meta| meta.channels.get(test_channel))
+            .map(|channel| channel.name.clone())
+            .unwrap_or_else(|| format!("CH{test_channel}"));
+        self.compare_config.channel_mappings = vec![project_file::ProjectCompareChannelMapping {
+            reference: project_file::ProjectChannelRef {
+                source_id: project_file::SourceId("source-primary".to_owned()),
+                raw_name: reference_name,
+                index_hint: reference_channel,
+                channel_id_hint: None,
+            },
+            test: project_file::ProjectChannelRef {
+                source_id: project_file::SourceId(format!("source-imported-{test_dataset_index}")),
+                raw_name: test_name,
+                index_hint: test_channel,
+                channel_id_hint: None,
+            },
+            label: "comparison".to_owned(),
+        }];
+    }
+
+    fn manual_offset_for_compare_alignment(
+        alignment: project_file::ProjectCompareAlignment,
+    ) -> f64 {
+        match alignment {
+            project_file::ProjectCompareAlignment::ManualOffset { seconds } => seconds,
+            project_file::ProjectCompareAlignment::Anchor {
+                reference_time,
+                test_time,
+            }
+            | project_file::ProjectCompareAlignment::TriggerPoint {
+                reference_time,
+                test_time,
+                ..
+            }
+            | project_file::ProjectCompareAlignment::ThresholdEvent {
+                reference_time,
+                test_time,
+                ..
+            } => reference_time - test_time,
+            project_file::ProjectCompareAlignment::FundamentalPhase {
+                reference_phase_radians,
+                test_phase_radians,
+                period_seconds,
+                confidence,
+            } => AlignmentSpec::FundamentalPhase {
+                reference_phase_radians,
+                test_phase_radians,
+                period_seconds,
+                confidence,
+            }
+            .offset_seconds()
+            .unwrap_or(0.0),
+        }
+    }
+
+    fn start_compare_metrics_worker(
+        &mut self,
+        test_dataset_index: usize,
+        reference_channel: usize,
+        test_channel: usize,
+    ) {
+        if self.compare_metrics_worker.is_some() {
+            return;
+        }
+        let Some(reference_source) = self.source.clone() else {
+            self.compare_status = Some("No primary dataset loaded.".to_owned());
+            return;
+        };
+        let Some(test_source) = self
+            .imported_datasets
+            .get(test_dataset_index)
+            .map(|dataset| dataset.source.clone())
+        else {
+            self.compare_status = Some("The selected test dataset is unavailable.".to_owned());
+            return;
+        };
+        let alignment = match self.compare_config.alignment {
+            project_file::ProjectCompareAlignment::ManualOffset { seconds } => {
+                AlignmentSpec::ManualOffset { seconds }
+            }
+            project_file::ProjectCompareAlignment::Anchor {
+                reference_time,
+                test_time,
+            } => AlignmentSpec::Anchor {
+                reference_time,
+                test_time,
+            },
+            project_file::ProjectCompareAlignment::TriggerPoint {
+                reference_time,
+                test_time,
+                confidence,
+            } => AlignmentSpec::TriggerPoint {
+                reference_time,
+                test_time,
+                confidence,
+            },
+            project_file::ProjectCompareAlignment::ThresholdEvent {
+                reference_time,
+                test_time,
+                confidence,
+            } => AlignmentSpec::ThresholdEvent {
+                reference_time,
+                test_time,
+                confidence,
+            },
+            project_file::ProjectCompareAlignment::FundamentalPhase {
+                reference_phase_radians,
+                test_phase_radians,
+                period_seconds,
+                confidence,
+            } => AlignmentSpec::FundamentalPhase {
+                reference_phase_radians,
+                test_phase_radians,
+                period_seconds,
+                confidence,
+            },
+        };
+        let tolerance = (self.compare_config.tolerance.absolute.is_some()
+            || self.compare_config.tolerance.relative.is_some())
+        .then_some(Tolerance {
+            absolute: self.compare_config.tolerance.absolute,
+            relative: self.compare_config.tolerance.relative,
+        });
+        let relative_floor = self.compare_config.relative_floor;
+        let generation = self.data_generation;
+        let cancel_token = JobCancelToken::new();
+        let worker_cancel = cancel_token.clone();
+        self.compare_metrics_cancel = Some(cancel_token);
+        self.compare_status = Some("Calculating comparison…".to_owned());
+        self.compare_result = None;
+        Self::spawn_job(&mut self.compare_metrics_worker, move || {
+            let result = Self::worker_result("Compare metrics worker panicked.", || {
+                let data_cancel = worker_cancel.data_token();
+                let reference = Self::read_compare_series(
+                    reference_source,
+                    reference_channel,
+                    Some(&data_cancel),
+                )?;
+                if worker_cancel.is_cancelled() {
+                    return Err("Operation cancelled.".to_owned());
+                }
+                let test =
+                    Self::read_compare_series(test_source, test_channel, Some(&data_cancel))?;
+                compare(CompareRequest {
+                    reference,
+                    test,
+                    alignment,
+                    tolerance,
+                    relative_floor,
+                })
+                .map_err(|error| error.to_string())
+            });
+            CompareMetricsJobResult { generation, result }
+        });
+        self.project_dirty = true;
+    }
+
+    fn poll_compare_metrics_worker(&mut self) {
+        let Some(joined) = Self::take_finished_job(
+            &mut self.compare_metrics_worker,
+            "Compare metrics worker panicked.",
+        ) else {
+            return;
+        };
+        self.compare_metrics_cancel = None;
+        let Ok(result) = joined else {
+            self.compare_status = Some("Compare metrics worker panicked.".to_owned());
+            return;
+        };
+        if result.generation != self.data_generation {
+            return;
+        }
+        match result.result {
+            Ok(result) => {
+                self.compare_status = Some("Comparison completed.".to_owned());
+                self.compare_result = Some(result);
+            }
+            Err(error) => {
+                self.compare_status = Some(error);
+                self.compare_result = None;
+            }
+        }
+    }
+
+    fn read_compare_series(
+        source: Arc<dyn DataSource>,
+        channel: usize,
+        cancel: Option<&scope_analyzer::data::DataCancelToken>,
+    ) -> Result<Series, String> {
+        let meta = source.metadata();
+        if meta.sample_count > MAX_COMPARE_SOURCE_SAMPLES {
+            return Err(format!(
+                "comparison input has {} samples; the exact comparison limit is {MAX_COMPARE_SOURCE_SAMPLES}",
+                meta.sample_count
+            ));
+        }
+        let max_points = usize::try_from(meta.sample_count)
+            .map_err(|_| "comparison sample count does not fit this platform".to_owned())?;
+        let blocks = if let Some(cancel) = cancel {
+            source.read_range_segments_cancellable(
+                meta.start_time,
+                meta.end_time,
+                &[channel],
+                max_points,
+                cancel,
+            )
+        } else {
+            source.read_range_segments(
+                meta.start_time,
+                meta.end_time,
+                &[channel],
+                max_points,
+            )
+        }
+        .map_err(|error| error.to_string())?;
+        let segments = blocks
+            .into_iter()
+            .filter_map(|block| {
+                let values = block.channels.into_iter().next()?;
+                (!block.times.is_empty() && block.times.len() == values.len()).then_some(
+                    SeriesSegment::new(block.times, values.into_iter().map(f64::from).collect()),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        Series::new(segments).map_err(|error| error.to_string())
+    }
+
     fn poll_measurement_worker(&mut self, expected_key: &MeasurementJobKey) {
         let Some(joined) =
             Self::take_finished_job(&mut self.measurement_worker, "Measurement worker panicked.")
@@ -20053,9 +20741,18 @@ impl ScopeApp {
             ui.add_space(8.0);
             ui.label(RichText::new("3φ Power").strong());
             ui.horizontal_wrapped(|ui| {
-                ui.label(format!("P: {:.3} {}", power.active_power, power.power_unit));
-                ui.label(format!("Q₁: {:.3} var", power.fundamental_reactive_power));
-                ui.label(format!("S: {:.3} VA", power.effective_apparent_power));
+                ui.label(format!(
+                    "P: {:.3} {}",
+                    power.active_power, power.active_power_unit
+                ));
+                ui.label(format!(
+                    "Q₁: {:.3} {}",
+                    power.fundamental_reactive_power, power.reactive_power_unit
+                ));
+                ui.label(format!(
+                    "S: {:.3} {}",
+                    power.effective_apparent_power, power.apparent_power_unit
+                ));
                 ui.label(format!(
                     "PF: {}",
                     Self::format_measurement_value(power.true_power_factor)
@@ -21222,8 +21919,15 @@ impl ScopeApp {
         }
     }
 
+    fn mark_project_dirty_after_live_capture(&mut self, capture_added: bool) {
+        if capture_added && self.project_path.is_some() {
+            self.project_dirty = true;
+        }
+    }
+
     fn update_inner(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.live.poll();
+        let capture_added = self.live.poll();
+        self.mark_project_dirty_after_live_capture(capture_added);
         self.poll_import_worker();
         if self.any_background_job_running()
             || self.live.connection_state
@@ -21282,6 +21986,8 @@ impl ScopeApp {
                                 ui.available_width().max(ANALYSIS_PANEL_CONTENT_MIN_WIDTH),
                             );
                             self.analysis_dataset_selector(ui);
+                            ui.separator();
+                            self.comparison_panel(ui);
                             ui.separator();
                             self.measurements_panel(ui);
                             ui.separator();
@@ -21379,6 +22085,20 @@ mod tests {
         assert_eq!(prepared.segmented_points[0][0][1].x, 0.1);
         assert_eq!(prepared.segmented_points[0][1][0].x, 1.0);
         assert_eq!(prepared.points[0].len(), 4);
+    }
+
+    #[test]
+    fn phase_alignment_switches_to_its_effective_manual_offset() {
+        let offset = ScopeApp::manual_offset_for_compare_alignment(
+            project_file::ProjectCompareAlignment::FundamentalPhase {
+                reference_phase_radians: 0.25 * std::f64::consts::PI,
+                test_phase_radians: -0.25 * std::f64::consts::PI,
+                period_seconds: 0.02,
+                confidence: 0.9,
+            },
+        );
+
+        assert!((offset - 0.005).abs() < 1.0e-12);
     }
 
     #[test]
@@ -21506,6 +22226,49 @@ mod tests {
         let opened = ScopeApp::open_waveform_file(&csv_path, 10.0).unwrap();
         let mut app = ScopeApp::new_for_test();
         app.set_source(opened.source, opened.path, opened.kind);
+        let compare_path = dir.join("compare.csv");
+        fs::write(
+            &compare_path,
+            "time,Va,Vb,Vc,Ia,Ib,Ic\n0.0,1,2,3,4,5,6\n0.1,2,3,4,5,6,7\n",
+        )
+        .unwrap();
+        let compare_opened = ScopeApp::open_waveform_file(&compare_path, 10.0).unwrap();
+        app.add_imported_dataset(
+            compare_opened.source,
+            compare_opened.path,
+            compare_opened.kind,
+        );
+        app.compare_config = project_file::ProjectCompare {
+            enabled: true,
+            reference_dataset_id: Some(project_file::DatasetId("dataset-primary".to_owned())),
+            test_dataset_id: Some(project_file::DatasetId("dataset-imported-0".to_owned())),
+            channel_mappings: vec![project_file::ProjectCompareChannelMapping {
+                reference: project_file::ProjectChannelRef {
+                    source_id: project_file::SourceId("source-primary".to_owned()),
+                    raw_name: "Va".to_owned(),
+                    index_hint: 0,
+                    channel_id_hint: None,
+                },
+                test: project_file::ProjectChannelRef {
+                    source_id: project_file::SourceId("source-imported-0".to_owned()),
+                    raw_name: "Va".to_owned(),
+                    index_hint: 0,
+                    channel_id_hint: None,
+                },
+                label: "voltage-a".to_owned(),
+            }],
+            alignment: project_file::ProjectCompareAlignment::FundamentalPhase {
+                reference_phase_radians: 0.1,
+                test_phase_radians: -0.2,
+                period_seconds: 0.02,
+                confidence: 0.8,
+            },
+            tolerance: project_file::ProjectCompareTolerance {
+                absolute: Some(0.25),
+                relative: Some(0.05),
+            },
+            relative_floor: 0.001,
+        };
         app.display_names[0] = "Voltage A".to_owned();
         app.channel_scales[0] = 2.0;
         app.scope_layout_rows = 2;
@@ -21532,6 +22295,11 @@ mod tests {
         restored.open_project_from(&project_path).unwrap();
 
         assert_eq!(restored.display_names[0], "Voltage A");
+        assert_eq!(restored.imported_datasets.len(), 1);
+        assert_eq!(
+            restored.compare_config, app.compare_config,
+            "Compare configuration must survive project save/restore"
+        );
         assert_eq!(restored.channel_scales[0], 2.0);
         assert_eq!(
             (restored.scope_layout_rows, restored.scope_layout_cols),
@@ -21650,6 +22418,32 @@ mod tests {
     }
 
     #[test]
+    fn relocated_project_remains_dirty_for_autosave() {
+        let mut app = ScopeApp::new_for_test();
+        let project_path = PathBuf::from("/tmp/relocated.scopeproj");
+
+        app.finish_project_restore(&project_path, "project-relocated".to_owned(), true);
+
+        assert_eq!(app.project_path.as_deref(), Some(project_path.as_path()));
+        assert!(app.project_dirty);
+
+        app.finish_project_restore(&project_path, "project-clean".to_owned(), false);
+        assert!(!app.project_dirty);
+    }
+
+    #[test]
+    fn new_live_capture_marks_an_open_project_dirty() {
+        let mut app = ScopeApp::new_for_test();
+        app.project_path = Some(PathBuf::from("/tmp/live.scopeproj"));
+
+        app.mark_project_dirty_after_live_capture(false);
+        assert!(!app.project_dirty);
+
+        app.mark_project_dirty_after_live_capture(true);
+        assert!(app.project_dirty);
+    }
+
+    #[test]
     fn scope_project_materializes_and_restores_live_capture_assets() {
         use scope_analyzer::live::{
             protocol::{ChannelDescriptor, ChannelKind, ChannelTable, HelloAck, WireFormat},
@@ -21686,10 +22480,28 @@ mod tests {
             trigger_position: 1,
             auto_timeout: false,
         };
-        app.live
+        let discarded_capture = TriggerCapture {
+            channel_ids: vec![0],
+            sample_indices: vec![1, 2, 3],
+            timestamps: vec![100, 200, 300],
+            channels: vec![vec![1.0, 2.0, 3.0]],
+            trigger_position: 1,
+            auto_timeout: false,
+        };
+        let discarded_id = app
+            .live
             .capture_history
-            .insert_live(capture.clone(), TriggerConfig::default(), 1, true)
-            .unwrap();
+            .insert_live(discarded_capture, TriggerConfig::default(), 1, true)
+            .unwrap()
+            .id;
+        let retained_id = app
+            .live
+            .capture_history
+            .insert_live(capture.clone(), TriggerConfig::default(), 2, true)
+            .unwrap()
+            .id;
+        assert!(app.live.capture_history.remove(discarded_id));
+        assert_eq!(retained_id.0, 2);
         app.live.last_capture = Some(capture.clone());
         let project_path = dir.join("capture.scopeproj");
         app.project_dirty = true;
@@ -21714,11 +22526,21 @@ mod tests {
         restored.open_project_from(&project_path).unwrap();
 
         assert_eq!(restored.live.capture_history.entries().len(), 1);
+        assert_eq!(restored.live.capture_history.entries()[0].id.0, 2);
         assert_eq!(restored.live.selected_trigger_capture(), Some(&capture));
         assert!(restored.source.is_none());
         assert!(dir
-            .join("capture.scopeproj.assets/captures/capture-1.scope")
+            .join("capture.scopeproj.assets/captures/capture-2.scope")
             .is_file());
+
+        restored.save_project_to(&project_path).unwrap();
+        let document = project_file::load_project(&project_path).unwrap();
+        assert_eq!(document.captures[0].id.0, "capture-2");
+        let asset = scope_analyzer::live::recording::read_capture_scope_file(
+            &dir.join("capture.scopeproj.assets/captures/capture-2.scope"),
+        )
+        .unwrap();
+        assert_eq!(asset.capture, capture);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -22090,6 +22912,24 @@ mod tests {
         assert_eq!(
             ConfigSection::Dataset.exported_message(Language::En),
             "Dataset settings exported."
+        );
+    }
+
+    #[test]
+    fn report_cursor_table_rows_preserve_interpolated_values() {
+        let rows = ScopeApp::export_cursor_table_rows(
+            vec![("CH1".to_owned(), Some(1.25), Some(0.75))],
+            true,
+            true,
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                "CH1".to_owned(),
+                "1.250".to_owned(),
+                "0.750".to_owned(),
+                "-0.500".to_owned(),
+            ]]
         );
     }
 

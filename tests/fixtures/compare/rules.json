@@ -1,0 +1,15 @@
+[
+  {
+    "id": "rms-limit",
+    "metric": "rms",
+    "operator": "less-equal",
+    "lower": 0.1
+  },
+  {
+    "id": "frequency-window",
+    "metric": "frequency",
+    "operator": "between-inclusive",
+    "lower": 49.0,
+    "upper": 51.0
+  }
+]

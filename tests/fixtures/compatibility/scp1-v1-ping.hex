@@ -1,0 +1,6 @@
+# SCP1 V1 PING golden frame: flags=3, sequence=7, session_id=11,
+# timestamp_ticks=13, nonce=17. Whitespace and comments are ignored by the
+# fixture reader used by compatibility tests.
+53 43 50 31 01 14 03 00 07 00 00 00 08 00 00 00
+0b 00 00 00 0d 00 00 00 00 00 00 00 11 00 00 00
+00 00 00 00 1d 23 97 cb

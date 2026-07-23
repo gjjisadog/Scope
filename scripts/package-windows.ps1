@@ -1,12 +1,14 @@
 param(
     [switch]$SkipPerformanceBaselines,
-    [switch]$OfflinePackage
+    [switch]$OfflinePackage,
+    [switch]$RequireSignature,
+    [string]$CertificateThumbprint = $env:SCOPE_SIGN_CERT_SHA1
 )
 
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
-$version = "0.11.0"
+$version = "0.12.0"
 $dist = Join-Path $root "dist"
 $stage = Join-Path $dist "ScopeAnalyzer-$version-win-x64"
 $zip = Join-Path $dist "ScopeAnalyzer-$version-win-x64.zip"
@@ -20,7 +22,15 @@ $sevenZipUrl = "https://www.7-zip.org/a/7zr.exe"
 $sevenZipSha256 = "abcf64ae1cbafddb5395e4cdd3bdc7e3e0561d54a0c6380e3dd43bdbffe519a2"
 $mesaManifestName = "mesa-runtime-manifest.json"
 $angleManifestName = "angle-runtime-manifest.json"
+$anglePreloadManifestName = "angle-runtime-preload-manifest.json"
+$angleSourceSha256 = $env:ANGLE_RUNTIME_SOURCE_SHA256
+$anglePreloadManifestSha256 = $env:ANGLE_RUNTIME_MANIFEST_SHA256
+$wixToolsetVersion = "3.14"
 $headers = @{ "User-Agent" = "ScopeAnalyzerPackageScript" }
+
+if ($RequireSignature -and [string]::IsNullOrWhiteSpace($CertificateThumbprint)) {
+    throw "-RequireSignature requires SCOPE_SIGN_CERT_SHA1 or -CertificateThumbprint."
+}
 
 function Resolve-Tool {
     param([string]$Name)
@@ -36,8 +46,7 @@ function Resolve-Tool {
         $candidateDirs += Join-Path $env:WIX "bin"
     }
     if (${env:ProgramFiles(x86)}) {
-        $candidateDirs += Join-Path ${env:ProgramFiles(x86)} "WiX Toolset v3.14\bin"
-        $candidateDirs += Join-Path ${env:ProgramFiles(x86)} "WiX Toolset v3.11\bin"
+        $candidateDirs += Join-Path ${env:ProgramFiles(x86)} "WiX Toolset v$wixToolsetVersion\bin"
     }
     $candidateDirs += "C:\tmp\wix314"
 
@@ -74,6 +83,65 @@ function Resolve-AngleRuntimeCandidate {
     }
 
     return $null
+}
+
+function Assert-AngleRuntimePreload {
+    param(
+        [string]$RuntimeDir,
+        [string]$ExpectedSourceSha256,
+        [string]$ExpectedManifestSha256
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ExpectedManifestSha256) -or
+        $ExpectedManifestSha256 -notmatch '^[0-9a-fA-F]{64}$') {
+        throw "ANGLE_RUNTIME_MANIFEST_SHA256 must be a 64-character hexadecimal SHA256 value for signed or offline packaging."
+    }
+
+    $manifestPath = Join-Path $RuntimeDir $anglePreloadManifestName
+    if (-not (Test-Path $manifestPath)) {
+        throw "ANGLE runtime preload manifest is required for signed or offline packaging: $manifestPath"
+    }
+    $actualManifestSha256 = Get-FileSha256 $manifestPath
+    if ($actualManifestSha256 -ne $ExpectedManifestSha256.ToLowerInvariant()) {
+        throw "ANGLE runtime preload manifest hash mismatch at $manifestPath. Expected $ExpectedManifestSha256, got $actualManifestSha256"
+    }
+
+    try {
+        $manifest = Get-Content -Raw $manifestPath | ConvertFrom-Json
+    } catch {
+        throw "ANGLE runtime preload manifest is not valid JSON at $manifestPath"
+    }
+    if ($manifest.schemaVersion -ne 1 -or $manifest.runtime -ne "ANGLE") {
+        throw "ANGLE runtime preload manifest must declare schemaVersion 1 and runtime ANGLE."
+    }
+    if ([string]$manifest.sourceArchiveSha256 -notmatch '^[0-9a-fA-F]{64}$' -or
+        ([string]$manifest.sourceArchiveSha256).ToLowerInvariant() -ne $ExpectedSourceSha256.ToLowerInvariant()) {
+        throw "ANGLE runtime preload manifest sourceArchiveSha256 does not match ANGLE_RUNTIME_SOURCE_SHA256."
+    }
+    if (-not $manifest.fileHashes) {
+        throw "ANGLE runtime preload manifest does not contain fileHashes."
+    }
+
+    foreach ($name in @("libEGL.dll", "libGLESv2.dll", "d3dcompiler_47.dll")) {
+        $path = Join-Path $RuntimeDir $name
+        $entry = $manifest.fileHashes.PSObject.Properties[$name]
+        if (Test-Path $path) {
+            if (-not $entry) {
+                throw "ANGLE runtime preload manifest does not hash packaged file $name."
+            }
+            if ([string]$entry.Value -notmatch '^[0-9a-fA-F]{64}$') {
+                throw "ANGLE runtime preload manifest hash for $name is not a SHA256 value."
+            }
+            $actualFileSha256 = Get-FileSha256 $path
+            if ($actualFileSha256 -ne ([string]$entry.Value).ToLowerInvariant()) {
+                throw "ANGLE runtime preload file hash mismatch for $name."
+            }
+        } elseif ($entry) {
+            throw "ANGLE runtime preload manifest hashes missing file $name."
+        }
+    }
+
+    return $actualManifestSha256
 }
 
 function Resolve-SystemAngleRuntimeDir {
@@ -117,7 +185,7 @@ function Test-MesaRuntimeDir {
         return $false
     }
 
-    $required = @("opengl32.dll", "libgallium_wgl.dll", "libEGL.dll", "libGLESv2.dll")
+    $required = @("opengl32.dll", "libgallium_wgl.dll", "libEGL.dll", "libGLESv2.dll", "libGLESv1_CM.dll")
     foreach ($name in $required) {
         if (-not (Test-Path (Join-Path $Dir $name))) {
             return $false
@@ -178,6 +246,262 @@ function Resolve-AngleRuntimeDir {
 
 function Get-IsOfflinePackage {
     return $OfflinePackage -or $env:SCOPE_PACKAGE_OFFLINE -eq "1"
+}
+
+function Get-CommandVersion {
+    param([string]$Name)
+
+    $command = Get-Command $Name -ErrorAction SilentlyContinue
+    if (-not $command) {
+        return "unavailable"
+    }
+    try {
+        $text = & $command.Source --version 2>$null | Select-Object -First 1
+        if ($text) {
+            return $text.ToString().Trim()
+        }
+    } catch {
+    }
+    return "unavailable"
+}
+
+function Get-RelativeStagePath {
+    param(
+        [string]$StageDir,
+        [string]$Path
+    )
+
+    return $Path.Substring($StageDir.Length).TrimStart('\', '/') -replace '\\', '/'
+}
+
+function Write-BuildEvidence {
+    param(
+        [string]$StageDir,
+        [string]$Version,
+        [string]$IncludeAngle,
+        [string]$IncludeMesa
+    )
+
+    $commit = "unknown"
+    $dirty = $false
+    try {
+        $commit = (& git -C $root rev-parse HEAD 2>$null | Select-Object -First 1).ToString().Trim()
+        $dirty = [bool](& git -C $root status --porcelain 2>$null)
+    } catch {
+    }
+    if ($RequireSignature -and ($commit -eq "unknown" -or $dirty)) {
+        throw "Signed packages must be produced from a clean source tree with a known source commit"
+    }
+    $cargoLockSha256 = (Get-FileHash -Path (Join-Path $root "Cargo.lock") -Algorithm SHA256).Hash.ToLowerInvariant()
+    $toolchainSha256 = (Get-FileHash -Path (Join-Path $root "rust-toolchain.toml") -Algorithm SHA256).Hash.ToLowerInvariant()
+
+    $fileHashes = [ordered]@{}
+    Get-ChildItem -Path $StageDir -Recurse -File |
+        Sort-Object FullName |
+        ForEach-Object {
+            $relative = Get-RelativeStagePath -StageDir $StageDir -Path $_.FullName
+            $fileHashes[$relative] = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+
+    $runtimeManifests = @()
+    foreach ($manifestPath in @(
+        (Join-Path $StageDir $angleManifestName),
+        (Join-Path $StageDir "mesa\$mesaManifestName")
+    )) {
+        if (Test-Path $manifestPath) {
+            $runtimeManifests += [ordered]@{
+                path = Get-RelativeStagePath -StageDir $StageDir -Path $manifestPath
+                sha256 = (Get-FileHash -Path $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+        }
+    }
+
+    $provenance = [ordered]@{
+        schemaVersion = 1
+        packageVersion = $Version
+        sourceCommit = $commit
+        sourceDirty = $dirty
+        cargoLockSha256 = $cargoLockSha256
+        toolchainSha256 = $toolchainSha256
+        rustc = Get-CommandVersion "rustc"
+        cargo = Get-CommandVersion "cargo"
+        wix = Get-CommandVersion "candle.exe"
+        includeAngleRuntime = ($IncludeAngle -eq "true")
+        includeMesaRuntime = ($IncludeMesa -eq "true")
+        runtimeManifests = $runtimeManifests
+        fileHashesExclude = @("build-provenance.json")
+        fileHashes = $fileHashes
+    }
+    $provenancePath = Join-Path $StageDir "build-provenance.json"
+    $provenance | ConvertTo-Json -Depth 8 | Set-Content -Path $provenancePath -Encoding ASCII
+
+    $components = @(
+        [ordered]@{
+            type = "application"
+            name = "scope-analyzer"
+            version = $Version
+            "bom-ref" = "scope-analyzer@$Version"
+        },
+        [ordered]@{
+            type = "application"
+            name = "scope-cli"
+            version = $Version
+            "bom-ref" = "scope-cli@$Version"
+        }
+    )
+    if ($IncludeAngle -eq "true") {
+        $components += [ordered]@{
+            type = "library"
+            name = "ANGLE runtime"
+            version = "manifest-pinned"
+            "bom-ref" = "angle-runtime"
+            licenses = @(
+                [ordered]@{
+                    license = [ordered]@{ id = "BSD-3-Clause" }
+                }
+            )
+        }
+    }
+    if ($IncludeMesa -eq "true") {
+        $components += [ordered]@{
+            type = "library"
+            name = "Mesa runtime"
+            version = $mesaReleaseTag
+            "bom-ref" = "mesa-runtime@$mesaReleaseTag"
+            licenses = @(
+                [ordered]@{
+                    license = [ordered]@{ name = "MIT/X11 and Mesa component licenses" }
+                }
+            )
+        }
+    }
+    $sbom = [ordered]@{
+        bomFormat = "CycloneDX"
+        specVersion = "1.5"
+        serialNumber = "urn:scope-analyzer:$Version"
+        version = 1
+        metadata = [ordered]@{
+            component = [ordered]@{
+                type = "application"
+                name = "Scope Analyzer"
+                version = $Version
+            }
+        }
+        components = $components
+    }
+    $sbom | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $StageDir "sbom.cdx.json") -Encoding ASCII
+
+    # The provenance file cannot contain its own hash without becoming
+    # self-referential. Recompute the final manifest after SBOM generation so
+    # every other staged artifact, including sbom.cdx.json, is covered.
+    $fileHashes = [ordered]@{}
+    Get-ChildItem -Path $StageDir -Recurse -File |
+        Sort-Object FullName |
+        ForEach-Object {
+            $relative = Get-RelativeStagePath -StageDir $StageDir -Path $_.FullName
+            if ($relative -ne "build-provenance.json") {
+                $fileHashes[$relative] = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+        }
+    $provenance.fileHashes = $fileHashes
+    $provenance | ConvertTo-Json -Depth 8 | Set-Content -Path $provenancePath -Encoding ASCII
+}
+
+function Write-ThirdPartyNotices {
+    param([string]$StageDir)
+
+    $notice = @"
+Scope Analyzer third-party runtime notices
+==========================================
+
+This package may contain the following redistributable runtime components. The
+runtime manifests next to these files record the exact copied file hashes.
+
+Mesa 26.0.8 (llvmpipe/WGL fallback)
+  Project: https://mesa3d.org/
+  License family: MIT/X11 and the component licenses documented by Mesa.
+  Release asset: $mesaAssetName
+  Release asset SHA256: $mesaAssetSha256
+
+ANGLE (EGL/GLES translation runtime)
+  Project: https://chromium.googlesource.com/angle/angle
+  License: BSD 3-Clause and the dependent notices distributed by ANGLE.
+  The package angle-runtime-manifest.json records the copied DLL hashes.
+
+7-Zip command-line extractor (build-time helper only)
+  Project: https://www.7-zip.org/
+  License: LGPL-2.1-or-later with the 7-Zip unRAR restriction where applicable.
+  7zr.exe is not shipped in the installed application.
+
+The Scope Analyzer application and its CLI are distributed under the repository
+license. See the source repository for the complete dependency license report.
+"@
+    Set-Content -Path (Join-Path $StageDir "THIRD-PARTY-NOTICES.txt") -Encoding UTF8 -Value $notice
+}
+
+function Resolve-SignTool {
+    if ($env:SIGNTOOL_PATH -and (Test-Path $env:SIGNTOOL_PATH)) {
+        return $env:SIGNTOOL_PATH
+    }
+    return Resolve-Tool "signtool.exe"
+}
+
+function Sign-ReleaseFile {
+    param(
+        [string]$Path,
+        [string]$SignTool
+    )
+
+    & $SignTool sign /fd SHA256 /sha1 $CertificateThumbprint $Path
+    if ($LASTEXITCODE -ne 0) {
+        throw "signtool failed for $Path with exit code $LASTEXITCODE"
+    }
+    $signature = Get-AuthenticodeSignature -FilePath $Path
+    if ($signature.Status -ne "Valid") {
+        throw "Authenticode signature validation failed for ${Path}: $($signature.Status)"
+    }
+}
+
+function Write-ReleaseEvidence {
+    param(
+        [string]$MsiPath,
+        [string]$ZipPath,
+        [string]$StageDir,
+        [string]$SignatureStatus
+    )
+
+    $artifacts = [ordered]@{}
+    foreach ($path in @($MsiPath, $ZipPath)) {
+        if (Test-Path $path) {
+            $artifacts[(Split-Path -Leaf $path)] = [ordered]@{
+                sha256 = (Get-FileHash -Path $path -Algorithm SHA256).Hash.ToLowerInvariant()
+                bytes = (Get-Item $path).Length
+            }
+        }
+    }
+    $commit = "unknown"
+    $dirty = $false
+    try {
+        $commitValue = & git -C $root rev-parse HEAD 2>$null | Select-Object -First 1
+        if ($commitValue) {
+            $commit = $commitValue.ToString().Trim()
+        }
+        $dirty = [bool](& git -C $root status --porcelain 2>$null)
+    } catch {
+    }
+    $evidence = [ordered]@{
+        schemaVersion = 1
+        packageVersion = $version
+        sourceCommit = $commit
+        sourceDirty = $dirty
+        cargoLockSha256 = (Get-FileHash -Path (Join-Path $root "Cargo.lock") -Algorithm SHA256).Hash.ToLowerInvariant()
+        toolchainSha256 = (Get-FileHash -Path (Join-Path $root "rust-toolchain.toml") -Algorithm SHA256).Hash.ToLowerInvariant()
+        stagePath = Split-Path -Leaf $StageDir
+        signatureStatus = $SignatureStatus
+        artifacts = $artifacts
+        generatedBy = "scripts/package-windows.ps1"
+    }
+    $evidence | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $dist "release-evidence.json") -Encoding ASCII
 }
 
 function Get-FileSha256 {
@@ -290,8 +614,22 @@ function Test-MesaRuntimeCache {
         Write-Host "Mesa runtime cache miss: manifest does not contain file hashes"
         return $false
     }
+    if ($manifest.sourceArchiveSha256 -notmatch '^[0-9a-fA-F]{64}$') {
+        Write-Host "Mesa runtime cache miss: manifest sourceArchiveSha256 is not a SHA256 value"
+        return $false
+    }
+    foreach ($name in @("opengl32.dll", "libgallium_wgl.dll", "libEGL.dll", "libGLESv2.dll", "libGLESv1_CM.dll")) {
+        if (-not $manifest.fileHashes.PSObject.Properties[$name]) {
+            Write-Host "Mesa runtime cache miss: manifest does not hash required file $name"
+            return $false
+        }
+    }
 
     foreach ($file in $manifest.fileHashes.PSObject.Properties) {
+        if ([string]$file.Value -notmatch '^[0-9a-fA-F]{64}$') {
+            Write-Host "Mesa runtime cache miss: hash for $($file.Name) is not a SHA256 value"
+            return $false
+        }
         $path = Join-Path $RuntimeDir $file.Name
         if (-not (Test-FileSha256 -Path $path -ExpectedSha256 $file.Value)) {
             Write-Host "Mesa runtime cache miss: cached file hash mismatch for $($file.Name)"
@@ -318,11 +656,11 @@ function Write-MesaRuntimeManifest {
     }
 
     $manifest = [ordered]@{
+        schemaVersion = 1
         mesaReleaseTag = $mesaReleaseTag
         mesaAssetName = $mesaAssetName
         mesaAssetSha256 = $mesaAssetSha256
         sourceArchiveSha256 = Get-FileSha256 $Archive
-        cachedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
         fileHashes = $fileHashes
     }
 
@@ -332,7 +670,9 @@ function Write-MesaRuntimeManifest {
 function Write-AngleRuntimeManifest {
     param(
         [string]$RuntimeDir,
-        [string]$ManifestPath
+        [string]$ManifestPath,
+        [string]$SourceSha256,
+        [string]$PreloadManifestSha256
     )
 
     $fileHashes = [ordered]@{}
@@ -344,8 +684,10 @@ function Write-AngleRuntimeManifest {
     }
 
     $manifest = [ordered]@{
-        sourcePath = (Resolve-Path $RuntimeDir).Path
-        cachedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
+        schemaVersion = 1
+        runtime = "ANGLE"
+        sourceArchiveSha256 = $SourceSha256
+        preloadManifestSha256 = $PreloadManifestSha256
         fileHashes = $fileHashes
     }
 
@@ -416,7 +758,14 @@ function Resolve-MesaRuntimeDir {
     if ($env:MESA_RUNTIME_DIR) {
         $resolved = Resolve-MesaRuntimeCandidate $env:MESA_RUNTIME_DIR
         if ($resolved) {
-            Write-Host "Mesa runtime explicit path: $resolved"
+            if (Test-MesaRuntimeCache $resolved) {
+                Write-Host "Mesa runtime explicit path: $resolved"
+                return $resolved
+            }
+            if ($RequireSignature -or (Get-IsOfflinePackage)) {
+                throw "Mesa runtime explicit path does not pass the pinned manifest validation: $resolved"
+            }
+            Write-Warning "Mesa runtime explicit path is not pinned by a valid manifest: $resolved"
             return $resolved
         }
     }
@@ -424,7 +773,14 @@ function Resolve-MesaRuntimeDir {
     $thirdPartyDir = Join-Path $root "third_party\mesa"
     $resolvedThirdParty = Resolve-MesaRuntimeCandidate $thirdPartyDir
     if ($resolvedThirdParty) {
-        Write-Host "Mesa runtime explicit path: $resolvedThirdParty"
+        if (Test-MesaRuntimeCache $resolvedThirdParty) {
+            Write-Host "Mesa runtime explicit path: $resolvedThirdParty"
+            return $resolvedThirdParty
+        }
+        if ($RequireSignature -or (Get-IsOfflinePackage)) {
+            throw "Mesa runtime explicit path does not pass the pinned manifest validation: $resolvedThirdParty"
+        }
+        Write-Warning "Mesa runtime explicit path is not pinned by a valid manifest: $resolvedThirdParty"
         return $resolvedThirdParty
     }
 
@@ -481,15 +837,43 @@ try {
         Copy-Item $shlwapiImportLib.FullName (Join-Path $linkLibDir "libshlwapi.a") -Force
     }
 
-    cargo rustc --release -- -L "native=$linkLibDir"
+    $cargoArgs = @("rustc", "--release", "--locked", "--bin", "scope_analyzer")
+    if (Get-IsOfflinePackage) {
+        $cargoArgs += "--offline"
+    }
+    & cargo @cargoArgs -- -L "native=$linkLibDir"
     if ($LASTEXITCODE -ne 0) {
         throw "cargo rustc --release failed with exit code $LASTEXITCODE"
     }
+    $cargoCliArgs = @("build", "--release", "--locked", "--bin", "scope-cli")
+    if (Get-IsOfflinePackage) {
+        $cargoCliArgs += "--offline"
+    }
+    & cargo @cargoCliArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo build --release --bin scope-cli failed with exit code $LASTEXITCODE"
+    }
     Copy-Item "target\release\scope_analyzer.exe" (Join-Path $stage "ScopeAnalyzer.exe")
+    Copy-Item "target\release\scope-cli.exe" (Join-Path $stage "scope-cli.exe")
     Copy-Item "resources\ScopeAnalyzer.ico" (Join-Path $stage "ScopeAnalyzer.ico")
     Copy-Item "README.md" (Join-Path $stage "README.txt")
     $angleRuntimeDir = Resolve-AngleRuntimeDir
     if ($angleRuntimeDir) {
+        if (($RequireSignature -or (Get-IsOfflinePackage)) -and
+            [string]::IsNullOrWhiteSpace($angleSourceSha256)) {
+            throw "ANGLE_RUNTIME_SOURCE_SHA256 is required when a signed or offline package bundles ANGLE."
+        }
+        if (-not [string]::IsNullOrWhiteSpace($angleSourceSha256) -and
+            $angleSourceSha256 -notmatch '^[0-9a-fA-F]{64}$') {
+            throw "ANGLE_RUNTIME_SOURCE_SHA256 must be a 64-character hexadecimal SHA256 value."
+        }
+        $anglePreloadManifestSha256ForStage = $null
+        if ($RequireSignature -or (Get-IsOfflinePackage)) {
+            $anglePreloadManifestSha256ForStage = Assert-AngleRuntimePreload `
+                -RuntimeDir $angleRuntimeDir `
+                -ExpectedSourceSha256 $angleSourceSha256 `
+                -ExpectedManifestSha256 $anglePreloadManifestSha256
+        }
         Copy-Item (Join-Path $angleRuntimeDir "libEGL.dll") (Join-Path $stage "libEGL.dll") -Force
         Copy-Item (Join-Path $angleRuntimeDir "libGLESv2.dll") (Join-Path $stage "libGLESv2.dll") -Force
         $includeAngleRuntime = "true"
@@ -499,9 +883,19 @@ try {
             Copy-Item $d3dCompiler (Join-Path $stage "d3dcompiler_47.dll") -Force
             $includeD3DCompiler = "true"
         }
-        Write-AngleRuntimeManifest -RuntimeDir $angleRuntimeDir -ManifestPath (Join-Path $stage $angleManifestName)
+        $angleManifestSourceSha256 = if ([string]::IsNullOrWhiteSpace($angleSourceSha256)) {
+            $null
+        } else {
+            $angleSourceSha256.ToLowerInvariant()
+        }
+        Write-AngleRuntimeManifest -RuntimeDir $angleRuntimeDir -ManifestPath (Join-Path $stage $angleManifestName) `
+            -SourceSha256 $angleManifestSourceSha256 `
+            -PreloadManifestSha256 $anglePreloadManifestSha256ForStage
     } else {
         Write-Warning "ANGLE runtime DLLs were not bundled. The installed app will rely on the target machine's OpenGL/ANGLE installation."
+        if ($RequireSignature) {
+            throw "Signed packages must bundle the pinned ANGLE runtime."
+        }
     }
     $mesaRuntimeDir = Resolve-MesaRuntimeDir
     if ($mesaRuntimeDir) {
@@ -515,9 +909,17 @@ try {
             }
             Copy-Item (Join-Path $mesaRuntimeDir $name) (Join-Path $mesaStage $name) -Force
         }
+        $mesaManifestPath = Get-MesaManifestPath $mesaRuntimeDir
+        if (-not (Test-Path $mesaManifestPath)) {
+            throw "Mesa runtime manifest is required for reproducible packaging: $mesaManifestPath"
+        }
+        Copy-Item $mesaManifestPath (Join-Path $mesaStage $mesaManifestName) -Force
         $includeMesaRuntime = "true"
     } else {
         Write-Warning "Mesa runtime DLLs were not found. Mesa/llvmpipe fallback will be unavailable in this package."
+        if ($RequireSignature) {
+            throw "Signed packages must bundle the pinned Mesa runtime."
+        }
     }
 Set-Content -Path (Join-Path $stage "Start-ScopeAnalyzer.bat") -Encoding ASCII -Value @(
     "@echo off",
@@ -554,6 +956,29 @@ $clang = Get-Command "x86_64-w64-mingw32-clang.exe" -ErrorAction SilentlyContinu
     Pop-Location
 }
 
+Write-ThirdPartyNotices -StageDir $stage
+$signTool = Resolve-SignTool
+$signatureStatus = "not-requested"
+if (-not [string]::IsNullOrWhiteSpace($CertificateThumbprint)) {
+    if (-not $signTool) {
+        throw "SCOPE_SIGN_CERT_SHA1 was supplied but signtool.exe was not found. Set SIGNTOOL_PATH or add signtool.exe to PATH."
+    }
+    $signableBinaries = @(
+        (Join-Path $stage "ScopeAnalyzer.exe"),
+        (Join-Path $stage "scope-cli.exe")
+    )
+    $mesaExecutable = Join-Path $stage "mesa\ScopeAnalyzerMesa.exe"
+    if (Test-Path $mesaExecutable) {
+        $signableBinaries += $mesaExecutable
+    }
+    foreach ($binary in $signableBinaries) {
+        Sign-ReleaseFile -Path $binary -SignTool $signTool
+    }
+    $signatureStatus = "stage-binaries-valid"
+} elseif ($RequireSignature) {
+    throw "-RequireSignature requires SCOPE_SIGN_CERT_SHA1 or -CertificateThumbprint."
+}
+Write-BuildEvidence -StageDir $stage -Version $version -IncludeAngle $includeAngleRuntime -IncludeMesa $includeMesaRuntime
 Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -Force
 Write-Host "Created $zip"
 
@@ -569,6 +994,12 @@ if ($candle -and $light) {
     if ($LASTEXITCODE -ne 0) {
         throw "light failed with exit code $LASTEXITCODE"
     }
+
+    if (-not [string]::IsNullOrWhiteSpace($CertificateThumbprint)) {
+        Sign-ReleaseFile -Path $msi -SignTool $signTool
+        $signatureStatus = "msi-and-stage-binaries-valid"
+    }
+    Write-ReleaseEvidence -MsiPath $msi -ZipPath $zip -StageDir $stage -SignatureStatus $signatureStatus
 
     Write-Host "Created $msi"
     return

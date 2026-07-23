@@ -30,6 +30,7 @@ pub struct WordReport {
     pub sample_rate: Option<String>,
     pub time_range_summary: String,
     pub include_cursor_tables: bool,
+    pub compare_summary: Option<String>,
     pub figures: Vec<WordReportFigure>,
 }
 
@@ -256,6 +257,9 @@ fn document_xml(report: &WordReport) -> String {
         &format!("时间范围：{}", report.time_range_summary),
         false,
     ));
+    if let Some(compare_summary) = &report.compare_summary {
+        body.push_str(&paragraph(compare_summary, false));
+    }
 
     for (index, figure) in report.figures.iter().enumerate() {
         body.push_str(&image_paragraph(index + 1, figure));
@@ -421,6 +425,7 @@ mod tests {
             sample_rate: Some("1000 Hz".to_owned()),
             time_range_summary: "0.000000s - 1.000000s".to_owned(),
             include_cursor_tables,
+            compare_summary: None,
             figures: vec![WordReportFigure {
                 caption: "图 1：窗口 #1 0.000000s - 1.000000s".to_owned(),
                 png: sample_png(),
@@ -452,6 +457,18 @@ mod tests {
 
         let without_table = document_xml(&sample_report(false));
         assert!(!without_table.contains("Y@X1"));
+    }
+
+    #[test]
+    fn word_report_includes_shared_compare_evidence_line() {
+        let mut report = sample_report(false);
+        report.compare_summary = Some(
+            "Compare: offset=0.000000s confidence=1.000 valid=2 invalid=1 rms=0.100000 maxAbs=0.200000 maxRel=20.000% exceedances=0"
+                .to_owned(),
+        );
+        let document = document_xml(&report);
+        assert!(document.contains("Compare: offset=0.000000s"));
+        assert!(document.contains("invalid=1"));
     }
 
     #[test]

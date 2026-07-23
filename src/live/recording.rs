@@ -39,7 +39,9 @@ const RECORD_SESSION_END: u8 = 4;
 const RECORD_INDEX: u8 = 5;
 const TRIGGER_RECORD_VERSION: u8 = 1;
 const TRIGGER_RECORD_LEN: usize = 48;
-const RECORDING_QUEUE_CAPACITY: usize = 128;
+// Keep roughly one second of 1 kHz sample-frame traffic buffered so display
+// backpressure cannot prematurely stop a recording while the writer catches up.
+const RECORDING_QUEUE_CAPACITY: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RecordingMetadata {
@@ -952,6 +954,10 @@ impl ScopeRecording {
                         .as_deref()
                         .ok_or_else(|| format_error_value("SessionEnd is missing index record"))?;
                     validate_index_matches_records(index, &sample_records)?;
+                    let mut trailing = [0_u8; 1];
+                    if read_partial(&mut file, &mut trailing)? != 0 {
+                        return format_error("trailing bytes after SessionEnd");
+                    }
                     clean_end = true;
                     break;
                 }
@@ -1226,7 +1232,7 @@ fn format_error_value(message: impl Into<String>) -> RecordingError {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs::OpenOptions,
+        fs::{self, OpenOptions},
         io::{Read, Seek, SeekFrom, Write},
         path::PathBuf,
     };
@@ -1400,6 +1406,25 @@ mod tests {
             .is_err());
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn checked_in_scope_v1_hex_fixture_opens() {
+        let text = include_str!("../../tests/fixtures/compatibility/scope-v1-minimal.hex");
+        let bytes = text
+            .lines()
+            .filter_map(|line| line.split('#').next())
+            .flat_map(str::split_whitespace)
+            .map(|token| u8::from_str_radix(token, 16).expect("fixture byte is hexadecimal"))
+            .collect::<Vec<_>>();
+        let path = unique_path("scope_v1_fixture");
+        fs::write(&path, bytes).unwrap();
+        let recording = ScopeRecording::open(&path).unwrap();
+        assert!(recording.clean_end());
+        assert!(!recording.recovered_tail());
+        assert!(recording.sample_records().is_empty());
+        assert_eq!(recording.metadata().device_id, "fixture-device");
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -1771,6 +1796,49 @@ mod tests {
         assert!(!recording.clean_end());
         assert!(recording.recovered_tail());
         assert_eq!(recording.sample_records().len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ingress_queue_overflow_detach_keeps_recording_recoverable() {
+        let path = unique_path("ingress_queue_full");
+        let recorder = AsyncScopeRecorder::create_with_capacity(&path, metadata(), 1).unwrap();
+        let release = recorder.pause_worker_for_test();
+        let ingress = recorder.ingress().unwrap();
+        ingress
+            .try_write_sample_frame(sample_frame(1, 0, 0, &[1, 2]))
+            .unwrap();
+
+        assert!(matches!(
+            ingress.try_write_sample_frame(sample_frame(2, 2, 200, &[3, 4])),
+            Err(RecordingError::QueueFull)
+        ));
+        drop(ingress);
+        drop(release);
+        recorder.abort().unwrap();
+
+        let recording = ScopeRecording::open(&path).unwrap();
+        assert!(!recording.clean_end());
+        assert!(recording.recovered_tail());
+        assert_eq!(recording.sample_records().len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recording_rejects_bytes_after_clean_session_end() {
+        let path = unique_path("trailing_after_session_end");
+        ScopeWriter::create(&path, metadata())
+            .unwrap()
+            .finish()
+            .unwrap();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[0xff]).unwrap();
+        file.flush().unwrap();
+
+        assert!(matches!(
+            ScopeRecording::open(&path),
+            Err(RecordingError::InvalidFormat(message)) if message.contains("trailing bytes after SessionEnd")
+        ));
         let _ = std::fs::remove_file(path);
     }
 

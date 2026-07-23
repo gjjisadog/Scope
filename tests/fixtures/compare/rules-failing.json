@@ -1,0 +1,8 @@
+[
+  {
+    "id": "rms-limit",
+    "metric": "rms",
+    "operator": "less-equal",
+    "lower": 0.01
+  }
+]

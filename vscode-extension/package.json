@@ -18,6 +18,9 @@
     "onCommand:scopeAnalyzer.openActiveFile"
   ],
   "main": "./src/extension.js",
+  "scripts": {
+    "test": "node --test src/*.test.js"
+  },
   "contributes": {
     "configuration": {
       "title": "Scope Analyzer",

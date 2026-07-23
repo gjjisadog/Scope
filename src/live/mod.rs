@@ -1,6 +1,7 @@
 pub mod bandwidth;
 pub mod buffer;
 pub mod capture_history;
+pub mod hardware_smoke;
 pub mod protocol;
 pub mod recording;
 pub mod scope_source;

@@ -1,3 +1,9 @@
+#![allow(
+    clippy::items_after_test_module,
+    clippy::self_named_constructors,
+    clippy::too_many_arguments
+)]
+
 use ab_glyph::{point, Font, FontArc, PxScale, ScaleFont};
 use std::{
     fs::{self, File},

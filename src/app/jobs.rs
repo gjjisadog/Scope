@@ -92,6 +92,9 @@ impl ScopeApp {
         if let Some(token) = &self.derived_measurement_cancel {
             token.cancel();
         }
+        if let Some(token) = &self.compare_metrics_cancel {
+            token.cancel();
+        }
     }
 
     pub(super) fn cancel_import_job(&mut self) {
@@ -108,6 +111,7 @@ impl ScopeApp {
             || self.sequence_worker.is_some()
             || self.derived_curve_worker.is_some()
             || self.derived_measurement_worker.is_some()
+            || self.compare_metrics_worker.is_some()
             || self.import_worker.is_some()
             || self.project_save_worker.is_some()
     }

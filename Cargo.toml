@@ -1,9 +1,17 @@
 [package]
 name = "scope_analyzer"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2021"
 description = "Windows offline oscilloscope-style waveform analyzer"
 license = "Proprietary"
+
+[[bin]]
+name = "scope-cli"
+path = "src/bin/scope_cli.rs"
+
+[[bin]]
+name = "scope-hardware-smoke"
+path = "src/bin/scope_hardware_smoke.rs"
 
 [dependencies]
 ab_glyph = "0.2"

@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     io::{Read, Write},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -16,7 +19,7 @@ use super::{
         ChannelTable, CommandResult, Configure, DecodedSampleBatch, Frame, FrameDecoder, Hello,
         HelloAck, Message, ProtocolError, ResultCode, MAX_PAYLOAD_LEN,
     },
-    recording::RecordingIngress,
+    recording::{RecordingError, RecordingIngress},
     transport::{TransportConfig, TransportError, TransportStream},
 };
 
@@ -107,6 +110,7 @@ pub struct LiveSession {
     control_rx: Receiver<SessionEvent>,
     data_rx: Receiver<SessionEvent>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    disconnect_requested: Arc<AtomicBool>,
 }
 
 impl LiveSession {
@@ -115,14 +119,25 @@ impl LiveSession {
         let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
         let (control_tx, control_rx) = bounded(CONTROL_EVENT_CAPACITY);
         let (data_tx, data_rx) = bounded(EVENT_CAPACITY);
+        let disconnect_requested = Arc::new(AtomicBool::new(false));
+        let worker_disconnect_requested = Arc::clone(&disconnect_requested);
         let worker = thread::Builder::new()
             .name("scope-live-session".to_owned())
-            .spawn(move || run_worker(config, command_rx, control_tx, data_tx))?;
+            .spawn(move || {
+                run_worker(
+                    config,
+                    command_rx,
+                    control_tx,
+                    data_tx,
+                    worker_disconnect_requested,
+                )
+            })?;
         Ok(Self {
             command_tx,
             control_rx,
             data_rx,
             worker: Mutex::new(Some(worker)),
+            disconnect_requested,
         })
     }
 
@@ -171,7 +186,16 @@ impl LiveSession {
     }
 
     pub fn disconnect(&self) -> Result<(), SessionError> {
-        self.send(SessionCommand::Disconnect)?;
+        // The atomic flag is the reliable stop path. The bounded command queue
+        // may be full while the worker is draining a burst of decoded frames,
+        // so a best-effort wake-up must not turn a bounded disconnect into a
+        // spurious CommandQueueFull error.
+        let _ = self.command_tx.try_send(SessionCommand::Disconnect);
+        // Queue the graceful command before publishing the fallback flag. If
+        // the worker is between event batches, this lets it write STOP through
+        // the normal command path instead of observing the flag and exiting
+        // before it drains the queue.
+        self.disconnect_requested.store(true, Ordering::Release);
         let worker = self
             .worker
             .lock()
@@ -197,6 +221,7 @@ impl LiveSession {
 
 impl Drop for LiveSession {
     fn drop(&mut self) {
+        self.disconnect_requested.store(true, Ordering::Release);
         let _ = self.command_tx.try_send(SessionCommand::Disconnect);
         if let Ok(worker) = self.worker.get_mut() {
             // Detach instead of an unbounded join. Explicit disconnect still joins and reports
@@ -211,12 +236,19 @@ fn run_worker(
     command_rx: Receiver<SessionCommand>,
     control_tx: Sender<SessionEvent>,
     data_tx: Sender<SessionEvent>,
+    disconnect_requested: Arc<AtomicBool>,
 ) {
     let _ = send_control(
         &control_tx,
         SessionEvent::State(ConnectionState::Connecting),
     );
-    let result = worker_loop(config, &command_rx, &control_tx, &data_tx);
+    let result = worker_loop(
+        config,
+        &command_rx,
+        &control_tx,
+        &data_tx,
+        &disconnect_requested,
+    );
     if let Err(error) = result {
         let _ = control_tx.try_send(SessionEvent::Error(error.to_string()));
     }
@@ -228,6 +260,7 @@ fn worker_loop(
     command_rx: &Receiver<SessionCommand>,
     control_tx: &Sender<SessionEvent>,
     data_tx: &Sender<SessionEvent>,
+    disconnect_requested: &AtomicBool,
 ) -> Result<(), SessionError> {
     let mut transport = config.connect()?;
     send_control(
@@ -260,6 +293,8 @@ fn worker_loop(
     let mut pending_host_gap: Option<LiveGap> = None;
     let mut recording: Option<RecordingIngress> = None;
     let mut streaming = false;
+    let mut disconnecting = false;
+    let mut disconnect_deadline = None;
 
     loop {
         while let Ok(command) = command_rx.try_recv() {
@@ -309,17 +344,36 @@ fn worker_loop(
                     let _ = ack_tx.send(());
                 }
                 SessionCommand::Disconnect => {
-                    if streaming {
-                        let _ = write_message(
+                    if streaming && !disconnecting {
+                        let sequence = write_message(
                             &mut transport,
                             &mut out_sequence,
                             session_id,
                             Message::Stop,
-                        );
+                        )?;
+                        pending.insert(sequence, PendingCommand::Stop);
+                        disconnecting = true;
+                        disconnect_deadline = Some(Instant::now() + Duration::from_millis(500));
+                    } else if !streaming {
+                        return Ok(());
                     }
-                    return Ok(());
                 }
             }
+        }
+
+        if disconnect_requested.load(Ordering::Acquire) && !disconnecting {
+            if streaming {
+                let sequence =
+                    write_message(&mut transport, &mut out_sequence, session_id, Message::Stop)?;
+                pending.insert(sequence, PendingCommand::Stop);
+                disconnecting = true;
+                disconnect_deadline = Some(Instant::now() + Duration::from_millis(500));
+            } else {
+                return Ok(());
+            }
+        }
+        if disconnect_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(());
         }
 
         if session_id != 0 && last_received.elapsed() >= Duration::from_secs(3) {
@@ -361,6 +415,24 @@ fn worker_loop(
         stats.malformed_headers = decoder_stats.malformed_headers;
         stats.discarded_bytes = decoder_stats.discarded_bytes;
         for frame in decoder.drain_frames() {
+            if disconnect_requested.load(Ordering::Acquire) && !disconnecting {
+                if streaming {
+                    let sequence = write_message(
+                        &mut transport,
+                        &mut out_sequence,
+                        session_id,
+                        Message::Stop,
+                    )?;
+                    pending.insert(sequence, PendingCommand::Stop);
+                    disconnecting = true;
+                    disconnect_deadline = Some(Instant::now() + Duration::from_millis(500));
+                } else {
+                    return Ok(());
+                }
+            }
+            if disconnect_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Ok(());
+            }
             last_received = Instant::now();
             stats.received_frames = stats.received_frames.saturating_add(1);
             if session_id != 0 && frame.session_id != session_id {
@@ -423,6 +495,7 @@ fn worker_loop(
                     send_control(control_tx, SessionEvent::State(ConnectionState::Ready))?;
                 }
                 Message::CommandResult(result) => {
+                    let mut disconnect_complete = false;
                     if result.result_code == ResultCode::Ok {
                         if let Some(command) = pending.remove(&result.request_sequence) {
                             let state = match command {
@@ -453,6 +526,7 @@ fn worker_loop(
                                 }
                                 PendingCommand::Stop => {
                                     streaming = false;
+                                    disconnect_complete = disconnecting;
                                     ConnectionState::Ready
                                 }
                                 PendingCommand::Start => {
@@ -469,6 +543,9 @@ fn worker_loop(
                         send_control(control_tx, SessionEvent::State(ConnectionState::Ready))?;
                     }
                     send_control(control_tx, SessionEvent::CommandResult(result))?;
+                    if disconnect_complete {
+                        return Ok(());
+                    }
                 }
                 Message::SampleBatch(_) => {
                     let Some(table) = &table else {
@@ -497,10 +574,9 @@ fn worker_loop(
                                 if let Err(error) =
                                     ingress.try_write_gap(gap, frame.timestamp_ticks)
                                 {
-                                    recording = None;
                                     send_control(
                                         control_tx,
-                                        SessionEvent::RecordingError(error.to_string()),
+                                        stop_recording_after_write_error(&mut recording, error),
                                     )?;
                                 }
                             }
@@ -512,8 +588,10 @@ fn worker_loop(
                     }
                     if let Some(ingress) = &recording {
                         if let Err(error) = ingress.try_write_sample_frame(frame.clone()) {
-                            recording = None;
-                            send_control(control_tx, SessionEvent::Error(error.to_string()))?;
+                            send_control(
+                                control_tx,
+                                stop_recording_after_write_error(&mut recording, error),
+                            )?;
                         }
                     }
                     let sample_count = decoded.channels.first().map(Vec::len).unwrap_or(0);
@@ -573,6 +651,14 @@ fn worker_loop(
             let _ = data_tx.try_send(SessionEvent::Stats(stats));
         }
     }
+}
+
+fn stop_recording_after_write_error(
+    recording: &mut Option<RecordingIngress>,
+    error: RecordingError,
+) -> SessionEvent {
+    *recording = None;
+    SessionEvent::RecordingError(error.to_string())
 }
 
 fn send_control(
@@ -1007,5 +1093,18 @@ mod tests {
         assert_eq!(latest.sequence_gaps, 0);
         assert!(simulator.stats().pings_sent > 0);
         session.disconnect().unwrap();
+    }
+
+    #[test]
+    fn recording_queue_full_is_reported_as_a_fatal_recording_error() {
+        let mut recording = None;
+
+        let event = stop_recording_after_write_error(&mut recording, RecordingError::QueueFull);
+
+        assert!(recording.is_none());
+        assert!(matches!(
+            event,
+            SessionEvent::RecordingError(message) if message.contains("queue is full")
+        ));
     }
 }

@@ -59,6 +59,10 @@ pub struct CaptureInsertOutcome {
 pub enum CaptureHistoryError {
     #[error("capture history limits must be greater than zero")]
     InvalidLimits,
+    #[error("capture id must be greater than zero")]
+    InvalidCaptureId,
+    #[error("capture id {0} already exists")]
+    DuplicateCaptureId(u64),
     #[error("capture cannot be retained because pinned entries consume the history budget")]
     PinnedBudgetExceeded,
 }
@@ -192,12 +196,36 @@ impl CaptureHistory {
         created_unix_ms: u64,
         select_new: bool,
     ) -> Result<CaptureInsertOutcome, CaptureHistoryError> {
+        self.insert_live_with_id(
+            CaptureId(self.next_id),
+            capture,
+            trigger_config,
+            created_unix_ms,
+            select_new,
+        )
+    }
+
+    /// Restores a live capture with its persisted ID, advancing the next live
+    /// ID so later captures cannot reuse an existing asset name.
+    pub fn insert_live_with_id(
+        &mut self,
+        id: CaptureId,
+        capture: TriggerCapture,
+        trigger_config: TriggerConfig,
+        created_unix_ms: u64,
+        select_new: bool,
+    ) -> Result<CaptureInsertOutcome, CaptureHistoryError> {
+        if id.0 == 0 {
+            return Err(CaptureHistoryError::InvalidCaptureId);
+        }
+        if self.entries.iter().any(|entry| entry.id == id) {
+            return Err(CaptureHistoryError::DuplicateCaptureId(id.0));
+        }
         let approximate_bytes = capture_bytes(&capture);
         if approximate_bytes > self.max_bytes {
             return Err(CaptureHistoryError::PinnedBudgetExceeded);
         }
-        let id = CaptureId(self.next_id);
-        self.next_id = self.next_id.saturating_add(1);
+        self.next_id = self.next_id.max(id.0.saturating_add(1));
         let trigger_position = capture
             .trigger_position
             .min(capture.sample_indices.len().saturating_sub(1));
@@ -372,5 +400,19 @@ mod tests {
             Err(CaptureHistoryError::PinnedBudgetExceeded)
         );
         assert_eq!(history.entries().len(), 1);
+    }
+
+    #[test]
+    fn restoring_a_persisted_id_advances_the_next_live_id() {
+        let mut history = CaptureHistory::default();
+        let restored = history
+            .insert_live_with_id(CaptureId(4), capture(4), TriggerConfig::default(), 1, true)
+            .unwrap();
+        let next = history
+            .insert_live(capture(4), TriggerConfig::default(), 2, true)
+            .unwrap();
+
+        assert_eq!(restored.id, CaptureId(4));
+        assert_eq!(next.id, CaptureId(5));
     }
 }

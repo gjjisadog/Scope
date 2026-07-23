@@ -1323,6 +1323,27 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_scp1_v1_hex_fixture_decodes() {
+        let text = include_str!("../../tests/fixtures/compatibility/scp1-v1-ping.hex");
+        let bytes = text
+            .lines()
+            .filter_map(|line| line.split('#').next())
+            .flat_map(str::split_whitespace)
+            .map(|token| u8::from_str_radix(token, 16).expect("fixture byte is hexadecimal"))
+            .collect::<Vec<_>>();
+        let frame = Frame::decode(&bytes).unwrap();
+        assert_eq!(frame.message_type, MSG_PING);
+        assert_eq!(frame.flags, 3);
+        assert_eq!(frame.sequence, 7);
+        assert_eq!(frame.session_id, 11);
+        assert_eq!(frame.timestamp_ticks, 13);
+        assert_eq!(
+            Message::decode(MSG_PING, &frame.payload),
+            Ok(Message::Ping(17))
+        );
+    }
+
+    #[test]
     fn channel_table_descriptor_matches_frozen_v1_byte_layout() {
         let message = Message::ChannelTable(ChannelTable {
             revision: 0x0102_0304,
@@ -1399,6 +1420,20 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "external-input fuzz gate; run explicitly in the release job"]
+    fn decoder_survives_one_million_deterministic_bytes() {
+        let mut decoder = FrameDecoder::default();
+        let mut state = 0x9e37_79b9_u32;
+        for _ in 0..1_000_000 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            decoder.push(&[(state & 0xff) as u8]);
+            let _ = decoder.drain_frames();
+        }
+    }
+
+    #[test]
     fn hello_message_round_trips() {
         let message = Message::Hello(Hello {
             client_capabilities: 0b111,
@@ -1430,6 +1465,114 @@ mod tests {
         assert!(matches!(
             message.encode_payload(),
             Err(ProtocolError::InvalidPayload(_))
+        ));
+    }
+
+    #[test]
+    fn protocol_rejection_matrix_covers_enum_and_descriptor_boundaries() {
+        assert!(ChannelKind::try_from(9).is_err());
+        assert!(WireFormat::try_from(9).is_err());
+        assert!(matches!(
+            ResultCode::try_from(99),
+            Err(ProtocolError::InvalidPayload(_))
+        ));
+        assert!(DeviceState::try_from(9).is_err());
+
+        let descriptor = |channel_id: u16,
+                          kind: ChannelKind,
+                          wire_format: WireFormat,
+                          scale: f32,
+                          offset: f32,
+                          name: &str| ChannelDescriptor {
+            channel_id,
+            kind,
+            wire_format,
+            scale,
+            offset,
+            unit: "V".to_owned(),
+            name: name.to_owned(),
+        };
+        for table in [
+            ChannelTable {
+                revision: 1,
+                channels: Vec::new(),
+            },
+            ChannelTable {
+                revision: 1,
+                channels: vec![descriptor(
+                    MAX_CHANNEL_COUNT as u16,
+                    ChannelKind::Analog,
+                    WireFormat::I16,
+                    1.0,
+                    0.0,
+                    "Va",
+                )],
+            },
+            ChannelTable {
+                revision: 1,
+                channels: vec![descriptor(
+                    0,
+                    ChannelKind::Analog,
+                    WireFormat::I16,
+                    1.0,
+                    0.0,
+                    "",
+                )],
+            },
+            ChannelTable {
+                revision: 1,
+                channels: vec![descriptor(
+                    0,
+                    ChannelKind::Analog,
+                    WireFormat::I16,
+                    f32::NAN,
+                    0.0,
+                    "Va",
+                )],
+            },
+            ChannelTable {
+                revision: 1,
+                channels: vec![descriptor(
+                    0,
+                    ChannelKind::Analog,
+                    WireFormat::F32,
+                    2.0,
+                    0.0,
+                    "Va",
+                )],
+            },
+        ] {
+            assert!(matches!(
+                Message::ChannelTable(table).encode_payload(),
+                Err(ProtocolError::InvalidPayload(_))
+            ));
+        }
+
+        assert!(matches!(
+            Message::HelloAck(HelloAck {
+                device_capabilities: 0,
+                max_payload: MAX_PAYLOAD_LEN as u32,
+                tick_hz: 0,
+                channel_count: 1,
+                max_batch_samples: 1,
+                device_id: [0; 16],
+                firmware_name: "fw".to_owned(),
+            })
+            .encode_payload(),
+            Err(ProtocolError::InvalidPayload(_))
+        ));
+        assert!(matches!(
+            Message::Configure(Configure {
+                sample_rate_hz: 0,
+                batch_samples: 1,
+                channel_mask: 1,
+            })
+            .encode_payload(),
+            Err(ProtocolError::InvalidPayload(_))
+        ));
+        assert!(matches!(
+            Message::decode(0xff, &[]),
+            Err(ProtocolError::UnknownMessageType(0xff))
         ));
     }
 

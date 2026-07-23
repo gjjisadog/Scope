@@ -1526,14 +1526,22 @@ impl ScopeApp {
         if let Some(power) = &result.power {
             ui.horizontal_wrapped(|ui| {
                 ui.strong("3φ");
-                ui.label(format!("P {:.3}", power.active_power));
-                ui.label(format!("Q₁ {:.3}", power.fundamental_reactive_power));
-                ui.label(format!("S {:.3}", power.effective_apparent_power));
+                ui.label(format!(
+                    "P {:.3} {}",
+                    power.active_power, power.active_power_unit
+                ));
+                ui.label(format!(
+                    "Q₁ {:.3} {}",
+                    power.fundamental_reactive_power, power.reactive_power_unit
+                ));
+                ui.label(format!(
+                    "S {:.3} {}",
+                    power.effective_apparent_power, power.apparent_power_unit
+                ));
                 ui.label(format!(
                     "PF {}",
                     Self::format_measurement_value(power.true_power_factor)
                 ));
-                ui.label(&power.power_unit);
             });
         }
         if self.live.connection_state == ConnectionState::Streaming && !self.live.display_paused {
@@ -2371,14 +2379,17 @@ mod tests {
         let measurement = ScopeApp::auto_measure(&block.times, &block.channels[0]).unwrap();
         assert!(measurement.statistics.max.is_some_and(|value| value > 0.9));
         assert!(measurement.statistics.min.is_some_and(|value| value < -0.9));
-        let offline_rms =
-            ScopeApp::auto_measure_segments(&[block.clone()], &[(0, app.channel_scales[0])], None)
-                .unwrap()
-                .rows[0]
-                .1
-                .statistics
-                .rms
-                .unwrap();
+        let offline_rms = ScopeApp::auto_measure_segments(
+            std::slice::from_ref(&block),
+            &[(0, app.channel_scales[0])],
+            None,
+        )
+        .unwrap()
+        .rows[0]
+            .1
+            .statistics
+            .rms
+            .unwrap();
         assert!((live_rms - offline_rms).abs() < 1.0e-6);
         let fft = crate::fft::analyze(
             "Phase A".to_owned(),

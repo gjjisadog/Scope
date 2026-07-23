@@ -24,6 +24,8 @@ Before producing release artifacts, run the one-command preflight from the
 repository root:
 
 ```powershell
+$env:SCOPE_PACKAGE_OFFLINE=1
+$env:CARGO_NET_OFFLINE=true
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release-check.ps1
 ```
 
@@ -31,11 +33,18 @@ The preflight checks version sync, PowerShell/WiX packaging files, formatting,
 clippy, normal tests, and ignored performance baselines. Do not skip performance
 baselines for release readiness.
 
-Release packaging should be reproducible and offline. Preload Mesa in
-`target/mesa-runtime/x64` with `mesa-runtime-manifest.json` or provide
-`MESA_RUNTIME_DIR`/`third_party/mesa`. Preload ANGLE through `ANGLE_RUNTIME_DIR`,
-`third_party/angle`, or `target/angle-runtime`; use `SCOPE_ALLOW_SYSTEM_ANGLE=1`
-only for local experiments, not releases.
+Release packaging should be reproducible and offline. Preload Rust 1.96.0 and
+the Cargo registry/git/target caches on the controlled release runner. The
+controlled Mesa and ANGLE runtimes must live outside the checkout because
+`actions/checkout` cleans ignored workspace paths. Set `MESA_RUNTIME_DIR` to a
+directory containing the pinned `mesa-runtime-manifest.json`, and set
+`ANGLE_RUNTIME_DIR` to a directory containing a hash-pinned
+`angle-runtime-preload-manifest.json`. Release packaging must set both
+`ANGLE_RUNTIME_SOURCE_SHA256` (the source asset hash) and
+`ANGLE_RUNTIME_MANIFEST_SHA256` (the preload manifest hash); the manifest binds
+that source hash to every copied ANGLE DLL. `target/mesa-runtime/x64` and
+`target/angle-runtime` are local-development caches only. Use
+`SCOPE_ALLOW_SYSTEM_ANGLE=1` only for local experiments, not releases.
 
 After preflight passes, build the release package with offline dependency
 resolution:
@@ -44,6 +53,14 @@ resolution:
 $env:SCOPE_PACKAGE_OFFLINE=1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -OfflinePackage
 ```
+
+The controlled release workflow also sets `CARGO_NET_OFFLINE=true` so the
+preflight cannot silently resolve missing dependencies from the network.
+
+Hardware acceptance uses the dedicated `scope-hardware-smoke` binary on a
+runner physically connected to an SCP1 device; the simulator test is not
+hardware evidence. Archive its `.scope` output, JSON envelope, and the
+`scope-cli validate-recording` result.
 
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence

@@ -1,0 +1,114 @@
+name: Windows standard-user acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_run_id:
+        description: "Run ID of the Windows release acceptance workflow"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+# The standard-user runner must have the MSI deployed by an administrator
+# before this workflow starts. It must be a separate non-elevated RDP session;
+# the acceptance script rejects an elevated token and never performs MSI work.
+jobs:
+  standard-user-acceptance:
+    name: Non-elevated Windows acceptance
+    runs-on: [self-hosted, windows, x64, scope-standard-user, rdp]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Resolve administrator source commit
+        id: release-meta
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $runId = "${{ inputs.release_run_id }}"
+          if ($runId -notmatch '^\d+$') {
+            throw "release_run_id must be a numeric workflow run id."
+          }
+          $headers = @{
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $uri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/runs/$runId"
+          $run = Invoke-RestMethod -Uri $uri -Headers $headers
+          if ($run.name -ne "Windows release acceptance") {
+            throw "The supplied run is not a Windows release acceptance run."
+          }
+          if ($run.conclusion -ne "success") {
+            throw "The administrator release run did not complete successfully: $($run.conclusion)"
+          }
+          if ([string]::IsNullOrWhiteSpace($run.head_sha)) {
+            throw "The administrator release run has no source commit."
+          }
+          "head_sha=$($run.head_sha)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Check out administrator source commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release-meta.outputs.head_sha }}
+
+      - name: Download administrator release evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: scope-windows-release-evidence
+          run-id: ${{ inputs.release_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: dist
+
+      - name: Locate release artifacts
+        run: |
+          $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
+          $msi = Get-ChildItem -Path $dist -Recurse -File -Filter "ScopeAnalyzer-0.12.0-win-x64.msi" | Select-Object -First 1
+          $zip = Get-ChildItem -Path $dist -Recurse -File -Filter "ScopeAnalyzer-0.12.0-win-x64.zip" | Select-Object -First 1
+          $evidence = Get-ChildItem -Path $dist -Recurse -File -Filter "release-evidence.json" | Select-Object -First 1
+          if (-not $msi -or -not $zip -or -not $evidence) {
+            throw "The administrator artifact must contain the MSI, ZIP, and release-evidence.json."
+          }
+          $releaseData = Get-Content -Raw $evidence.FullName | ConvertFrom-Json
+          $head = (& git rev-parse HEAD).Trim()
+          if ([string]::IsNullOrWhiteSpace($releaseData.sourceCommit) -or
+              $releaseData.sourceCommit -eq "unknown" -or
+              $releaseData.sourceCommit -ne $head -or
+              $releaseData.sourceDirty -eq $true) {
+            throw "Administrator release evidence sourceCommit does not match the checked-out source."
+          }
+          $provenancePath = Get-ChildItem -Path $dist -Recurse -File -Filter "build-provenance.json" | Select-Object -First 1
+          if (-not $provenancePath) {
+            throw "Administrator artifact must contain build-provenance.json."
+          }
+          $provenance = Get-Content -Raw $provenancePath.FullName | ConvertFrom-Json
+          $lockHash = (Get-FileHash -Path (Join-Path $env:GITHUB_WORKSPACE "Cargo.lock") -Algorithm SHA256).Hash.ToLowerInvariant()
+          $toolchainHash = (Get-FileHash -Path (Join-Path $env:GITHUB_WORKSPACE "rust-toolchain.toml") -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($provenance.sourceCommit -ne $head -or $provenance.sourceDirty -eq $true -or
+              $provenance.cargoLockSha256 -ne $lockHash -or
+              $provenance.toolchainSha256 -ne $toolchainHash) {
+            throw "Administrator build provenance does not bind this source, lockfile, or toolchain pin."
+          }
+          "SCOPE_MSI=$($msi.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SCOPE_ZIP=$($zip.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SCOPE_RELEASE_EVIDENCE=$($evidence.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Run non-elevated renderer and bridge acceptance
+        run: |
+          & ./scripts/windows-acceptance.ps1 `
+            -MsiPath $env:SCOPE_MSI `
+            -ZipPath $env:SCOPE_ZIP `
+            -ReleaseEvidencePath $env:SCOPE_RELEASE_EVIDENCE `
+            -SkipMsiLifecycle -RequireStandardUser -RequireSignature `
+            -RequireMesaRuntime -RequireAngleRuntime -RequireRdpSession `
+            -OutputPath (Join-Path $env:GITHUB_WORKSPACE "dist\windows-acceptance-standard-user.json")
+
+      - name: Upload standard-user evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: scope-windows-standard-user-evidence
+          if-no-files-found: error
+          path: dist/windows-acceptance-standard-user.json

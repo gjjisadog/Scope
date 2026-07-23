@@ -2,6 +2,11 @@ const fs = require("fs/promises");
 const path = require("path");
 const { execFile } = require("child_process");
 const vscode = require("vscode");
+const {
+  filterBridgeCandidates,
+  isBridgeUnavailableError,
+  validateBridgeCapabilities,
+} = require("./bridge-policy");
 
 const MAX_STANDARD_ROWS = 250000;
 const MAX_CLOUD_RECORDS = 125000;
@@ -9,6 +14,8 @@ const MAX_DAT_SAMPLES = 250000;
 const BRIDGE_MAX_BUFFER = 512 * 1024 * 1024;
 const BRIDGE_TIMEOUT_MS = 30000;
 const MAX_DAT_CHANNELS = 128;
+const BRIDGE_PROTOCOL_VERSION = 1;
+const bridgeCapabilitiesCache = new Map();
 const DAT_HEADER_FIXED_WORDS = 4;
 const DAT_HEADER_WORD_BYTES = 4;
 const CLOUD_CHANNEL_NAMES = [
@@ -195,7 +202,13 @@ async function parseWaveformFileShared(filePath, options) {
     const dataset = await parseWaveformFileWithRust(filePath, options);
     dataset.bridgeAvailable = true;
     return dataset;
-  } catch {
+  } catch (error) {
+    // The compatibility parser is only for machines without a bridge binary.
+    // Once a bridge is found, its protocol and execution errors are authoritative
+    // and must not be hidden by a second analysis implementation.
+    if (!isBridgeUnavailableError(error)) {
+      throw error;
+    }
     const dataset = await parseWaveformFile(filePath, options);
     dataset.bridgeAvailable = false;
     return dataset;
@@ -235,10 +248,30 @@ async function parseWaveformFileWithRust(filePath, options) {
 async function runBridgeJson(filePath, args) {
   const executable = await findBridgeExecutable(filePath);
   if (!executable) {
-    throw new Error("Scope Analyzer Rust bridge executable was not found.");
+    const error = new Error("Scope Analyzer Rust bridge executable was not found.");
+    error.code = "SCOPE_BRIDGE_UNAVAILABLE";
+    throw error;
   }
+  await ensureBridgeCapabilities(executable);
   const stdout = await execFileText(executable, args);
   return JSON.parse(stdout);
+}
+
+async function ensureBridgeCapabilities(executable) {
+  if (bridgeCapabilitiesCache.has(executable)) {
+    return bridgeCapabilitiesCache.get(executable);
+  }
+  const capabilities = JSON.parse(
+    await execFileText(executable, ["--vscode-capabilities"])
+  );
+  const validation = validateBridgeCapabilities(capabilities, BRIDGE_PROTOCOL_VERSION);
+  if (!validation.ok) {
+    const error = new Error(validation.reason);
+    error.code = "SCOPE_BRIDGE_VERSION_MISMATCH";
+    throw error;
+  }
+  bridgeCapabilitiesCache.set(executable, capabilities);
+  return capabilities;
 }
 
 async function findBridgeExecutable(filePath) {
@@ -266,7 +299,12 @@ async function findBridgeExecutable(filePath) {
     path.join(extensionRoot, executableName())
   );
 
-  for (const candidate of candidates) {
+  const filteredCandidates = await filterBridgeCandidates(
+    candidates,
+    workspaceFolder?.uri.fsPath,
+    vscode.workspace.isTrusted === true
+  );
+  for (const candidate of filteredCandidates) {
     if (candidate && await fileExists(candidate)) {
       return candidate;
     }
@@ -945,6 +983,7 @@ module.exports = {
   activate,
   deactivate,
   _test: {
+    filterBridgeCandidates,
     parseWaveformFile,
     parseDatFile,
     parseMetadataCsv,

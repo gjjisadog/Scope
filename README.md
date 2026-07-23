@@ -11,11 +11,17 @@ Configuration import/export is intentionally split so one file type cannot overw
 
 Windows 离线波形分析工具。界面按软件示波器方式组织，支持多 CSV 数据组叠加、通道勾选与分栏显示、双光标测量、选区 FFT/THD、三相正负序分析、变量名导入导出、浅色/深色主题和中英文界面。
 
-0.11.0 补齐工程调试闭环：离线、冻结 Capture 和实时窗口统一提供平均值、真 RMS、正/负/绝对峰值、峰峰值与实际频率，并支持三相 P/Q₁/S/PF；Live 增加有界触发事件历史、固定与选择导航，`.scope` 回放可按触发事件跳转；采集设置提供 SCP1 帧大小、链路利用率、批次延迟和安全批次建议；新的 `.scopeproj` 工程文件可恢复数据组、布局、光标、通道外观、分析绑定、Live 预设、Capture 资产和导出标注，恢复时不会自动连接设备。SCP1 V1 与 `.scope` V1 格式保持兼容。
+0.12.0 在 0.11.0 的工程调试闭环上增加 Reference/Compare 核心：按路线 A 支持手动偏移、触发点、阈值事件和基波相位四种对齐语义，并兼容保留已有锚点模式；所有模式记录对齐置信度。支持分段时间序列插值、绝对/相对误差与超差区间；`.scopeproj` 自动从 V1 迁移到 V2，并保存 Compare 配置。离线、冻结 Capture 和实时窗口统一提供平均值、真 RMS、正/负/绝对峰值、峰峰值与实际频率，并支持三相 P/Q₁/S/PF；Live 增加有界触发事件历史、固定与选择导航，`.scope` 回放可按触发事件跳转；采集设置提供 SCP1 帧大小、链路利用率、批次延迟和安全批次建议；恢复工程时不会自动连接设备。SCP1 V1 与 `.scope` V1 格式保持兼容。
 
 0.10.0 新增实时捕获一键冻结分析：触发 Capture 或当前实时历史可直接进入离线工作区，复用光标测量、FFT/THD、序分量、标注与导出，无需先写入临时录波。在线与回放共享通道名称、颜色、倍率和窗格配置；波形视口共享光标、缩放、平移和多窗格状态，gap 在实时、离线绘图及导出中均保持断线。
 
-0.11.0 详细说明：[工程文件](docs/scopeproj-v1.md)、[工程测量](docs/engineering-measurements.md)、[Capture 历史](docs/capture-history.md)、[采集带宽](docs/acquisition-bandwidth.md)。
+0.12.0 详细说明：[工程文件](docs/scopeproj-v2.md)、[工程测量](docs/engineering-measurements.md)、[Capture 历史](docs/capture-history.md)、[采集带宽](docs/acquisition-bandwidth.md)、[路线 A 设计](docs/superpowers/specs/2026-07-14-route-a-design.md)、[路线 A 验收矩阵](docs/superpowers/route-a-acceptance-matrix.md)。
+
+命令行自动化入口：`scope-cli inspect` 检查数据集、`scope-cli analyze` 复用 MeasurementEngine 计算指标、`scope-cli compare` 计算参考/测试误差、`scope-cli test` 执行确定性规则、`scope-cli report` 生成 Markdown 报告、`scope-cli validate-recording` 校验 `.scope`、`scope-cli project` 校验或迁移 `.scopeproj`；所有命令均输出带 `schema_version` 的 JSON envelope，并使用稳定退出码。`scope-cli test` 即使返回完整的 `ok: true` 结果，规则结果为 `passed: false` 时会返回退出码 5；`validate-recording` 对缺少 clean SessionEnd 或存在 recovered tail 的录波返回 `valid: false` 和退出码 5，方便 CI 阻断不完整证据。
+
+Compare 核心使用显式 Reference/Test 角色、四种路线 A 对齐模式（并兼容 anchor）、线性重采样和容差区间计算。比较会保留数据缺口，缺口不会被当作零值或跨段插值；相对误差使用可配置的最小分母。图形界面、工程文件和 CLI 已复用同一套核心语义。语义样本见 `tests/fixtures/compare/`。
+
+规则支持绝对或事件相对时间窗、持续时间、容差、严重级别和证据窗口；结构化报告携带来源 CRC32C、应用/schema 版本、trigger/gap 质量、数据质量、Compare 摘要和确定性 SVG 证据图。VS Code bridge 启动时先协商协议版本（当前为 1），版本或能力不匹配会拒绝调用。
 
 0.9.0 将实时界面重构为可停靠工程工作区：紧凑采集工具栏、分组信号树、共享时间轴分轨波形、触发/显示/诊断检查器，以及事件/链路底部面板；默认显示最近 1 秒历史数据，兼顾细节与趋势。采集、触发、录波和离线回放协议保持兼容。
 
@@ -198,21 +204,83 @@ cargo run --release
 在 Windows 机器安装 Rust 稳定版和 WiX Toolset v3 后执行：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release-check.ps1
 $env:SCOPE_PACKAGE_OFFLINE=1
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -OfflinePackage
+$env:CARGO_NET_OFFLINE=true
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release-check.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -OfflinePackage -RequireSignature
+# 在 Win10/11 acceptance runner 上执行安装/升级/卸载和渲染器烟测
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-acceptance.ps1 `
+  -MsiPath dist\ScopeAnalyzer-0.12.0-win-x64.msi `
+  -ZipPath dist\ScopeAnalyzer-0.12.0-win-x64.zip `
+  -ReleaseEvidencePath dist\release-evidence.json `
+  -RequireSignature -RequireMesaRuntime -RequireAngleRuntime -RequireRdpSession `
+  -OutputPath dist\windows-acceptance.json
+# 如需单独验证标准用户启动，先在验收管理员会话中部署但不要卸载
+msiexec.exe /i dist\ScopeAnalyzer-0.12.0-win-x64.msi /qn /norestart
+# 切换到标准用户会话后复核启动权限和渲染器路径
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-acceptance.ps1 `
+  -MsiPath dist\ScopeAnalyzer-0.12.0-win-x64.msi `
+  -ZipPath dist\ScopeAnalyzer-0.12.0-win-x64.zip `
+  -ReleaseEvidencePath dist\release-evidence.json `
+  -SkipMsiLifecycle -RequireStandardUser -RequireSignature -RequireMesaRuntime -RequireAngleRuntime -RequireRdpSession `
+  -OutputPath dist\windows-acceptance-standard-user.json
+# 验收结束后由管理员清理部署
+msiexec.exe /x dist\ScopeAnalyzer-0.12.0-win-x64.msi /qn /norestart
 ```
 
-Release machines should preload Mesa in `target/mesa-runtime/x64` with
-`mesa-runtime-manifest.json` or provide `MESA_RUNTIME_DIR`/`third_party/mesa`.
-Bundle ANGLE from `ANGLE_RUNTIME_DIR`, `third_party/angle`, or
-`target/angle-runtime`; `SCOPE_ALLOW_SYSTEM_ANGLE=1` is only for local packaging
-experiments.
+Release runners must preload Mesa and ANGLE in controlled directories **outside**
+the checkout, then set `MESA_RUNTIME_DIR` and `ANGLE_RUNTIME_DIR`. `checkout@v4`
+cleans ignored workspace paths, so `target/mesa-runtime/x64` and
+`target/angle-runtime` are local-development caches only. The Mesa directory must
+contain the pinned `mesa-runtime-manifest.json` and all required WGL/EGL/GLES DLLs.
+`SCOPE_ALLOW_SYSTEM_ANGLE=1` is only for local packaging experiments.
+签名或离线发布若捆绑 ANGLE，还必须设置
+`ANGLE_RUNTIME_SOURCE_SHA256`（源资产 SHA256）以及
+`ANGLE_RUNTIME_MANIFEST_SHA256`（受控预载
+`angle-runtime-preload-manifest.json` 的 SHA256）。该预载 manifest 必须包含
+`schemaVersion: 1`、`runtime: "ANGLE"`、与 source SHA 一致的
+`sourceArchiveSha256`，以及 `libEGL.dll`、`libGLESv2.dll`（和存在时的
+`d3dcompiler_47.dll`）的 SHA256。打包会在复制前验证 manifest 与 DLL，随后将
+其来源 manifest 哈希写入 `angle-runtime-manifest.json` 供 acceptance 审计。
+发布验收必须使用 `-RequireSignature -RequireMesaRuntime -RequireAngleRuntime
+-RequireRdpSession`；省略这些开关的 acceptance 仅用于开发机 exploratory smoke。
+仓库提供了受控 runner 的手动工作流
+`.github/workflows/windows-release-acceptance.yml`；它要求在 GitHub Variables
+中配置工作区外的 `SCOPE_MESA_RUNTIME_DIR`、`SCOPE_ANGLE_RUNTIME_DIR`、
+`SCOPE_ANGLE_RUNTIME_SOURCE_SHA256`、`SCOPE_ANGLE_RUNTIME_MANIFEST_SHA256`，以及
+预置 WiX、签名证书和 RDP 会话，并上传 ZIP/MSI 与管理员验收证据。
+随后在预部署同一 MSI 的非管理员 runner 上手动触发
+`.github/workflows/windows-standard-user-acceptance.yml`，传入管理员 workflow 的
+run ID，生成标准用户 evidence。
+真实设备 smoke 使用 `.github/workflows/windows-hardware-smoke.yml`，它在连接
+SCP1 设备的 runner 上运行 `scope-hardware-smoke`，生成设备身份、固件、样本数、
+clean-end 和 `scope-cli validate-recording` evidence；simulator 不会被当作硬件证据。
+
+Windows packaging uses the pinned WiX Toolset 3.14 path (or an explicit `WIX`
+override) and the repository `rust-toolchain.toml`/lockfile. Controlled release
+and hardware runners must preload Rust 1.96.0 plus Cargo registry/git/target
+caches; the controlled release workflow also sets `CARGO_NET_OFFLINE=true`.
+Release builds must run with `SCOPE_PACKAGE_OFFLINE=1` after all inputs are
+preloaded.
+
+Route A CI also runs the pinned `cargo-llvm-cov` 0.8.7 gate over the headless
+core library: overall line coverage must be at least 75%, and Compare, SCP1
+protocol, `.scope` recording, and project migration/validation must each be at
+least 90%. The GUI/renderer adapters remain covered by their unit and native
+Windows smoke tests rather than being mixed into this deterministic core gate.
 
 产物在：
 
-- `dist/ScopeAnalyzer-0.11.0-win-x64.zip`
-- `dist/ScopeAnalyzer-0.11.0-win-x64.msi`
+- `dist/ScopeAnalyzer-0.12.0-win-x64.zip`
+- `dist/ScopeAnalyzer-0.12.0-win-x64.msi`
+
+压缩包和 MSI 同时包含 `scope-cli.exe`，用于 CI 中的 Compare、规则检查和 Markdown 报告生成。
+同时包含 `build-provenance.json`（源码 commit、工具链、运行时和 stage 文件 SHA256）与
+`sbom.cdx.json`（CycloneDX SBOM）以及 `THIRD-PARTY-NOTICES.txt`（Mesa、ANGLE
+和构建工具的归属/许可证说明），用于发布复核和离线环境追溯。
+打包完成后，`dist/release-evidence.json` 记录 ZIP/MSI 的 SHA256、源码 commit
+和签名状态；正式发布应设置 `SCOPE_SIGN_CERT_SHA1`（或显式证书指纹）并使用
+`-RequireSignature`，它会验证两个 EXE 和 MSI 的 Authenticode 签名。
 
 ## 启动渲染器和云桌面兜底
 
@@ -227,16 +295,18 @@ experiments.
 5. `mesa` / Mesa llvmpipe software OpenGL, isolated in the packaged `mesa`
    directory as the last cloud-desktop fallback.
 
-Packaged builds bundle ANGLE only from explicit reproducible sources:
-`ANGLE_RUNTIME_DIR`, `third_party/angle`, or `target/angle-runtime`. When ANGLE
-is bundled, packaging writes `angle-runtime-manifest.json` with the copied DLL
-hashes. Set `SCOPE_ALLOW_SYSTEM_ANGLE=1` only for local experiments that should
+Packaged builds bundle ANGLE only from explicit sources:
+`ANGLE_RUNTIME_DIR`, `third_party/angle`, or `target/angle-runtime`. Signed and
+offline packages require a hash-pinned `angle-runtime-preload-manifest.json` next
+to the runtime, so the source-archive declaration is checked against every copied
+DLL rather than being an unchecked label. `target/angle-runtime` is for local
+development only; controlled release runners must use the external environment
+path. Set `SCOPE_ALLOW_SYSTEM_ANGLE=1` only for local experiments that should
 probe the build machine's Edge/WebView runtime. If every renderer exits during
 startup, the launcher tries the isolated Mesa helper before stopping. Mesa
-runtime files are resolved
-from `MESA_RUNTIME_DIR`, `third_party/mesa`, or the verified
-`target/mesa-runtime/x64` cache. If no local runtime is available, packaging
-downloads the pinned `pal1000/mesa-dist-win` `26.0.8`
+runtime files are resolved from `MESA_RUNTIME_DIR`, `third_party/mesa`, or the
+verified `target/mesa-runtime/x64` local cache. If no local runtime is available,
+packaging downloads the pinned `pal1000/mesa-dist-win` `26.0.8`
 `mesa3d-26.0.8-release-msvc.7z` asset and verifies SHA256 before extraction.
 The automatic cache writes `mesa-runtime-manifest.json`; CI/release machines can
 preload this cache and set `SCOPE_PACKAGE_OFFLINE=1` or pass `-OfflinePackage`

@@ -112,7 +112,9 @@ pub struct ThreePhasePower {
     pub effective_apparent_power: f64,
     pub true_power_factor: Option<f64>,
     pub frequency_hz: f64,
-    pub power_unit: String,
+    pub active_power_unit: String,
+    pub reactive_power_unit: String,
+    pub apparent_power_unit: String,
     pub quality: MeasurementQuality,
 }
 
@@ -476,11 +478,17 @@ fn analyze_three_phase_power(
         .then_some((active_power / effective_apparent_power).clamp(-1.0, 1.0));
     let (voltage_factor, voltage_label) = engineering_unit_factor(&spec.voltage_unit, true);
     let (current_factor, current_label) = engineering_unit_factor(&spec.current_unit, false);
-    let power_unit = if voltage_label.is_some() && current_label.is_some() {
-        power_unit_label(voltage_factor * current_factor)
-    } else {
-        "engineering units".to_owned()
-    };
+    let (active_power_unit, reactive_power_unit, apparent_power_unit) =
+        if voltage_label.is_some() && current_label.is_some() {
+            let (active, reactive, apparent) = power_unit_label(voltage_factor * current_factor);
+            (active.to_owned(), reactive.to_owned(), apparent.to_owned())
+        } else {
+            (
+                "engineering units".to_owned(),
+                "engineering units".to_owned(),
+                "engineering units".to_owned(),
+            )
+        };
     Ok(ThreePhasePower {
         valid_samples,
         active_power,
@@ -488,7 +496,9 @@ fn analyze_three_phase_power(
         effective_apparent_power,
         true_power_factor,
         frequency_hz: frequency,
-        power_unit,
+        active_power_unit,
+        reactive_power_unit,
+        apparent_power_unit,
         quality: MeasurementQuality {
             contains_gap,
             insufficient_samples: false,
@@ -601,13 +611,13 @@ fn engineering_unit_factor(unit: &str, voltage: bool) -> (f64, Option<&'static s
     }
 }
 
-fn power_unit_label(factor: f64) -> String {
+fn power_unit_label(factor: f64) -> (&'static str, &'static str, &'static str) {
     if factor >= 1_000_000.0 {
-        "MW / Mvar / MVA".to_owned()
+        ("MW", "Mvar", "MVA")
     } else if factor >= 1_000.0 {
-        "kW / kvar / kVA".to_owned()
+        ("kW", "kvar", "kVA")
     } else {
-        "W / var / VA".to_owned()
+        ("W", "var", "VA")
     }
 }
 
@@ -717,6 +727,13 @@ mod tests {
     }
 
     #[test]
+    fn power_units_are_reported_separately_for_each_quantity() {
+        assert_eq!(power_unit_label(1.0), ("W", "var", "VA"));
+        assert_eq!(power_unit_label(1_000.0), ("kW", "kvar", "kVA"));
+        assert_eq!(power_unit_label(1_000_000.0), ("MW", "Mvar", "MVA"));
+    }
+
+    #[test]
     fn balanced_three_phase_power_matches_known_values() {
         let sample_rate = 10_000.0;
         let frequency = 50.0;
@@ -758,6 +775,9 @@ mod tests {
         );
         assert!((result.effective_apparent_power - expected_s).abs() / expected_s < 0.01);
         assert!((result.true_power_factor.unwrap() - lag.cos()).abs() < 0.01);
+        assert_eq!(result.active_power_unit, "W");
+        assert_eq!(result.reactive_power_unit, "var");
+        assert_eq!(result.apparent_power_unit, "VA");
     }
 
     #[test]

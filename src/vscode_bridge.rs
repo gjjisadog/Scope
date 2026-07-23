@@ -15,6 +15,7 @@ const DEFAULT_SAMPLE_RATE_HZ: f64 = 1000.0;
 const DEFAULT_HARMONIC_BASE_HZ: f64 = 50.0;
 const DEFAULT_MAX_POINTS: usize = 250_000;
 const MAX_FFT_POINTS: usize = 262_144;
+pub const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 
 pub fn run_from_args(args: impl IntoIterator<Item = OsString>) -> Option<i32> {
     let mut args = args.into_iter();
@@ -25,6 +26,7 @@ pub fn run_from_args(args: impl IntoIterator<Item = OsString>) -> Option<i32> {
     }
 
     let result = match command.as_ref() {
+        "--vscode-capabilities" => run_capabilities(args.collect()),
         "--vscode-dataset" => run_dataset(args.collect()),
         "--vscode-fft" => run_fft(args.collect()),
         _ => Err(format!("Unknown VS Code bridge command: {command}")),
@@ -37,6 +39,25 @@ pub fn run_from_args(args: impl IntoIterator<Item = OsString>) -> Option<i32> {
             Some(1)
         }
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BridgeCapabilities {
+    protocol_version: u32,
+    application_version: &'static str,
+    commands: &'static [&'static str],
+}
+
+fn run_capabilities(args: Vec<OsString>) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err("--vscode-capabilities does not accept options".to_owned());
+    }
+    print_json(&BridgeCapabilities {
+        protocol_version: BRIDGE_PROTOCOL_VERSION,
+        application_version: env!("CARGO_PKG_VERSION"),
+        commands: &["dataset", "fft"],
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -366,4 +387,24 @@ fn print_json(value: &impl Serialize) -> Result<(), String> {
     let text = serde_json::to_string(value).map_err(|error| error.to_string())?;
     println!("{text}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "external-input fuzz gate; run explicitly in the release job"]
+    fn bridge_option_parsers_survive_one_million_inputs() {
+        let mut state = 0x1319_8a2e_u32;
+        for index in 0..1_000_000_usize {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let token = format!("arg-{}-{:08x}", index % 17, state);
+            let args = vec![OsString::from(token)];
+            let _ = parse_dataset_options(args.clone());
+            let _ = parse_fft_options(args);
+        }
+    }
 }

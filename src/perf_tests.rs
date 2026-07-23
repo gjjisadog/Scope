@@ -269,8 +269,8 @@ fn perf_png_canvas_export_smoke() {
     let mut canvas = Canvas::new(2400, 1200, Rgba::rgb(255, 255, 255));
     let timer = PerfTimer::start("png_canvas_draw");
     for segment in 0..4000 {
-        let x0 = 20 + (segment % 2360) as i32;
-        let x1 = 20 + ((segment + 1) % 2360) as i32;
+        let x0 = 20 + (segment % 2360);
+        let x1 = 20 + ((segment + 1) % 2360);
         let y0 = 600 + ((segment as f64 * 0.02).sin() * 400.0) as i32;
         let y1 = 600 + (((segment + 1) as f64 * 0.02).sin() * 400.0) as i32;
         canvas.line(x0, y0, x1, y1, Rgba::rgb(25, 120, 220), 2);

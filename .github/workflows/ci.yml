@@ -1,0 +1,166 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check all targets
+        run: cargo check --locked --all-targets
+      - name: Run tests
+        run: cargo test --locked --all-targets
+      - name: Strict project Clippy
+        run: cargo clippy --locked --all-targets --no-deps -- -D warnings
+      - name: CLI fixture smoke
+        shell: bash
+        run: |
+          cargo run --locked --quiet --bin scope-cli -- inspect --input tests/fixtures/compare/reference.csv
+          cargo run --locked --quiet --bin scope-cli -- analyze --input tests/fixtures/compare/reference.csv --channel 0
+          cargo run --locked --quiet --bin scope-cli -- compare \
+            --reference tests/fixtures/compare/reference.csv \
+            --test tests/fixtures/compare/test-delayed.csv \
+            --offset 0.1 > "$RUNNER_TEMP/scope-compare.json"
+          cargo run --locked --quiet --bin scope-cli -- test \
+            --metrics tests/fixtures/compare/metrics.json \
+            --rules tests/fixtures/compare/rules.json
+          set +e
+          cargo run --locked --quiet --bin scope-cli -- test \
+            --metrics tests/fixtures/compare/metrics.json \
+            --rules tests/fixtures/compare/rules-failing.json > "$RUNNER_TEMP/scope-failing-rules.json"
+          failing_exit=$?
+          set -e
+          test "$failing_exit" -eq 5
+          python3 - <<PY
+          import json
+          from pathlib import Path
+          failed = json.loads(Path("$RUNNER_TEMP/scope-failing-rules.json").read_text())
+          assert failed["ok"] is True
+          assert failed["result"]["passed"] is False
+          PY
+          cargo run --locked --quiet --bin scope-cli -- report \
+            --compare "$RUNNER_TEMP/scope-compare.json" \
+            --source tests/fixtures/compare/reference.csv \
+            --source tests/fixtures/compare/test-delayed.csv \
+            --metrics tests/fixtures/compare/metrics.json \
+            --rules tests/fixtures/compare/rules.json \
+            --output "$RUNNER_TEMP/scope-report.md" \
+            --evidence-output "$RUNNER_TEMP/scope-evidence.svg" > "$RUNNER_TEMP/scope-report.json"
+          python3 - <<PY
+          import json
+          from pathlib import Path
+          report = json.loads(Path("$RUNNER_TEMP/scope-report.json").read_text())
+          assert report["ok"] is True
+          assert report["result"]["dataQuality"]["triggerQuality"] == []
+          evidence = report["result"]["compareEvidence"]
+          assert evidence["alignmentOffsetSeconds"] == 0.1
+          assert evidence["validPoints"] == 4
+          assert evidence["invalidPoints"] == 1
+          assert evidence["exceedanceIntervals"] == []
+          assert "Trigger/gap quality" in report["result"]["markdown"]
+          PY
+          cargo run --locked --quiet --bin scope_analyzer -- --vscode-capabilities
+
+  performance:
+    name: Performance regression gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: ubuntu-cargo-
+      - name: Live measurement p95 gate
+        run: cargo test --locked --lib live_measurement_p95 -- --ignored --test-threads=1
+      - name: Compare and render performance gates
+        run: cargo test --locked --bin scope_analyzer -- --ignored perf_ --test-threads=1
+      - name: Protocol one-million-input fuzz gate
+        run: cargo test --locked --lib decoder_survives_one_million_deterministic_bytes -- --ignored --test-threads=1
+      - name: Project parser one-million-input fuzz gate
+        run: cargo test --locked --lib project_parser_survives_one_million_deterministic_inputs -- --ignored --test-threads=1
+      - name: VS Code bridge parser one-million-input fuzz gate
+        run: cargo test --locked --bin scope_analyzer bridge_option_parsers_survive_one_million_inputs -- --ignored --test-threads=1
+
+  coverage:
+    name: Route A core coverage gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+          components: llvm-tools-preview
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-coverage-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: ubuntu-coverage-
+      - name: Install pinned cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --version 0.8.7 --locked
+      - name: Verify core library coverage
+        env:
+          SCOPE_COVERAGE_REPORT: ${{ runner.temp }}/scope-core-coverage.json
+        run: python3 scripts/coverage-check.py
+      - name: Upload coverage evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: scope-core-coverage
+          path: ${{ runner.temp }}/scope-core-coverage.json
+
+  vscode-extension:
+    name: VS Code bridge policy tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Run extension tests
+        run: npm test --prefix vscode-extension
+
+  packaging-script:
+    name: Windows packaging script checks
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate packaging scripts
+        shell: pwsh
+        run: ./scripts/test-package-windows.ps1

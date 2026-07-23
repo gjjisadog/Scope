@@ -6,6 +6,11 @@ $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
 
+if ($env:SCOPE_PACKAGE_OFFLINE -eq "1") {
+    $env:CARGO_NET_OFFLINE = "true"
+    Write-Host "CARGO_NET_OFFLINE=true (inherited from SCOPE_PACKAGE_OFFLINE=1)"
+}
+
 function Invoke-ReleaseStep {
     param(
         [string]$Name,
@@ -95,6 +100,7 @@ try {
         $null = [scriptblock]::Create((Get-Content -Raw (Join-Path $PSScriptRoot "run-performance-baselines.ps1")))
         $null = [scriptblock]::Create((Get-Content -Raw (Join-Path $PSScriptRoot "test-package-windows.ps1")))
         $null = [scriptblock]::Create((Get-Content -Raw (Join-Path $PSScriptRoot "release-check.ps1")))
+        $null = [scriptblock]::Create((Get-Content -Raw (Join-Path $PSScriptRoot "windows-acceptance.ps1")))
     }
 
     Invoke-ReleaseStep "WiX XML parse" {
@@ -110,11 +116,11 @@ try {
     }
 
     Invoke-ReleaseStep "cargo clippy --all-targets" {
-        & cargo clippy --all-targets --quiet
+        & cargo clippy --locked --all-targets --no-deps --quiet -- -D warnings
     }
 
     Invoke-ReleaseStep "cargo test --quiet" {
-        & cargo test --quiet
+        & cargo test --locked --all-targets --quiet
     }
 
     if ($SkipPerformanceBaselines) {

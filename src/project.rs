@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const PROJECT_TYPE: &str = "scope-analyzer-project";
-pub const PROJECT_SCHEMA_VERSION: u32 = 1;
+pub const PROJECT_SCHEMA_VERSION: u32 = 2;
+const LEGACY_PROJECT_SCHEMA_VERSION: u32 = 1;
 pub const MAX_PROJECT_JSON_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -246,6 +247,91 @@ pub struct ProjectAnalysis {
     pub derived_curves: Vec<ProjectDerivedCurve>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ProjectCompareAlignment {
+    ManualOffset {
+        seconds: f64,
+    },
+    Anchor {
+        reference_time: f64,
+        test_time: f64,
+    },
+    TriggerPoint {
+        reference_time: f64,
+        test_time: f64,
+        confidence: f64,
+    },
+    ThresholdEvent {
+        reference_time: f64,
+        test_time: f64,
+        confidence: f64,
+    },
+    FundamentalPhase {
+        reference_phase_radians: f64,
+        test_phase_radians: f64,
+        period_seconds: f64,
+        confidence: f64,
+    },
+}
+
+impl Default for ProjectCompareAlignment {
+    fn default() -> Self {
+        Self::ManualOffset { seconds: 0.0 }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectCompareTolerance {
+    #[serde(default)]
+    pub absolute: Option<f64>,
+    #[serde(default)]
+    pub relative: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectCompareChannelMapping {
+    pub reference: ProjectChannelRef,
+    pub test: ProjectChannelRef,
+    #[serde(default)]
+    pub label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectCompare {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub reference_dataset_id: Option<DatasetId>,
+    #[serde(default)]
+    pub test_dataset_id: Option<DatasetId>,
+    #[serde(default)]
+    pub channel_mappings: Vec<ProjectCompareChannelMapping>,
+    #[serde(default)]
+    pub alignment: ProjectCompareAlignment,
+    #[serde(default)]
+    pub tolerance: ProjectCompareTolerance,
+    #[serde(default = "default_relative_floor")]
+    pub relative_floor: f64,
+}
+
+impl Default for ProjectCompare {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            reference_dataset_id: None,
+            test_dataset_id: None,
+            channel_mappings: Vec::new(),
+            alignment: ProjectCompareAlignment::default(),
+            tolerance: ProjectCompareTolerance::default(),
+            relative_floor: default_relative_floor(),
+        }
+    }
+}
+
 impl Default for ProjectAnalysis {
     fn default() -> Self {
         Self {
@@ -393,6 +479,8 @@ pub struct ScopeProjectDocument {
     #[serde(default)]
     pub analysis: ProjectAnalysis,
     #[serde(default)]
+    pub compare: ProjectCompare,
+    #[serde(default)]
     pub live_profile: Option<ProjectLiveProfile>,
     #[serde(default)]
     pub captures: Vec<ProjectCaptureRef>,
@@ -411,6 +499,7 @@ impl ScopeProjectDocument {
             datasets: Vec::new(),
             workspace: ProjectWorkspace::default(),
             analysis: ProjectAnalysis::default(),
+            compare: ProjectCompare::default(),
             live_profile: None,
             captures: Vec::new(),
             export: ProjectExportState::default(),
@@ -421,7 +510,29 @@ impl ScopeProjectDocument {
         if bytes.len() > MAX_PROJECT_JSON_BYTES {
             return Err(ProjectError::TooLarge(bytes.len()));
         }
-        let document: Self = serde_json::from_slice(bytes)?;
+        let mut value: serde_json::Value = serde_json::from_slice(bytes)?;
+        let schema_version = value
+            .get("schemaVersion")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok());
+        if schema_version == Some(LEGACY_PROJECT_SCHEMA_VERSION) {
+            let object = value.as_object_mut().ok_or_else(|| {
+                ProjectError::InvalidField("project JSON root must be an object".to_owned())
+            })?;
+            object.insert(
+                "schemaVersion".to_owned(),
+                serde_json::Value::from(PROJECT_SCHEMA_VERSION),
+            );
+            object
+                .entry("compare".to_owned())
+                .or_insert_with(|| serde_json::json!({}));
+        }
+        if let Some(version) = schema_version {
+            if version != LEGACY_PROJECT_SCHEMA_VERSION && version != PROJECT_SCHEMA_VERSION {
+                return Err(ProjectError::UnsupportedSchema(version));
+            }
+        }
+        let document: Self = serde_json::from_value(value)?;
         document.validate()?;
         Ok(document)
     }
@@ -494,6 +605,7 @@ impl ScopeProjectDocument {
 
         validate_workspace(&self.workspace, &dataset_ids)?;
         validate_analysis(&self.analysis, &source_ids)?;
+        validate_compare(&self.compare, &dataset_ids, &source_ids)?;
         if let Some(profile) = &self.live_profile {
             validate_live_profile(profile)?;
         }
@@ -680,7 +792,19 @@ fn file_metadata_matches(path: &Path, expected: &ProjectFileRef) -> bool {
     let Ok(metadata) = fs::metadata(path) else {
         return false;
     };
-    expected.size_bytes == 0 || expected.size_bytes == metadata.len()
+    let size_matches = expected.size_bytes == 0 || expected.size_bytes == metadata.len();
+    let modified_matches = match expected.modified_unix_ms {
+        None => true,
+        Some(expected_modified) => {
+            metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+                == Some(expected_modified)
+        }
+    };
+    size_matches && modified_matches
 }
 
 #[derive(Debug, Error)]
@@ -856,6 +980,122 @@ fn validate_analysis(
     Ok(())
 }
 
+fn validate_compare(
+    compare: &ProjectCompare,
+    dataset_ids: &HashSet<DatasetId>,
+    source_ids: &HashSet<SourceId>,
+) -> Result<(), ProjectError> {
+    if let Some(reference) = &compare.reference_dataset_id {
+        if !dataset_ids.contains(reference) {
+            return Err(ProjectError::DanglingReference(reference.0.clone()));
+        }
+    }
+    if let Some(test) = &compare.test_dataset_id {
+        if !dataset_ids.contains(test) {
+            return Err(ProjectError::DanglingReference(test.0.clone()));
+        }
+    }
+    if compare.enabled {
+        let (Some(reference), Some(test)) = (
+            compare.reference_dataset_id.as_ref(),
+            compare.test_dataset_id.as_ref(),
+        ) else {
+            return Err(ProjectError::InvalidField(
+                "enabled compare requires reference and test datasets".to_owned(),
+            ));
+        };
+        if reference == test {
+            return Err(ProjectError::InvalidField(
+                "compare reference and test datasets must differ".to_owned(),
+            ));
+        }
+    }
+    match compare.alignment {
+        ProjectCompareAlignment::ManualOffset { seconds } => {
+            if !seconds.is_finite() {
+                return Err(ProjectError::InvalidField(
+                    "compare alignment offset must be finite".to_owned(),
+                ));
+            }
+        }
+        ProjectCompareAlignment::Anchor {
+            reference_time,
+            test_time,
+        } => {
+            if !reference_time.is_finite() || !test_time.is_finite() {
+                return Err(ProjectError::InvalidField(
+                    "compare alignment anchor must be finite".to_owned(),
+                ));
+            }
+        }
+        ProjectCompareAlignment::TriggerPoint {
+            reference_time,
+            test_time,
+            confidence,
+        }
+        | ProjectCompareAlignment::ThresholdEvent {
+            reference_time,
+            test_time,
+            confidence,
+        } => {
+            if !reference_time.is_finite()
+                || !test_time.is_finite()
+                || !confidence.is_finite()
+                || !(0.0..=1.0).contains(&confidence)
+            {
+                return Err(ProjectError::InvalidField(
+                    "compare event alignment must contain finite times and confidence 0..=1"
+                        .to_owned(),
+                ));
+            }
+        }
+        ProjectCompareAlignment::FundamentalPhase {
+            reference_phase_radians,
+            test_phase_radians,
+            period_seconds,
+            confidence,
+        } => {
+            if !reference_phase_radians.is_finite()
+                || !test_phase_radians.is_finite()
+                || !period_seconds.is_finite()
+                || period_seconds <= 0.0
+                || !confidence.is_finite()
+                || !(0.0..=1.0).contains(&confidence)
+            {
+                return Err(ProjectError::InvalidField(
+                    "compare phase alignment must contain finite phases, positive period and confidence 0..=1"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    if !compare.relative_floor.is_finite() || compare.relative_floor <= 0.0 {
+        return Err(ProjectError::InvalidField(
+            "compare relativeFloor must be positive".to_owned(),
+        ));
+    }
+    let tolerance_values = [compare.tolerance.absolute, compare.tolerance.relative];
+    if tolerance_values
+        .into_iter()
+        .flatten()
+        .any(|value| !value.is_finite() || value < 0.0)
+    {
+        return Err(ProjectError::InvalidField(
+            "compare tolerance values must be finite and non-negative".to_owned(),
+        ));
+    }
+    for mapping in &compare.channel_mappings {
+        validate_channel_ref(&mapping.reference, source_ids)?;
+        validate_channel_ref(&mapping.test, source_ids)?;
+        if mapping.label.trim().is_empty() {
+            return Err(ProjectError::InvalidField(
+                "compare channel mapping label must not be empty".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_live_profile(profile: &ProjectLiveProfile) -> Result<(), ProjectError> {
     if profile.sample_rate_hz == 0 || profile.batch_samples == 0 {
         return Err(ProjectError::InvalidField(
@@ -934,6 +1174,10 @@ const fn default_history_bytes() -> u64 {
     128 * 1024 * 1024
 }
 
+const fn default_relative_floor() -> f64 {
+    1.0e-12
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1002,7 +1246,119 @@ mod tests {
         assert_eq!(decoded, document);
         assert!(String::from_utf8(bytes)
             .unwrap()
-            .contains("\"schemaVersion\": 1"));
+            .contains("\"schemaVersion\": 2"));
+    }
+
+    #[test]
+    fn project_v1_json_migrates_to_v2_with_disabled_compare() {
+        let document = document();
+        let mut value = serde_json::to_value(document).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.insert("schemaVersion".to_owned(), serde_json::json!(1));
+        object.remove("compare");
+
+        let migrated =
+            ScopeProjectDocument::from_json_bytes(&serde_json::to_vec(&value).unwrap()).unwrap();
+
+        assert_eq!(migrated.schema_version, 2);
+        assert!(!migrated.compare.enabled);
+        assert_eq!(migrated.compare.reference_dataset_id, None);
+    }
+
+    #[test]
+    fn compatibility_fixture_migrates_explicitly_to_v2() {
+        let migrated = ScopeProjectDocument::from_json_bytes(include_bytes!(
+            "../tests/fixtures/compatibility/scopeproj-v1-minimal.json"
+        ))
+        .unwrap();
+        assert_eq!(migrated.schema_version, PROJECT_SCHEMA_VERSION);
+        assert!(!migrated.compare.enabled);
+        assert_eq!(migrated.datasets.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "external-input fuzz gate; run explicitly in the release job"]
+    fn project_parser_survives_one_million_deterministic_inputs() {
+        let mut state = 0x243f_6a88_u32;
+        for length in 0..1_000_000_usize {
+            let mut bytes = vec![0_u8; length % 96];
+            for byte in &mut bytes {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                *byte = (state & 0xff) as u8;
+            }
+            let _ = ScopeProjectDocument::from_json_bytes(&bytes);
+        }
+    }
+
+    #[test]
+    fn project_compare_validation_rejects_invalid_dataset_and_tolerance() {
+        let mut document = document();
+        document.compare.enabled = true;
+        document.compare.reference_dataset_id = Some(DatasetId("dataset-main".to_owned()));
+        document.compare.test_dataset_id = Some(DatasetId("missing".to_owned()));
+        assert!(matches!(
+            document.validate(),
+            Err(ProjectError::DanglingReference(_))
+        ));
+
+        document.compare.test_dataset_id = Some(DatasetId("dataset-main".to_owned()));
+        document.compare.tolerance.absolute = Some(-1.0);
+        assert!(matches!(
+            document.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+    }
+
+    #[test]
+    fn project_compare_validation_accepts_event_and_phase_alignment() {
+        let mut document = document();
+        let mut imported_source = source();
+        imported_source.id = SourceId("source-imported".to_owned());
+        imported_source.file.relative_path = "data/imported.csv".to_owned();
+        document.sources.push(imported_source);
+        document.datasets.push(ProjectDataset {
+            id: DatasetId("dataset-imported".to_owned()),
+            source_id: SourceId("source-imported".to_owned()),
+            role: ProjectDatasetRole::Imported,
+            display_name: "Imported".to_owned(),
+            enabled: true,
+            line_pattern: "dashed".to_owned(),
+            time_offset: 0.0,
+            channels: Vec::new(),
+        });
+        document.compare.enabled = true;
+        document.compare.reference_dataset_id = Some(DatasetId("dataset-main".to_owned()));
+        document.compare.test_dataset_id = Some(DatasetId("dataset-imported".to_owned()));
+        document.compare.alignment = ProjectCompareAlignment::TriggerPoint {
+            reference_time: 1.0,
+            test_time: 0.8,
+            confidence: 0.9,
+        };
+        assert!(document.validate().is_ok());
+
+        document.compare.alignment = ProjectCompareAlignment::FundamentalPhase {
+            reference_phase_radians: 0.25,
+            test_phase_radians: -0.25,
+            period_seconds: 0.02,
+            confidence: 0.8,
+        };
+        assert!(document.validate().is_ok());
+    }
+
+    #[test]
+    fn project_compare_validation_rejects_invalid_alignment_confidence() {
+        let mut document = document();
+        document.compare.alignment = ProjectCompareAlignment::ThresholdEvent {
+            reference_time: 1.0,
+            test_time: 0.8,
+            confidence: 1.1,
+        };
+        assert!(matches!(
+            document.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
     }
 
     #[test]
@@ -1113,5 +1469,429 @@ mod tests {
             ProjectSourceResolution::MetadataMismatch(_)
         ));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn source_resolution_rejects_same_size_file_with_different_mtime() {
+        let directory = temporary_dir("same-size-mtime");
+        let data_path = directory.join("data/main.csv");
+        fs::create_dir_all(data_path.parent().unwrap()).unwrap();
+        fs::write(&data_path, b"time,value\n0,1\n").unwrap();
+        let original_metadata = fs::metadata(&data_path).unwrap();
+        let original_modified = original_metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .try_into()
+            .unwrap();
+        let mut document = document();
+        document.sources[0].file.size_bytes = original_metadata.len();
+        document.sources[0].file.modified_unix_ms = Some(original_modified);
+        let project_path = directory.join("test.scopeproj");
+
+        fs::write(&data_path, b"time,value\n0,2\n").unwrap();
+        let replacement_modified = std::time::UNIX_EPOCH
+            + std::time::Duration::from_millis(original_modified)
+            + std::time::Duration::from_secs(1);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&data_path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(replacement_modified))
+            .unwrap();
+
+        assert_eq!(
+            fs::metadata(&data_path).unwrap().len(),
+            original_metadata.len()
+        );
+        assert!(matches!(
+            resolve_project_sources(&project_path, &document)[0].resolution,
+            ProjectSourceResolution::MetadataMismatch(_)
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn project_validation_covers_rejection_matrix_for_persisted_sections() {
+        let mut invalid = document();
+        invalid.scope_project_type = "other".to_owned();
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::WrongType(_))
+        ));
+
+        let mut invalid = document();
+        invalid.schema_version = 99;
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::UnsupportedSchema(99))
+        ));
+
+        let mut invalid = document();
+        invalid.created_by_version.clear();
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+
+        for value in [String::new(), "not valid".to_owned(), "x".repeat(129)] {
+            let mut invalid = document();
+            invalid.project_id = ProjectId(value);
+            assert!(matches!(
+                invalid.validate(),
+                Err(ProjectError::InvalidId(_))
+            ));
+        }
+
+        let mut invalid = document();
+        invalid.sources[0].id = SourceId("bad id".to_owned());
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidId(_))
+        ));
+
+        let mut invalid = document();
+        invalid.datasets[0].time_offset = f64::NAN;
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+
+        let mut invalid = document();
+        invalid.datasets[0].channels.push(ProjectChannelState {
+            channel: channel(0, "Va"),
+            display_name: String::new(),
+            color: [0, 0, 0, 255],
+            visible: true,
+            scale: 0.0,
+            pane: 0,
+            line_width: 1.0,
+            line_pattern: String::new(),
+        });
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+
+        let mut invalid = document();
+        invalid.datasets[0].channels.push(ProjectChannelState {
+            channel: channel(0, "Va"),
+            display_name: String::new(),
+            color: [0, 0, 0, 255],
+            visible: true,
+            scale: 1.0,
+            pane: 0,
+            line_width: 0.0,
+            line_pattern: String::new(),
+        });
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+
+        let mut invalid = document();
+        invalid.workspace.layout_rows = 0;
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+
+        let mut invalid = document();
+        invalid.workspace.selected_dataset_id = Some(DatasetId("missing".to_owned()));
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::DanglingReference(_))
+        ));
+
+        let mut invalid = document();
+        invalid.workspace.viewport.view_end = invalid.workspace.viewport.view_start;
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+
+        let mut invalid = document();
+        invalid.workspace.viewport.pane_y_bounds = vec![[1.0, 1.0]];
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+
+        let mut invalid = document();
+        invalid.analysis.harmonic_base_hz = 0.0;
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+
+        let mut invalid = document();
+        invalid.analysis.live_measurement_cycles = 101.0;
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+
+        let mut invalid = document();
+        invalid.analysis.fft_channel = Some(channel(0, ""));
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+
+        let refs = [
+            channel(0, "V1"),
+            channel(1, "V2"),
+            channel(2, "V3"),
+            channel(3, "I1"),
+            channel(4, "I2"),
+        ];
+        let mut invalid = document();
+        invalid.analysis.power = Some(ProjectPowerBindings {
+            voltage: [refs[0].clone(), refs[1].clone(), refs[2].clone()],
+            current: [refs[3].clone(), refs[3].clone(), refs[4].clone()],
+            voltage_scales: [1.0; 3],
+            current_scales: [1.0; 3],
+        });
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+
+        let mut invalid = document();
+        invalid.analysis.power = Some(ProjectPowerBindings {
+            voltage: [refs[0].clone(), refs[1].clone(), refs[2].clone()],
+            current: [refs[3].clone(), refs[4].clone(), channel(5, "I3")],
+            voltage_scales: [0.0, 1.0, 1.0],
+            current_scales: [1.0; 3],
+        });
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+
+        let mut invalid = document();
+        invalid.analysis.derived_curves.push(ProjectDerivedCurve {
+            name: String::new(),
+            script: "x".to_owned(),
+            gain: 1.0,
+            offset: 0.0,
+            visible: true,
+            pane: 0,
+        });
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+
+        let mut invalid = document();
+        invalid.compare.enabled = true;
+        invalid.compare.reference_dataset_id = None;
+        invalid.compare.test_dataset_id = None;
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+
+        let mut invalid = document();
+        invalid.compare.enabled = true;
+        invalid.compare.reference_dataset_id = Some(DatasetId("dataset-main".to_owned()));
+        invalid.compare.test_dataset_id = Some(DatasetId("dataset-main".to_owned()));
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+
+        let invalid_alignments = [
+            ProjectCompareAlignment::ManualOffset { seconds: f64::NAN },
+            ProjectCompareAlignment::Anchor {
+                reference_time: f64::NAN,
+                test_time: 0.0,
+            },
+            ProjectCompareAlignment::TriggerPoint {
+                reference_time: 0.0,
+                test_time: 0.0,
+                confidence: 2.0,
+            },
+            ProjectCompareAlignment::ThresholdEvent {
+                reference_time: 0.0,
+                test_time: 0.0,
+                confidence: -0.1,
+            },
+            ProjectCompareAlignment::FundamentalPhase {
+                reference_phase_radians: 0.0,
+                test_phase_radians: 0.0,
+                period_seconds: 0.0,
+                confidence: 0.5,
+            },
+        ];
+        for alignment in invalid_alignments {
+            let mut invalid = document();
+            invalid.compare.alignment = alignment;
+            assert!(matches!(
+                invalid.validate(),
+                Err(ProjectError::InvalidField(_))
+            ));
+        }
+
+        let mut invalid = document();
+        invalid.compare.relative_floor = 0.0;
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+
+        let mut invalid = document();
+        invalid.compare.tolerance.relative = Some(-0.1);
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+
+        let mut invalid = document();
+        invalid
+            .compare
+            .channel_mappings
+            .push(ProjectCompareChannelMapping {
+                reference: channel(0, "Va"),
+                test: channel(0, "Vb"),
+                label: String::new(),
+            });
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+
+        let live = ProjectLiveProfile {
+            transport: Some(ProjectTransport::Serial {
+                port: String::new(),
+                baud: 0,
+            }),
+            sample_rate_hz: 0,
+            batch_samples: 0,
+            channel_ids: Vec::new(),
+            trigger: ProjectTriggerConfig {
+                mode: ProjectTriggerMode::Auto,
+                edge: ProjectTriggerEdge::Rising,
+                source_channel: 0,
+                level: 0.0,
+                hysteresis: 0.0,
+                pre_samples: 0,
+                post_samples: 0,
+                auto_timeout_samples: 0,
+            },
+            capture_history_entries: 0,
+            capture_history_bytes: 0,
+        };
+        let mut invalid = document();
+        invalid.live_profile = Some(live);
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+
+        let mut invalid = document();
+        invalid.captures = vec![
+            ProjectCaptureRef {
+                id: CaptureId("capture".to_owned()),
+                origin: ProjectCaptureOrigin::CaptureAsset,
+                source_id: SourceId("source-main".to_owned()),
+                trigger_ordinal: None,
+                label: String::new(),
+                note: String::new(),
+                pinned: false,
+                selected: true,
+            },
+            ProjectCaptureRef {
+                id: CaptureId("capture".to_owned()),
+                origin: ProjectCaptureOrigin::RecordingTrigger,
+                source_id: SourceId("source-main".to_owned()),
+                trigger_ordinal: None,
+                label: String::new(),
+                note: String::new(),
+                pinned: false,
+                selected: true,
+            },
+        ];
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::DuplicateId(_))
+        ));
+
+        let mut invalid = document();
+        invalid.captures.push(ProjectCaptureRef {
+            id: CaptureId("capture".to_owned()),
+            origin: ProjectCaptureOrigin::RecordingTrigger,
+            source_id: SourceId("missing".to_owned()),
+            trigger_ordinal: None,
+            label: String::new(),
+            note: String::new(),
+            pinned: false,
+            selected: false,
+        });
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::DanglingReference(_))
+        ));
+
+        let mut invalid = document();
+        invalid.captures = (0..2)
+            .map(|index| ProjectCaptureRef {
+                id: CaptureId(format!("capture-{index}")),
+                origin: ProjectCaptureOrigin::RecordingTrigger,
+                source_id: SourceId("source-main".to_owned()),
+                trigger_ordinal: None,
+                label: String::new(),
+                note: String::new(),
+                pinned: false,
+                selected: true,
+            })
+            .collect();
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+
+        let mut invalid = document();
+        invalid.export.annotations.push(ProjectAnnotation {
+            kind: ProjectAnnotationKind::Text,
+            text: "bad".to_owned(),
+            points: vec![[1.1, 0.0]],
+            color: [0, 0, 0, 255],
+            width: 1.0,
+        });
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+
+        let mut invalid = document();
+        invalid.export.annotations.push(ProjectAnnotation {
+            kind: ProjectAnnotationKind::Arrow,
+            text: String::new(),
+            points: vec![[0.0, 0.0]],
+            color: [0, 0, 0, 255],
+            width: 0.0,
+        });
+        invalid.export.canvas_width = 100;
+        invalid.export.canvas_height = 100;
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
+
+        let mut invalid = document();
+        invalid.export.annotations.push(ProjectAnnotation {
+            kind: ProjectAnnotationKind::Rectangle,
+            text: String::new(),
+            points: vec![[0.0, 0.0]],
+            color: [0, 0, 0, 255],
+            width: 1.0,
+        });
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidField(_))
+        ));
     }
 }

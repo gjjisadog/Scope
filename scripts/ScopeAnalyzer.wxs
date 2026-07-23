@@ -4,7 +4,7 @@
     Id="*"
     Name="Scope Analyzer"
     Language="1033"
-    Version="0.11.0"
+    Version="0.12.0"
     Manufacturer="Scope"
     UpgradeCode="{8C47D14B-9AA6-4F93-89C8-1B2D66B70B94}">
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="x64" />
@@ -47,8 +47,16 @@
             Advertise="yes" />
         </File>
       </Component>
+      <Component Id="ScopeCliExecutable" Directory="INSTALLFOLDER" Guid="{D59C2A72-DF7D-4E16-907C-2BE8D0F5BF4C}" Win64="yes">
+        <File Id="ScopeCliExe" Source="$(var.StageDir)\scope-cli.exe" KeyPath="yes" />
+      </Component>
       <Component Id="ReadmeFile" Directory="INSTALLFOLDER" Guid="{FDB844CE-DF49-43D7-85AB-AEFC68110067}" Win64="yes">
         <File Id="ReadmeTxt" Source="$(var.StageDir)\README.txt" KeyPath="yes" />
+      </Component>
+      <Component Id="BuildEvidence" Directory="INSTALLFOLDER" Guid="{B9D0BDFB-41A1-4B30-BF7F-AC0BD9D604D6}" Win64="yes">
+        <File Id="BuildProvenanceJson" Source="$(var.StageDir)\build-provenance.json" KeyPath="yes" />
+        <File Id="SbomCdxJson" Source="$(var.StageDir)\sbom.cdx.json" />
+        <File Id="ThirdPartyNotices" Source="$(var.StageDir)\THIRD-PARTY-NOTICES.txt" />
       </Component>
       <Component Id="StartScript" Directory="INSTALLFOLDER" Guid="{43437FD8-35E2-4B95-A555-B0FD2471E5C0}" Win64="yes">
         <File Id="StartScopeAnalyzerBat" Source="$(var.StageDir)\Start-ScopeAnalyzer.bat" KeyPath="yes" />
@@ -75,6 +83,7 @@
         <File Id="MesaLibEglDll" Source="$(var.StageDir)\mesa\libEGL.dll" />
         <File Id="MesaLibGlesV2Dll" Source="$(var.StageDir)\mesa\libGLESv2.dll" />
         <File Id="MesaLibGlesV1Dll" Source="$(var.StageDir)\mesa\libGLESv1_CM.dll" />
+        <File Id="MesaRuntimeManifestFile" Source="$(var.StageDir)\mesa\mesa-runtime-manifest.json" />
         <?if $(var.IncludeLibUnwind) = "true" ?>
         <File Id="MesaLibUnwindDllFile" Source="$(var.StageDir)\mesa\libunwind.dll" />
         <?endif?>

@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use std::{fs, path::Path};
 
 use crate::png_export::{ClipRect, Rgba, StrokeStyle, TextStyle, WaveformCanvas};
