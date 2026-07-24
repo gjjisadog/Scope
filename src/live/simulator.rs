@@ -18,16 +18,21 @@ use super::protocol::{
     MSG_PING, MSG_START, MSG_STOP,
 };
 use super::protocol_v2::{
-    ArmCapture, CaptureBegin, CaptureData, CaptureEnd, CapturePhase, CaptureState, CaptureStatus,
-    ConfigureStream, MessageV2, SampleDomain, StreamChannelBinding, StreamDescriptor,
-    StreamSampleBatch, StreamTable, CAPABILITY_V2_STREAMS,
+    capture_integrity_summary, ArmCapture, CaptureBegin, CaptureData, CaptureEnd, CapturePhase,
+    CaptureState, CaptureStatus, ConfigureStream, MessageV2, SampleDomain, StreamChannelBinding,
+    StreamDescriptor, StreamSampleBatch, StreamTable, CAPABILITY_V2_STREAMS,
 };
 use super::snapshot::{
     SnapshotMeta, ADC_SAMPLE_VALID, APPLIED_SEQUENCE_VALID, CLA_RESULT_VALID, FROZEN_ROW,
     SNAPSHOT_VALID, SOURCE_SEQUENCE_VALID,
 };
 
-const SIMULATOR_TICK_HZ: u64 = 1_000_000;
+/// Frozen V1 simulator clock. Keep this separate so V2 hardening does not
+/// alter the existing V1 simulator timing path.
+const V1_SIMULATOR_TICK_HZ: u64 = 1_000_000;
+/// All V2 fixed domains divide this clock exactly: 32 kHz -> 1000 ticks,
+/// 8 kHz -> 4000 ticks, and 1 kHz -> 32000 ticks.
+const V2_SIMULATOR_TICK_HZ: u64 = 32_000_000;
 const SIMULATOR_SESSION_ID: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -132,9 +137,13 @@ impl Default for SimulatorConfig {
 
 impl SimulatorConfig {
     pub fn validate(&self) -> Result<(), SimulatorError> {
-        if self.sample_rate_hz == 0 || self.sample_rate_hz as u64 > SIMULATOR_TICK_HZ {
+        let tick_hz = match self.protocol {
+            SimulatorProtocol::V1 => V1_SIMULATOR_TICK_HZ,
+            SimulatorProtocol::V2 => V2_SIMULATOR_TICK_HZ,
+        };
+        if self.sample_rate_hz == 0 || self.sample_rate_hz as u64 > tick_hz {
             return Err(SimulatorError::InvalidConfig(format!(
-                "sample rate must be within 1..={SIMULATOR_TICK_HZ}"
+                "sample rate must be within 1..={tick_hz}"
             )));
         }
         if self.batch_samples == 0 || self.batch_samples > 4096 {
@@ -464,6 +473,9 @@ fn serve_v2_client(
     let mut row_sequence = 1_u64;
     let mut emitted_batches = 0_u64;
     let mut armed_capture: Option<ArmCapture> = None;
+    let mut session_established = false;
+    let mut last_ping = Instant::now();
+    let mut ping_nonce = 1_u64;
     let channels = v2_channel_table();
     let streams = v2_stream_table();
     let preset = config.preset.unwrap_or(V2Preset::Normal30k);
@@ -507,6 +519,12 @@ fn serve_v2_client(
                                 &mut out_sequence,
                                 MessageV2::StreamTable(streams.clone()),
                             )?;
+                            send_v2_common(
+                                &mut stream,
+                                &mut out_sequence,
+                                status_message(DeviceState::Idle, 0),
+                            )?;
+                            session_established = true;
                         }
                         super::protocol_v2::MSG_CONFIGURE_STREAM => {
                             let Ok(MessageV2::ConfigureStream(request)) =
@@ -536,6 +554,11 @@ fn serve_v2_client(
                                             result_code: ResultCode::Ok,
                                             detail: "ok".to_owned(),
                                         }),
+                                    )?;
+                                    send_v2_common(
+                                        &mut stream,
+                                        &mut out_sequence,
+                                        status_message(DeviceState::Configured, emitted_batches),
                                     )?;
                                 }
                                 Err(error) => send_v2_common(
@@ -568,6 +591,13 @@ fn serve_v2_client(
                                         .to_owned(),
                                 }),
                             )?;
+                            if streaming {
+                                send_v2_common(
+                                    &mut stream,
+                                    &mut out_sequence,
+                                    status_message(DeviceState::Streaming, emitted_batches),
+                                )?;
+                            }
                         }
                         MSG_STOP => {
                             update_stats(stats, |value| {
@@ -583,6 +613,11 @@ fn serve_v2_client(
                                     detail: "ok".to_owned(),
                                 }),
                             )?;
+                            send_v2_common(
+                                &mut stream,
+                                &mut out_sequence,
+                                status_message(DeviceState::Configured, emitted_batches),
+                            )?;
                         }
                         MSG_PING => {
                             if let Ok(Message::Ping(nonce)) =
@@ -593,6 +628,13 @@ fn serve_v2_client(
                                     &mut out_sequence,
                                     Message::Pong(nonce),
                                 )?;
+                            }
+                        }
+                        super::protocol::MSG_PONG => {
+                            if Message::decode(frame.message_type, &frame.payload).is_ok() {
+                                update_stats(stats, |value| {
+                                    value.pongs_received = value.pongs_received.saturating_add(1)
+                                });
                             }
                         }
                         super::protocol_v2::MSG_ARM_CAPTURE => {
@@ -707,8 +749,11 @@ fn serve_v2_client(
                 }
                 batch.first_row_sequence = batch.row_metadata[0].row_sequence;
             }
+            let timestamp_ticks = row_sequence
+                .checked_mul(u64::from(batch.sample_period_ticks))
+                .ok_or_else(|| SimulatorError::InvalidConfig("V2 timestamp overflow".to_owned()))?;
             let mut frame = MessageV2::StreamSampleBatch(batch)
-                .into_frame(0, out_sequence, SIMULATOR_SESSION_ID, row_sequence)
+                .into_frame(0, out_sequence, SIMULATOR_SESSION_ID, timestamp_ticks)
                 .map_err(|error| SimulatorError::InvalidConfig(error.to_string()))?;
             if preset == V2Preset::PhaseMismatch30k {
                 frame.payload[7] = CapturePhase::ControlCycleEnd as u8;
@@ -737,6 +782,14 @@ fn serve_v2_client(
             } else {
                 thread::yield_now();
             }
+        }
+        if session_established && last_ping.elapsed() >= Duration::from_secs(1) {
+            send_v2_common(&mut stream, &mut out_sequence, Message::Ping(ping_nonce))?;
+            update_stats(stats, |value| {
+                value.pings_sent = value.pings_sent.saturating_add(1)
+            });
+            ping_nonce = ping_nonce.wrapping_add(1);
+            last_ping = Instant::now();
         }
     }
     Ok(())
@@ -886,7 +939,7 @@ fn v2_hello_ack(table: &ChannelTable) -> HelloAck {
     HelloAck {
         device_capabilities: CAPABILITY_V2_STREAMS,
         max_payload: MAX_PAYLOAD_LEN as u32,
-        tick_hz: SIMULATOR_TICK_HZ,
+        tick_hz: V2_SIMULATOR_TICK_HZ,
         channel_count: table.channels.len() as u16,
         max_batch_samples: 4096,
         device_id: *b"SCOPE-SIM-V2----",
@@ -955,11 +1008,12 @@ fn v2_sample_batch(
         capture_phase: descriptor.capture_phase,
         consistency_group: descriptor.consistency_group,
         first_row_sequence,
-        sample_period_ticks: match descriptor.domain {
-            SampleDomain::Fast32k => 31,
-            SampleDomain::Control8k => 125,
-            SampleDomain::Slow1k => 1_000,
-        },
+        sample_period_ticks: u32::try_from(
+            V2_SIMULATOR_TICK_HZ / u64::from(descriptor.sample_rate_hz),
+        )
+        .map_err(|_| {
+            SimulatorError::InvalidConfig("V2 sample period does not fit u32".to_owned())
+        })?,
         row_count: configure.batch_samples,
         channel_ids,
         sample_data,
@@ -1056,6 +1110,14 @@ fn upload_simulated_capture(
         block_index: 1,
         batch: second,
     });
+    let integrity_blocks = match (&first_data, &second_data) {
+        (MessageV2::CaptureData(first), MessageV2::CaptureData(second)) => {
+            vec![first.clone(), second.clone()]
+        }
+        _ => unreachable!("capture data variants are constructed above"),
+    };
+    let integrity_summary = capture_integrity_summary(capture.capture_id, &integrity_blocks)
+        .map_err(|error| SimulatorError::InvalidConfig(error.to_string()))?;
     match preset {
         V2Preset::CaptureChunkLoss30k => send_v2_message(stream, out_sequence, second_data)?,
         V2Preset::CaptureChunkReorder30k => {
@@ -1077,7 +1139,7 @@ fn upload_simulated_capture(
             dropped_rows: 0,
             total_blocks: 2,
             total_samples: 2,
-            integrity_summary: 0x5343_5031,
+            integrity_summary,
         }),
     )
 }
@@ -1086,7 +1148,7 @@ fn simulator_hello_ack(table: &ChannelTable) -> HelloAck {
     HelloAck {
         device_capabilities: 0,
         max_payload: MAX_PAYLOAD_LEN as u32,
-        tick_hz: SIMULATOR_TICK_HZ,
+        tick_hz: V1_SIMULATOR_TICK_HZ,
         channel_count: table.channels.len() as u16,
         max_batch_samples: 4096,
         device_id: *b"SCOPE-SIM-V1----",
@@ -1130,10 +1192,10 @@ fn sample_frame(
             "configured channel mask is empty".to_owned(),
         ));
     }
-    let sample_period_ticks =
-        u32::try_from(SIMULATOR_TICK_HZ / u64::from(configure.sample_rate_hz)).map_err(|_| {
-            SimulatorError::InvalidConfig("sample period does not fit u32".to_owned())
-        })?;
+    let sample_period_ticks = u32::try_from(
+        V1_SIMULATOR_TICK_HZ / u64::from(configure.sample_rate_hz),
+    )
+    .map_err(|_| SimulatorError::InvalidConfig("sample period does not fit u32".to_owned()))?;
     if sample_period_ticks == 0 {
         return Err(SimulatorError::InvalidConfig(
             "sample period rounded to zero".to_owned(),

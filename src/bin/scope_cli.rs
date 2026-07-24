@@ -292,6 +292,11 @@ struct V2DiagnosticReport {
     source_sequence_faults: u64,
     applied_sequence_faults: u64,
     invalid_snapshot_rows: u64,
+    missing_causal_source: u64,
+    causal_source_mismatch: u64,
+    causal_application_mismatch: u64,
+    causal_sequence_reorder: u64,
+    causal_group_mismatch: u64,
     capture_complete: bool,
     capture_missing_chunks: u32,
     capture_duplicate_chunks: u32,
@@ -432,6 +437,13 @@ fn inspect_v2_live(
                     .row_count
                     .saturating_add(batch.row_metadata.len() as u64);
                 copy_snapshot_diagnostics(&mut report, diagnostics);
+                if v2_report_has_failure(&report) {
+                    let _ = session.disconnect();
+                    return Err(CliError::Input(
+                        "V2 snapshot diagnostics reported a protocol or causal contract failure"
+                            .to_owned(),
+                    ));
+                }
                 if report.row_count >= u64::from(rows) {
                     let _ = session.disconnect();
                     return Ok(report);
@@ -520,6 +532,21 @@ fn inspect_v2_capture(
                 let _ = session.disconnect();
                 return Ok(report);
             }
+            SessionEvent::CaptureFailure(error) => return Err(CliError::Input(error)),
+            SessionEvent::CaptureStatus(status)
+                if !matches!(
+                    status.state,
+                    scope_analyzer::live::protocol_v2::CaptureState::Armed
+                        | scope_analyzer::live::protocol_v2::CaptureState::Triggered
+                        | scope_analyzer::live::protocol_v2::CaptureState::PostCapture
+                        | scope_analyzer::live::protocol_v2::CaptureState::Uploading
+                ) =>
+            {
+                return Err(CliError::Input(format!(
+                    "V2 capture ended in device state {:?}",
+                    status.state
+                )))
+            }
             SessionEvent::Error(error) => return Err(CliError::Input(error)),
             _ => {}
         }
@@ -543,6 +570,11 @@ fn empty_v2_report(stream_id: u16) -> V2DiagnosticReport {
         source_sequence_faults: 0,
         applied_sequence_faults: 0,
         invalid_snapshot_rows: 0,
+        missing_causal_source: 0,
+        causal_source_mismatch: 0,
+        causal_application_mismatch: 0,
+        causal_sequence_reorder: 0,
+        causal_group_mismatch: 0,
         capture_complete: false,
         capture_missing_chunks: 0,
         capture_duplicate_chunks: 0,
@@ -559,6 +591,24 @@ fn copy_snapshot_diagnostics(
     report.source_sequence_faults = diagnostics.source_sequence_faults;
     report.applied_sequence_faults = diagnostics.applied_sequence_faults;
     report.invalid_snapshot_rows = diagnostics.invalid_snapshot_rows;
+    report.missing_causal_source = diagnostics.missing_causal_source;
+    report.causal_source_mismatch = diagnostics.causal_source_mismatch;
+    report.causal_application_mismatch = diagnostics.causal_application_mismatch;
+    report.causal_sequence_reorder = diagnostics.causal_sequence_reorder;
+    report.causal_group_mismatch = diagnostics.causal_group_mismatch;
+}
+
+fn v2_report_has_failure(report: &V2DiagnosticReport) -> bool {
+    report.row_sequence_gaps != 0
+        || report.row_sequence_reorders != 0
+        || report.source_sequence_faults != 0
+        || report.applied_sequence_faults != 0
+        || report.invalid_snapshot_rows != 0
+        || report.missing_causal_source != 0
+        || report.causal_source_mismatch != 0
+        || report.causal_application_mismatch != 0
+        || report.causal_sequence_reorder != 0
+        || report.causal_group_mismatch != 0
 }
 
 fn parse_args<I, S>(args: I) -> Result<CliArgs, CliError>

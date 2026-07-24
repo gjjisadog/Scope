@@ -561,6 +561,7 @@ impl LiveScopeState {
             }
             SessionEvent::CaptureStatus(status) => self.v2_capture_status = Some(status),
             SessionEvent::CaptureComplete(capture) => self.v2_last_capture = Some(capture),
+            SessionEvent::CaptureFailure(error) => self.last_error = Some(error),
             SessionEvent::Gap(_) => {
                 // Gap detection and live-ring mutation occur in the acquisition worker.
             }
@@ -746,7 +747,9 @@ mod tests {
     fn simulator_acquisition_records_and_replays() {
         let simulator = SimulatorHandle::spawn(SimulatorConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
-            accelerated: true,
+            // A paced producer exercises the same V1 recording path without
+            // saturating the TCP peer before the UI has drained its events.
+            accelerated: false,
             ..SimulatorConfig::default()
         })
         .unwrap();
