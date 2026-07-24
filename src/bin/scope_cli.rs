@@ -1,8 +1,22 @@
-use std::{collections::BTreeMap, fs, path::Path, process::ExitCode};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::Path,
+    process::ExitCode,
+    time::{Duration, Instant},
+};
 
 use scope_analyzer::{
     compare::{compare, AlignmentSpec, CompareRequest, Series, SeriesSegment, Tolerance},
     data::{CsvDataSource, DataSource},
+    live::{
+        protocol_v2::{
+            ArmCapture, CaptureEdge, CaptureTrigger, CaptureTriggerKind, ConfigureStream,
+            ManualTrigger,
+        },
+        session::{LiveSession, SessionEvent},
+        transport::TransportConfig,
+    },
     measurements::{analyze_segments, ChannelMeasurementSpec},
     rules::{evaluate, evaluate_series, MetricSample, RuleEvaluation, RuleSpec},
 };
@@ -103,6 +117,12 @@ struct CliErrorPayload {
 
 fn main() -> ExitCode {
     let raw_args = std::env::args().skip(1).collect::<Vec<_>>();
+    if matches!(
+        raw_args.first().map(String::as_str),
+        Some("live-inspect" | "capture-inspect")
+    ) {
+        return run_v2_diagnostic_command(raw_args);
+    }
     let command_hint = command_hint(raw_args.first().map(String::as_str));
     let args = match parse_args(raw_args) {
         Ok(args) => args,
@@ -257,6 +277,288 @@ fn print_error_envelope(command: &'static str, code: &'static str, error: CliErr
         "{}",
         serde_json::to_string(&envelope).expect("error result is serializable")
     );
+}
+
+#[derive(Serialize)]
+struct V2DiagnosticReport {
+    protocol_version: u8,
+    stream_id: u16,
+    domain: String,
+    capture_phase: String,
+    consistency_group: u16,
+    row_count: u64,
+    row_sequence_gaps: u64,
+    row_sequence_reorders: u64,
+    source_sequence_faults: u64,
+    applied_sequence_faults: u64,
+    invalid_snapshot_rows: u64,
+    capture_complete: bool,
+    capture_missing_chunks: u32,
+    capture_duplicate_chunks: u32,
+    capture_reordered_chunks: u32,
+}
+
+fn run_v2_diagnostic_command(raw_args: Vec<String>) -> ExitCode {
+    let command = raw_args.first().map(String::as_str).unwrap_or("unknown");
+    let parsed = parse_v2_diagnostic_args(&raw_args[1..]);
+    let result = parsed.and_then(|(address, stream_id, rows)| {
+        if command == "live-inspect" {
+            inspect_v2_live(&address, stream_id, rows)
+        } else {
+            inspect_v2_capture(&address, stream_id, rows)
+        }
+    });
+    match result {
+        Ok(report) => {
+            let envelope = SuccessEnvelope {
+                schema_version: CLI_SCHEMA_VERSION,
+                command,
+                ok: true,
+                result: report,
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&envelope).expect("diagnostic JSON")
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("scope-cli: {error}");
+            let (code, exit_code) = error_code_and_exit(&error);
+            print_error_envelope(
+                match command {
+                    "live-inspect" => "live-inspect",
+                    _ => "capture-inspect",
+                },
+                code,
+                error,
+            );
+            ExitCode::from(exit_code)
+        }
+    }
+}
+
+fn parse_v2_diagnostic_args(args: &[String]) -> Result<(String, u16, u16), CliError> {
+    let mut address = None;
+    let mut stream_id = 1_u16;
+    let mut rows = 16_u16;
+    let mut values = args.iter();
+    while let Some(argument) = values.next() {
+        match argument.as_str() {
+            "--address" => address = Some(next_v2_argument(&mut values, "--address")?),
+            "--stream-id" => {
+                stream_id = next_v2_argument(&mut values, "--stream-id")?
+                    .parse()
+                    .map_err(|_| CliError::Usage("--stream-id must be a u16".to_owned()))?
+            }
+            "--rows" => {
+                rows = next_v2_argument(&mut values, "--rows")?
+                    .parse()
+                    .map_err(|_| CliError::Usage("--rows must be a u16".to_owned()))?;
+                if rows == 0 {
+                    return Err(CliError::Usage("--rows must be non-zero".to_owned()));
+                }
+            }
+            value => {
+                return Err(CliError::Usage(format!(
+                    "unknown diagnostic argument {value}"
+                )))
+            }
+        }
+    }
+    Ok((
+        address.ok_or_else(|| {
+            CliError::Usage("diagnostic command requires --address <host:port>".to_owned())
+        })?,
+        stream_id,
+        rows,
+    ))
+}
+
+fn next_v2_argument<'a>(
+    values: &mut impl Iterator<Item = &'a String>,
+    flag: &str,
+) -> Result<String, CliError> {
+    values
+        .next()
+        .cloned()
+        .ok_or_else(|| CliError::Usage(format!("{flag} needs a value")))
+}
+
+fn inspect_v2_live(
+    address: &str,
+    stream_id: u16,
+    rows: u16,
+) -> Result<V2DiagnosticReport, CliError> {
+    let session = LiveSession::connect_v2(TransportConfig::Tcp {
+        address: address.to_owned(),
+    })
+    .map_err(|error| CliError::Input(error.to_string()))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut configured = false;
+    let mut report = empty_v2_report(stream_id);
+    while Instant::now() < deadline {
+        let event = session
+            .recv_timeout(Duration::from_millis(100))
+            .map_err(|error| CliError::Input(error.to_string()))?;
+        match event {
+            SessionEvent::StreamTable(table) => {
+                let descriptor = table.stream(stream_id).ok_or_else(|| {
+                    CliError::Input(format!("stream {stream_id} is absent from STREAM_TABLE"))
+                })?;
+                report.domain = format!("{:?}", descriptor.domain);
+                report.capture_phase = format!("{:?}", descriptor.capture_phase);
+                report.consistency_group = descriptor.consistency_group;
+                let mask = descriptor
+                    .channel_ids
+                    .iter()
+                    .fold(0_u64, |mask, id| mask | (1_u64 << id));
+                session
+                    .configure_stream(ConfigureStream {
+                        stream_id,
+                        batch_samples: rows,
+                        channel_mask: mask,
+                    })
+                    .map_err(|error| CliError::Input(error.to_string()))?;
+                configured = true;
+            }
+            SessionEvent::ConfiguredV2(_) if configured => {
+                session
+                    .start()
+                    .map_err(|error| CliError::Input(error.to_string()))?;
+            }
+            SessionEvent::SnapshotV2(batch, diagnostics) => {
+                report.row_count = report
+                    .row_count
+                    .saturating_add(batch.row_metadata.len() as u64);
+                copy_snapshot_diagnostics(&mut report, diagnostics);
+                if report.row_count >= u64::from(rows) {
+                    let _ = session.disconnect();
+                    return Ok(report);
+                }
+            }
+            SessionEvent::Error(error) => return Err(CliError::Input(error)),
+            _ => {}
+        }
+    }
+    let _ = session.disconnect();
+    Err(CliError::Input(
+        "timed out waiting for a V2 sample batch".to_owned(),
+    ))
+}
+
+fn inspect_v2_capture(
+    address: &str,
+    stream_id: u16,
+    rows: u16,
+) -> Result<V2DiagnosticReport, CliError> {
+    let session = LiveSession::connect_v2(TransportConfig::Tcp {
+        address: address.to_owned(),
+    })
+    .map_err(|error| CliError::Input(error.to_string()))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut armed = false;
+    let mut report = empty_v2_report(stream_id);
+    while Instant::now() < deadline {
+        let event = session
+            .recv_timeout(Duration::from_millis(100))
+            .map_err(|error| CliError::Input(error.to_string()))?;
+        match event {
+            SessionEvent::StreamTable(table) => {
+                let descriptor = table.stream(stream_id).ok_or_else(|| {
+                    CliError::Input(format!("stream {stream_id} is absent from STREAM_TABLE"))
+                })?;
+                report.domain = format!("{:?}", descriptor.domain);
+                report.capture_phase = format!("{:?}", descriptor.capture_phase);
+                report.consistency_group = descriptor.consistency_group;
+                let mask = descriptor
+                    .channel_ids
+                    .iter()
+                    .fold(0_u64, |mask, id| mask | (1_u64 << id));
+                session
+                    .configure_stream(ConfigureStream {
+                        stream_id,
+                        batch_samples: rows,
+                        channel_mask: mask,
+                    })
+                    .map_err(|error| CliError::Input(error.to_string()))?;
+            }
+            SessionEvent::ConfiguredV2(_) if !armed => {
+                session
+                    .arm_capture(ArmCapture {
+                        capture_id: 1,
+                        stream_id,
+                        pretrigger_rows: 1,
+                        posttrigger_rows: 1,
+                        timeout_samples: u32::from(rows).saturating_mul(10),
+                        trigger: CaptureTrigger {
+                            kind: CaptureTriggerKind::Manual,
+                            channel_id: 0,
+                            level: 0.0,
+                            edge: CaptureEdge::Rising,
+                            hysteresis: 0.0,
+                            flag_mask: 0,
+                            flag_value: 0,
+                        },
+                    })
+                    .map_err(|error| CliError::Input(error.to_string()))?;
+                session
+                    .manual_trigger(ManualTrigger { capture_id: 1 })
+                    .map_err(|error| CliError::Input(error.to_string()))?;
+                armed = true;
+            }
+            SessionEvent::CaptureComplete(capture) => {
+                report.capture_complete = capture.diagnostics.capture_complete;
+                report.capture_missing_chunks = capture.diagnostics.capture_missing_chunks;
+                report.capture_duplicate_chunks = capture.diagnostics.capture_duplicate_chunks;
+                report.capture_reordered_chunks = capture.diagnostics.capture_reordered_chunks;
+                report.row_count = capture
+                    .blocks
+                    .iter()
+                    .map(|batch| u64::from(batch.row_count))
+                    .sum();
+                let _ = session.disconnect();
+                return Ok(report);
+            }
+            SessionEvent::Error(error) => return Err(CliError::Input(error)),
+            _ => {}
+        }
+    }
+    let _ = session.disconnect();
+    Err(CliError::Input(
+        "timed out waiting for a V2 hardware capture".to_owned(),
+    ))
+}
+
+fn empty_v2_report(stream_id: u16) -> V2DiagnosticReport {
+    V2DiagnosticReport {
+        protocol_version: 2,
+        stream_id,
+        domain: String::new(),
+        capture_phase: String::new(),
+        consistency_group: 0,
+        row_count: 0,
+        row_sequence_gaps: 0,
+        row_sequence_reorders: 0,
+        source_sequence_faults: 0,
+        applied_sequence_faults: 0,
+        invalid_snapshot_rows: 0,
+        capture_complete: false,
+        capture_missing_chunks: 0,
+        capture_duplicate_chunks: 0,
+        capture_reordered_chunks: 0,
+    }
+}
+
+fn copy_snapshot_diagnostics(
+    report: &mut V2DiagnosticReport,
+    diagnostics: scope_analyzer::live::snapshot::SnapshotDiagnostics,
+) {
+    report.row_sequence_gaps = diagnostics.row_sequence_gaps;
+    report.row_sequence_reorders = diagnostics.row_sequence_reorders;
+    report.source_sequence_faults = diagnostics.source_sequence_faults;
+    report.applied_sequence_faults = diagnostics.applied_sequence_faults;
+    report.invalid_snapshot_rows = diagnostics.invalid_snapshot_rows;
 }
 
 fn parse_args<I, S>(args: I) -> Result<CliArgs, CliError>
@@ -820,12 +1122,14 @@ impl RuleMetricsInput {
 }
 
 fn load_rule_metrics(path: &str) -> Result<RuleMetricsInput, CliError> {
-    let text = fs::read_to_string(path).map_err(|error| CliError::Input(format!("{path}: {error}")))?;
+    let text =
+        fs::read_to_string(path).map_err(|error| CliError::Input(format!("{path}: {error}")))?;
     serde_json::from_str(&text).map_err(|error| CliError::Input(format!("{path}: {error}")))
 }
 
 fn load_rule_specs(path: &str) -> Result<Vec<RuleSpec>, CliError> {
-    let text = fs::read_to_string(path).map_err(|error| CliError::Input(format!("{path}: {error}")))?;
+    let text =
+        fs::read_to_string(path).map_err(|error| CliError::Input(format!("{path}: {error}")))?;
     let value = serde_json::from_str::<serde_json::Value>(&text)
         .map_err(|error| CliError::Input(format!("{path}: {error}")))?;
     if value.is_array() {
@@ -1347,7 +1651,10 @@ mod tests {
         let result = metrics.evaluate(&[rule]).unwrap();
 
         assert!(result.passed);
-        assert_eq!(result.outcomes[0].evidence.as_ref().unwrap().sample_count, 2);
+        assert_eq!(
+            result.outcomes[0].evidence.as_ref().unwrap().sample_count,
+            2
+        );
         assert_eq!(metrics.key_measurements().get("rms"), Some(&0.3));
     }
 

@@ -1198,6 +1198,7 @@ impl ScopeApp {
     fn live_diagnostics_inspector(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new(self.live_text("链路健康", "Link health")).strong());
         self.live_stats_grid(ui, false);
+        self.live_v2_diagnostics(ui);
         ui.separator();
         ui.label(RichText::new(self.live_text("录波", "Recording")).strong());
         let recording = self.live.recording_stats();
@@ -1820,6 +1821,57 @@ impl ScopeApp {
                         ui.end_row();
                     }
                 }
+            });
+    }
+
+    /// Compact developer-only V2 visibility. It deliberately presents the
+    /// DSP-provided row instead of trying to merge variables across domains.
+    fn live_v2_diagnostics(&self, ui: &mut egui::Ui) {
+        let Some(table) = &self.live.v2_stream_table else {
+            return;
+        };
+        ui.separator();
+        ui.label(RichText::new("SCP1 V2 developer diagnostics").strong());
+        egui::Grid::new("live_v2_snapshot_diagnostics")
+            .num_columns(2)
+            .spacing([12.0, 4.0])
+            .show(ui, |ui| {
+                for stream in &table.streams {
+                    ui.label(format!("Stream {}", stream.stream_id));
+                    ui.label(format!(
+                        "{:?} · {:?} · group {}",
+                        stream.domain, stream.capture_phase, stream.consistency_group
+                    ));
+                    ui.end_row();
+                }
+                if let Some(batch) = &self.live.v2_last_snapshot {
+                    if let Some(row) = batch.row_metadata.last() {
+                        ui.label("Row / Source / Applied");
+                        ui.label(format!(
+                            "{} / {} / {} (flags 0x{:08x})",
+                            row.row_sequence,
+                            row.source_sequence,
+                            row.applied_sequence,
+                            row.valid_flags
+                        ));
+                        ui.end_row();
+                    }
+                }
+                let diagnostics = &self.live.v2_snapshot_diagnostics;
+                ui.label("V2 gaps / reorders");
+                ui.label(format!(
+                    "{} / {}",
+                    diagnostics.row_sequence_gaps, diagnostics.row_sequence_reorders
+                ));
+                ui.end_row();
+                ui.label("V2 source / applied / invalid");
+                ui.label(format!(
+                    "{} / {} / {}",
+                    diagnostics.source_sequence_faults,
+                    diagnostics.applied_sequence_faults,
+                    diagnostics.invalid_snapshot_rows
+                ));
+                ui.end_row();
             });
     }
 

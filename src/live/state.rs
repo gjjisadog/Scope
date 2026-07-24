@@ -11,9 +11,12 @@ use crate::presentation::ChannelPresentation;
 use super::{
     buffer::{LiveBuffer, LiveSnapshot, SnapshotSegment},
     capture_history::{CaptureHistory, CapturePayload},
+    hardware_capture::AssembledCapture,
     protocol::{validate_configure_for_device, ChannelTable, Configure, HelloAck, ResultCode},
+    protocol_v2::{CaptureStatus, DecodedStreamSampleBatch, StreamTable},
     recording::{AsyncScopeRecorder, RecordingMetadata, RecordingStats},
     session::{AcquisitionConfig, ConnectionState, LiveSession, SessionEvent, SessionStats},
+    snapshot::SnapshotDiagnostics,
     transport::TransportConfig,
     trigger::{TriggerCapture, TriggerConfig, TriggerEngine, TriggerMode},
 };
@@ -31,6 +34,13 @@ pub struct LiveScopeState {
     pub connection_state: ConnectionState,
     pub hello_ack: Option<HelloAck>,
     pub channel_table: Option<ChannelTable>,
+    /// V2-only diagnostics. Kept separate so the default V1 workspace and
+    /// `.scope` V1 recording path never reinterpret multi-domain rows.
+    pub v2_stream_table: Option<StreamTable>,
+    pub v2_last_snapshot: Option<DecodedStreamSampleBatch>,
+    pub v2_snapshot_diagnostics: SnapshotDiagnostics,
+    pub v2_capture_status: Option<CaptureStatus>,
+    pub v2_last_capture: Option<AssembledCapture>,
     pub acquisition: Configure,
     pub configuration_applied: bool,
     pub history_seconds: u32,
@@ -64,6 +74,11 @@ impl Default for LiveScopeState {
             connection_state: ConnectionState::Disconnected,
             hello_ack: None,
             channel_table: None,
+            v2_stream_table: None,
+            v2_last_snapshot: None,
+            v2_snapshot_diagnostics: SnapshotDiagnostics::default(),
+            v2_capture_status: None,
+            v2_last_capture: None,
             acquisition: Configure {
                 sample_rate_hz: 500,
                 batch_samples: 10,
@@ -514,6 +529,7 @@ impl LiveScopeState {
                 self.channel_table = Some(table);
                 self.configuration_applied = false;
             }
+            SessionEvent::StreamTable(table) => self.v2_stream_table = Some(table),
             SessionEvent::Configured(configure) => {
                 self.acquisition = configure;
                 self.configuration_applied = true;
@@ -526,6 +542,7 @@ impl LiveScopeState {
                         .map_err(error_string)?;
                 }
             }
+            SessionEvent::ConfiguredV2(_) => self.configuration_applied = true,
             SessionEvent::CommandResult(result) => {
                 if result.result_code != ResultCode::Ok {
                     self.start_after_configure = false;
@@ -538,6 +555,12 @@ impl LiveScopeState {
             SessionEvent::Batch(_) => {
                 return Err("received an unprocessed live batch on the UI path".to_owned());
             }
+            SessionEvent::SnapshotV2(snapshot, diagnostics) => {
+                self.v2_last_snapshot = Some(snapshot);
+                self.v2_snapshot_diagnostics = diagnostics;
+            }
+            SessionEvent::CaptureStatus(status) => self.v2_capture_status = Some(status),
+            SessionEvent::CaptureComplete(capture) => self.v2_last_capture = Some(capture),
             SessionEvent::Gap(_) => {
                 // Gap detection and live-ring mutation occur in the acquisition worker.
             }
@@ -771,7 +794,10 @@ mod tests {
         wait_until(&mut state, |state| {
             state.recording_stats().sample_frames >= 3
         });
-        assert!(state.recording_pending_records() <= 128);
+        // `AsyncScopeRecorder` uses the production 1024-record bounded
+        // ingress queue; this checks that UI polling never observes more than
+        // the documented queue capacity.
+        assert!(state.recording_pending_records() <= 1_024);
         state.stop().unwrap();
         wait_until(&mut state, |state| {
             state.connection_state == ConnectionState::Ready

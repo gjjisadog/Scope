@@ -1,6 +1,8 @@
 use std::{process::ExitCode, thread, time::Duration};
 
-use scope_analyzer::live::simulator::{SimulatorConfig, SimulatorHandle};
+use scope_analyzer::live::simulator::{
+    SimulatorConfig, SimulatorHandle, SimulatorProtocol, V2Preset,
+};
 
 fn main() -> ExitCode {
     let config = match parse_args(std::env::args().skip(1)) {
@@ -36,6 +38,19 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Simulator
         match argument.as_str() {
             "-h" | "--help" => return Ok(None),
             "--accelerated" => config.accelerated = true,
+            "--protocol" => {
+                config.protocol = match parse_value::<String>(&mut args, "--protocol")?.as_str() {
+                    "v1" => SimulatorProtocol::V1,
+                    "v2" => SimulatorProtocol::V2,
+                    value => return Err(format!("invalid --protocol {value}; expected v1 or v2")),
+                }
+            }
+            "--preset" => {
+                let value = parse_value::<String>(&mut args, "--preset")?;
+                config.preset = Some(
+                    V2Preset::parse(&value).ok_or_else(|| format!("unknown V2 preset {value}"))?,
+                );
+            }
             "--listen" => config.listen = parse_value(&mut args, "--listen")?,
             "--sample-rate" => config.sample_rate_hz = parse_value(&mut args, "--sample-rate")?,
             "--batch-samples" => config.batch_samples = parse_value(&mut args, "--batch-samples")?,
@@ -71,6 +86,8 @@ fn print_help() {
          --listen <host:port>       Listen address (default 127.0.0.1:19090)\n\
          --sample-rate <hz>         Default sample rate (default 10000)\n\
          --batch-samples <count>    Samples per frame (default 100)\n\
+         --protocol <v1|v2>          SCP1 protocol mode (default v1)\n\
+         --preset <name>             Deterministic V2 preset, e.g. 30k-normal\n\
          --accelerated              Run faster than wall clock\n\
          --seed <integer>           Deterministic signal seed\n\
          --drop-every <n>           Drop every nth sample frame\n\
@@ -104,5 +121,20 @@ mod tests {
         assert_eq!(config.sample_rate_hz, 20_000);
         assert_eq!(config.batch_samples, 50);
         assert!(config.accelerated);
+    }
+
+    #[test]
+    fn parses_v2_protocol_and_preset() {
+        let config = parse_args([
+            "--protocol".to_owned(),
+            "v2".to_owned(),
+            "--preset".to_owned(),
+            "30k-normal".to_owned(),
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(config.protocol, SimulatorProtocol::V2);
+        assert_eq!(config.preset, Some(V2Preset::Normal30k));
     }
 }

@@ -11,7 +11,7 @@ Configuration import/export is intentionally split so one file type cannot overw
 
 Windows 离线波形分析工具。界面按软件示波器方式组织，支持多 CSV 数据组叠加、通道勾选与分栏显示、双光标测量、选区 FFT/THD、三相正负序分析、变量名导入导出、浅色/深色主题和中英文界面。
 
-0.14.0 完成 SCP1 V2 的采样域与冻结截面协议：32 kHz CLA、8 kHz CPU1 控制和 1 kHz CPU2 LogicTask 是互斥的固定 stream；每行携带 `row_seq`、`source_seq`、`applied_seq`、`valid_flags` 与 `cla_completed_seq`，可显示“同拍 / 上一拍 / 无效 / 序号不匹配”而不误称物理同时。新增 DSP 侧 ARM/触发/冻结/分块上传录波消息，32 kHz 故障前触发不再依赖 UART 连续传输；V1 连续低速流仍兼容。实时客户端把 LiveRingBuffer、软件触发和 gap 检测移至采集线程，UI 只读取 30 Hz 左右的不可变快照。详细规范见 [SCP1 V2](docs/protocols/scp1-live-scope-v2.md)。
+0.15.0 完成 SCP1 V2 多采样域与硬件 Capture 基础：32 kHz CPU1/CLA、8 kHz CPU1 和 1 kHz CPU2 是互斥固定 stream；每个 DSP 冻结行携带 `row_sequence`、`source_sequence`、`applied_sequence` 和有效位。V2 客户端明确校验 domain/phase/group、批内连续行号、跨批 gap/reorder 与因果序号，不将跨 CPU 数据误称为物理同时。新增 ARM、手动/边沿/故障触发、状态、分块上传与完整性校验；默认 GUI、SCP1 V1 和 `.scope V1` 保持不变。详细规范见 [SCP1 V2](docs/protocols/scp1-live-scope-v2.md)。
 
 0.12.0 在 0.11.0 的工程调试闭环上增加 Reference/Compare 核心：按路线 A 支持手动偏移、触发点、阈值事件和基波相位四种对齐语义，并兼容保留已有锚点模式；所有模式记录对齐置信度。支持分段时间序列插值、绝对/相对误差与超差区间；`.scopeproj` 自动从 V1 迁移到 V2，并保存 Compare 配置。离线、冻结 Capture 和实时窗口统一提供平均值、真 RMS、正/负/绝对峰值、峰峰值与实际频率，并支持三相 P/Q₁/S/PF；Live 增加有界触发事件历史、固定与选择导航，`.scope` 回放可按触发事件跳转；采集设置提供 SCP1 帧大小、链路利用率、批次延迟和安全批次建议；恢复工程时不会自动连接设备。SCP1 V1 与 `.scope` V1 格式保持兼容。
 
@@ -212,22 +212,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release-check.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -OfflinePackage -RequireSignature
 # 在 Win10/11 acceptance runner 上执行安装/升级/卸载和渲染器烟测
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-acceptance.ps1 `
-  -MsiPath dist\ScopeAnalyzer-0.14.0-win-x64.msi `
-  -ZipPath dist\ScopeAnalyzer-0.14.0-win-x64.zip `
+  -MsiPath dist\ScopeAnalyzer-0.15.0-win-x64.msi `
+  -ZipPath dist\ScopeAnalyzer-0.15.0-win-x64.zip `
   -ReleaseEvidencePath dist\release-evidence.json `
   -RequireSignature -RequireMesaRuntime -RequireAngleRuntime -RequireRdpSession `
   -OutputPath dist\windows-acceptance.json
 # 如需单独验证标准用户启动，先在验收管理员会话中部署但不要卸载
-msiexec.exe /i dist\ScopeAnalyzer-0.14.0-win-x64.msi /qn /norestart
+msiexec.exe /i dist\ScopeAnalyzer-0.15.0-win-x64.msi /qn /norestart
 # 切换到标准用户会话后复核启动权限和渲染器路径
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-acceptance.ps1 `
-  -MsiPath dist\ScopeAnalyzer-0.14.0-win-x64.msi `
-  -ZipPath dist\ScopeAnalyzer-0.14.0-win-x64.zip `
+  -MsiPath dist\ScopeAnalyzer-0.15.0-win-x64.msi `
+  -ZipPath dist\ScopeAnalyzer-0.15.0-win-x64.zip `
   -ReleaseEvidencePath dist\release-evidence.json `
   -SkipMsiLifecycle -RequireStandardUser -RequireSignature -RequireMesaRuntime -RequireAngleRuntime -RequireRdpSession `
   -OutputPath dist\windows-acceptance-standard-user.json
 # 验收结束后由管理员清理部署
-msiexec.exe /x dist\ScopeAnalyzer-0.14.0-win-x64.msi /qn /norestart
+msiexec.exe /x dist\ScopeAnalyzer-0.15.0-win-x64.msi /qn /norestart
 ```
 
 Release runners must preload Mesa and ANGLE in controlled directories **outside**
@@ -273,8 +273,8 @@ Windows smoke tests rather than being mixed into this deterministic core gate.
 
 产物在：
 
-- `dist/ScopeAnalyzer-0.14.0-win-x64.zip`
-- `dist/ScopeAnalyzer-0.14.0-win-x64.msi`
+- `dist/ScopeAnalyzer-0.15.0-win-x64.zip`
+- `dist/ScopeAnalyzer-0.15.0-win-x64.msi`
 
 压缩包和 MSI 同时包含 `scope-cli.exe`，用于 CI 中的 Compare、规则检查和 Markdown 报告生成。
 同时包含 `build-provenance.json`（源码 commit、工具链、运行时和 stage 文件 SHA256）与

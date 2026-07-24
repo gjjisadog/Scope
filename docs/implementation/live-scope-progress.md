@@ -1,10 +1,19 @@
-# DSP 实时软件示波器 V1 实施进度
+# DSP 实时软件示波器 V1 + V2 实施进度
 
-最后更新：2026-07-11
+最后更新：2026-07-24（Scope Analyzer 0.15.0）
 
 ## 当前里程碑
 
-里程碑 11：真机反馈修复——跨平台中文字体、带回差触发、录波/回放交互和异常重连。
+里程碑 12：SCP1 V2 多采样域、冻结截面和 DSP hardware Capture 协议基础。
+
+## V2 本阶段状态
+
+- V1 帧、golden frame、默认 GUI、LiveBuffer 与 `.scope V1` 不变；V2 只能由 `LiveSession::connect_v2`、CLI 或模拟器显式选择。
+- 已实现 FAST32K/CTRL8K/SLOW1K fixed stream、owner/role 通道 metadata、domain/phase/group 校验、`row/source/applied` 元数据与客户端诊断计数。
+- 已实现 V2 hardware Capture 配置、状态、内存组装和完整性验证；本阶段不写入 `.scope V1`。
+- TCP simulator 提供可重复的 `30k-*` V2 预设；这是 simulator/client 验证，不是 DSP 硬件验证。
+- 现有 LAUNCHXL-F28P65X V1 客户端实测仍是 V1 证据；真实 Hybrid30K 的 CPU1/CPU2/CLA V2 冻结实现、DMA/RAMGS 与真机验收均未进行。
+- 异步 V1 录波 writer 的实际有界队列容量为 **1024** 项；V2 Capture 不进入该队列。
 
 ## 已完成内容
 

@@ -14,12 +14,19 @@ use thiserror::Error;
 
 use super::{
     buffer::{GapReason, LiveBuffer, LiveGap, LiveSnapshot},
+    hardware_capture::{AssembledCapture, CaptureAssembler},
     protocol::{
         decode_configure_result_detail, decode_sample_frame, validate_configure_for_device,
         ChannelTable, CommandResult, Configure, DecodedSampleBatch, Frame, FrameDecoder, Hello,
-        HelloAck, Message, ProtocolError, ResultCode, MAX_PAYLOAD_LEN,
+        HelloAck, Message, ProtocolError, ResultCode, MAX_PAYLOAD_LEN, PROTOCOL_VERSION_V2,
+    },
+    protocol_v2::{
+        decode_stream_sample_frame, ArmCapture, CancelCapture, CaptureStatus, ConfigureStream,
+        DecodedStreamSampleBatch, ManualTrigger, MessageV2, StreamTable, CAPABILITY_V2_STREAMS,
+        MSG_CAPTURE_BEGIN, MSG_CAPTURE_DATA, MSG_CAPTURE_END, MSG_STREAM_SAMPLE_BATCH,
     },
     recording::{RecordingError, RecordingIngress},
+    snapshot::{SnapshotDiagnostics, SnapshotValidator},
     transport::{TransportConfig, TransportError, TransportStream},
     trigger::{TriggerCapture, TriggerConfig, TriggerEngine},
 };
@@ -58,6 +65,13 @@ pub enum ConnectionState {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LiveProtocol {
+    #[default]
+    V1,
+    V2,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SessionStats {
     pub received_frames: u64,
     pub received_batches: u64,
@@ -71,6 +85,11 @@ pub struct SessionStats {
     pub unknown_messages: u64,
     pub device_dropped_samples: u64,
     pub device_tx_overruns: u64,
+    pub row_sequence_gaps: u64,
+    pub row_sequence_reorders: u64,
+    pub source_sequence_faults: u64,
+    pub applied_sequence_faults: u64,
+    pub invalid_snapshot_rows: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -78,11 +97,16 @@ pub enum SessionEvent {
     State(ConnectionState),
     HelloAck(HelloAck),
     ChannelTable(ChannelTable),
+    StreamTable(StreamTable),
     Configured(Configure),
+    ConfiguredV2(ConfigureStream),
     CommandResult(CommandResult),
     /// Retained for source compatibility; acquisition workers no longer emit
     /// a batch to the UI event queue.
     Batch(DecodedSampleBatch),
+    SnapshotV2(DecodedStreamSampleBatch, SnapshotDiagnostics),
+    CaptureStatus(CaptureStatus),
+    CaptureComplete(AssembledCapture),
     Gap(LiveGap),
     DisplaySnapshot(Arc<LiveSnapshot>),
     TriggerCapture(TriggerCapture, TriggerConfig),
@@ -94,11 +118,15 @@ pub enum SessionEvent {
 
 enum SessionCommand {
     Configure(Configure, AcquisitionConfig),
+    ConfigureStream(ConfigureStream),
     SetTriggerConfig(TriggerConfig),
     ArmTrigger,
     Start,
     Stop,
     Ping(u64),
+    ArmCapture(ArmCapture),
+    ManualTrigger(ManualTrigger),
+    CancelCapture(CancelCapture),
     SetRecording(Option<RecordingIngress>, Sender<()>),
     Disconnect,
 }
@@ -106,6 +134,7 @@ enum SessionCommand {
 #[derive(Clone)]
 enum PendingCommand {
     Configure(Configure, AcquisitionConfig),
+    ConfigureStream(ConfigureStream),
     Start,
     Stop,
 }
@@ -142,6 +171,19 @@ pub struct LiveSession {
 
 impl LiveSession {
     pub fn connect(config: TransportConfig) -> Result<Self, SessionError> {
+        Self::connect_with_protocol(config, LiveProtocol::V1)
+    }
+
+    /// Explicit V2 entry point. The desktop GUI keeps calling `connect()` and
+    /// therefore remains on SCP1 V1 by default.
+    pub fn connect_v2(config: TransportConfig) -> Result<Self, SessionError> {
+        Self::connect_with_protocol(config, LiveProtocol::V2)
+    }
+
+    fn connect_with_protocol(
+        config: TransportConfig,
+        protocol: LiveProtocol,
+    ) -> Result<Self, SessionError> {
         config.validate()?;
         let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
         let (control_tx, control_rx) = bounded(CONTROL_EVENT_CAPACITY);
@@ -153,6 +195,7 @@ impl LiveSession {
             .spawn(move || {
                 run_worker(
                     config,
+                    protocol,
                     command_rx,
                     control_tx,
                     data_tx,
@@ -180,6 +223,10 @@ impl LiveSession {
         self.send(SessionCommand::Configure(configure, acquisition))
     }
 
+    pub fn configure_stream(&self, configure: ConfigureStream) -> Result<(), SessionError> {
+        self.send(SessionCommand::ConfigureStream(configure))
+    }
+
     pub fn set_trigger_config(&self, config: TriggerConfig) -> Result<(), SessionError> {
         self.send(SessionCommand::SetTriggerConfig(config))
     }
@@ -198,6 +245,18 @@ impl LiveSession {
 
     pub fn ping(&self, nonce: u64) -> Result<(), SessionError> {
         self.send(SessionCommand::Ping(nonce))
+    }
+
+    pub fn arm_capture(&self, capture: ArmCapture) -> Result<(), SessionError> {
+        self.send(SessionCommand::ArmCapture(capture))
+    }
+
+    pub fn manual_trigger(&self, trigger: ManualTrigger) -> Result<(), SessionError> {
+        self.send(SessionCommand::ManualTrigger(trigger))
+    }
+
+    pub fn cancel_capture(&self, cancel: CancelCapture) -> Result<(), SessionError> {
+        self.send(SessionCommand::CancelCapture(cancel))
     }
 
     pub fn set_recording(&self, recording: Option<RecordingIngress>) -> Result<(), SessionError> {
@@ -357,6 +416,7 @@ impl AcquisitionWorker {
 
 fn run_worker(
     config: TransportConfig,
+    protocol: LiveProtocol,
     command_rx: Receiver<SessionCommand>,
     control_tx: Sender<SessionEvent>,
     data_tx: Sender<SessionEvent>,
@@ -366,13 +426,22 @@ fn run_worker(
         &control_tx,
         SessionEvent::State(ConnectionState::Connecting),
     );
-    let result = worker_loop(
-        config,
-        &command_rx,
-        &control_tx,
-        &data_tx,
-        &disconnect_requested,
-    );
+    let result = match protocol {
+        LiveProtocol::V1 => worker_loop(
+            config,
+            &command_rx,
+            &control_tx,
+            &data_tx,
+            &disconnect_requested,
+        ),
+        LiveProtocol::V2 => worker_loop_v2(
+            config,
+            &command_rx,
+            &control_tx,
+            &data_tx,
+            &disconnect_requested,
+        ),
+    };
     if let Err(error) = result {
         let _ = control_tx.try_send(SessionEvent::Error(error.to_string()));
     }
@@ -439,6 +508,14 @@ fn worker_loop(
                         control_tx,
                         SessionEvent::State(ConnectionState::Configuring),
                     )?;
+                }
+                SessionCommand::ConfigureStream(_)
+                | SessionCommand::ArmCapture(_)
+                | SessionCommand::ManualTrigger(_)
+                | SessionCommand::CancelCapture(_) => {
+                    return Err(SessionError::Acquisition(
+                        "SCP1 V2 command sent to a V1 session".to_owned(),
+                    ));
                 }
                 SessionCommand::SetTriggerConfig(config) => {
                     if let Some(worker) = &mut acquisition {
@@ -672,6 +749,7 @@ fn worker_loop(
                                     send_control(control_tx, SessionEvent::Configured(actual))?;
                                     ConnectionState::Ready
                                 }
+                                PendingCommand::ConfigureStream(_) => ConnectionState::Ready,
                                 PendingCommand::Stop => {
                                     streaming = false;
                                     disconnect_complete = disconnecting;
@@ -814,6 +892,429 @@ fn stop_recording_after_write_error(
     SessionEvent::RecordingError(error.to_string())
 }
 
+fn worker_loop_v2(
+    config: TransportConfig,
+    command_rx: &Receiver<SessionCommand>,
+    control_tx: &Sender<SessionEvent>,
+    data_tx: &Sender<SessionEvent>,
+    disconnect_requested: &AtomicBool,
+) -> Result<(), SessionError> {
+    let mut transport = config.connect()?;
+    send_control(
+        control_tx,
+        SessionEvent::State(ConnectionState::Handshaking),
+    )?;
+    let mut out_sequence = 1_u32;
+    write_common_v2(
+        &mut transport,
+        &mut out_sequence,
+        0,
+        Message::Hello(Hello {
+            client_capabilities: 0b111 | CAPABILITY_V2_STREAMS,
+            max_payload: MAX_PAYLOAD_LEN as u32,
+            client_name: "ScopeAnalyzer V2".to_owned(),
+        }),
+    )?;
+
+    let mut decoder = FrameDecoder::default();
+    let mut read_buffer = [0_u8; 16 * 1024];
+    let mut session_id = 0_u32;
+    let mut hello_ack: Option<HelloAck> = None;
+    let mut channels: Option<ChannelTable> = None;
+    let mut streams: Option<StreamTable> = None;
+    let mut pending = HashMap::new();
+    let mut validators: HashMap<u16, SnapshotValidator> = HashMap::new();
+    let mut capture: Option<CaptureAssembler> = None;
+    let mut stats = SessionStats::default();
+    let mut streaming = false;
+    let mut last_received = Instant::now();
+
+    loop {
+        while let Ok(command) = command_rx.try_recv() {
+            match command {
+                SessionCommand::ConfigureStream(configure) => {
+                    let sequence = write_v2_message(
+                        &mut transport,
+                        &mut out_sequence,
+                        session_id,
+                        MessageV2::ConfigureStream(configure.clone()),
+                    )?;
+                    pending.insert(sequence, PendingCommand::ConfigureStream(configure));
+                    send_control(
+                        control_tx,
+                        SessionEvent::State(ConnectionState::Configuring),
+                    )?;
+                }
+                SessionCommand::Start => {
+                    let sequence = write_common_v2(
+                        &mut transport,
+                        &mut out_sequence,
+                        session_id,
+                        Message::Start,
+                    )?;
+                    pending.insert(sequence, PendingCommand::Start);
+                }
+                SessionCommand::Stop => {
+                    let sequence = write_common_v2(
+                        &mut transport,
+                        &mut out_sequence,
+                        session_id,
+                        Message::Stop,
+                    )?;
+                    pending.insert(sequence, PendingCommand::Stop);
+                }
+                SessionCommand::Ping(nonce) => {
+                    write_common_v2(
+                        &mut transport,
+                        &mut out_sequence,
+                        session_id,
+                        Message::Ping(nonce),
+                    )?;
+                }
+                SessionCommand::ArmCapture(value) => {
+                    write_v2_message(
+                        &mut transport,
+                        &mut out_sequence,
+                        session_id,
+                        MessageV2::ArmCapture(value),
+                    )?;
+                }
+                SessionCommand::ManualTrigger(value) => {
+                    write_v2_message(
+                        &mut transport,
+                        &mut out_sequence,
+                        session_id,
+                        MessageV2::ManualTrigger(value),
+                    )?;
+                }
+                SessionCommand::CancelCapture(value) => {
+                    write_v2_message(
+                        &mut transport,
+                        &mut out_sequence,
+                        session_id,
+                        MessageV2::CancelCapture(value),
+                    )?;
+                }
+                SessionCommand::Configure(_, _)
+                | SessionCommand::SetTriggerConfig(_)
+                | SessionCommand::ArmTrigger
+                | SessionCommand::SetRecording(_, _) => {
+                    return Err(SessionError::Acquisition(
+                        "SCP1 V1 command sent to a V2 session".to_owned(),
+                    ));
+                }
+                SessionCommand::Disconnect => {
+                    if streaming {
+                        let _ = write_common_v2(
+                            &mut transport,
+                            &mut out_sequence,
+                            session_id,
+                            Message::Stop,
+                        );
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        if disconnect_requested.load(Ordering::Acquire) {
+            if streaming {
+                let _ =
+                    write_common_v2(&mut transport, &mut out_sequence, session_id, Message::Stop);
+            }
+            return Ok(());
+        }
+        if session_id != 0 && last_received.elapsed() >= Duration::from_secs(3) {
+            return Err(SessionError::Acquisition(
+                "no valid SCP1 V2 frame received for 3 seconds".to_owned(),
+            ));
+        }
+
+        match transport.read(&mut read_buffer) {
+            Ok(0) => return Ok(()),
+            Ok(count) => decoder.push(&read_buffer[..count]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let decoder_stats = decoder.stats();
+        stats.crc_errors = decoder_stats.crc_errors;
+        stats.malformed_headers = decoder_stats.malformed_headers;
+        stats.discarded_bytes = decoder_stats.discarded_bytes;
+
+        for frame in decoder.drain_frames() {
+            if frame.version != PROTOCOL_VERSION_V2 {
+                stats.protocol_errors = stats.protocol_errors.saturating_add(1);
+                send_control(
+                    control_tx,
+                    SessionEvent::Error("SCP1 V2 session received a non-V2 frame".to_owned()),
+                )?;
+                continue;
+            }
+            if session_id != 0 && frame.session_id != session_id {
+                stats.protocol_errors = stats.protocol_errors.saturating_add(1);
+                continue;
+            }
+            last_received = Instant::now();
+            stats.received_frames = stats.received_frames.saturating_add(1);
+
+            match frame.message_type {
+                super::protocol::MSG_HELLO_ACK => {
+                    let Message::HelloAck(hello) =
+                        Message::decode(frame.message_type, &frame.payload)?
+                    else {
+                        unreachable!()
+                    };
+                    if frame.session_id == 0
+                        || hello.device_capabilities & CAPABILITY_V2_STREAMS == 0
+                    {
+                        return Err(SessionError::Acquisition(
+                            "peer did not negotiate SCP1 V2 streams".to_owned(),
+                        ));
+                    }
+                    session_id = frame.session_id;
+                    hello_ack = Some(hello.clone());
+                    send_control(control_tx, SessionEvent::HelloAck(hello))?;
+                }
+                super::protocol::MSG_CHANNEL_TABLE => {
+                    let Message::ChannelTable(table) =
+                        Message::decode(frame.message_type, &frame.payload)?
+                    else {
+                        unreachable!()
+                    };
+                    let hello = hello_ack.as_ref().ok_or_else(|| {
+                        SessionError::Acquisition(
+                            "CHANNEL_TABLE arrived before HELLO_ACK".to_owned(),
+                        )
+                    })?;
+                    if usize::from(hello.channel_count) != table.channels.len() {
+                        return Err(SessionError::Acquisition(
+                            "V2 CHANNEL_TABLE count disagrees with HELLO_ACK".to_owned(),
+                        ));
+                    }
+                    channels = Some(table.clone());
+                    send_control(control_tx, SessionEvent::ChannelTable(table))?;
+                }
+                super::protocol::MSG_COMMAND_RESULT => {
+                    let Message::CommandResult(result) =
+                        Message::decode(frame.message_type, &frame.payload)?
+                    else {
+                        unreachable!()
+                    };
+                    if result.result_code == ResultCode::Ok {
+                        if let Some(command) = pending.remove(&result.request_sequence) {
+                            match command {
+                                PendingCommand::ConfigureStream(configure) => {
+                                    send_control(
+                                        control_tx,
+                                        SessionEvent::ConfiguredV2(configure),
+                                    )?;
+                                    send_control(
+                                        control_tx,
+                                        SessionEvent::State(ConnectionState::Ready),
+                                    )?;
+                                }
+                                PendingCommand::Start => {
+                                    streaming = true;
+                                    send_control(
+                                        control_tx,
+                                        SessionEvent::State(ConnectionState::Streaming),
+                                    )?;
+                                }
+                                PendingCommand::Stop => {
+                                    streaming = false;
+                                    send_control(
+                                        control_tx,
+                                        SessionEvent::State(ConnectionState::Ready),
+                                    )?;
+                                }
+                                PendingCommand::Configure(_, _) => {}
+                            }
+                        }
+                    }
+                    send_control(control_tx, SessionEvent::CommandResult(result))?;
+                }
+                MSG_STREAM_SAMPLE_BATCH => {
+                    let table = channels.as_ref().ok_or_else(|| {
+                        SessionError::Acquisition(
+                            "V2 sample arrived before CHANNEL_TABLE".to_owned(),
+                        )
+                    })?;
+                    let stream_table = streams.as_ref().ok_or_else(|| {
+                        SessionError::Acquisition(
+                            "V2 sample arrived before STREAM_TABLE".to_owned(),
+                        )
+                    })?;
+                    let decoded = decode_stream_sample_frame(&frame, table, stream_table)?;
+                    let descriptor = stream_table.stream(decoded.stream_id).ok_or_else(|| {
+                        SessionError::Acquisition(
+                            "decoded stream disappeared from STREAM_TABLE".to_owned(),
+                        )
+                    })?;
+                    let validator = validators.entry(decoded.stream_id).or_default();
+                    for row in &decoded.row_metadata {
+                        validator.observe(descriptor, *row);
+                    }
+                    let diagnostics = validator.diagnostics().clone();
+                    stats.row_sequence_gaps = diagnostics.row_sequence_gaps;
+                    stats.row_sequence_reorders = diagnostics.row_sequence_reorders;
+                    stats.source_sequence_faults = diagnostics.source_sequence_faults;
+                    stats.applied_sequence_faults = diagnostics.applied_sequence_faults;
+                    stats.invalid_snapshot_rows = diagnostics.invalid_snapshot_rows;
+                    stats.received_batches = stats.received_batches.saturating_add(1);
+                    stats.received_samples = stats
+                        .received_samples
+                        .saturating_add(u64::from(decoded.row_metadata.len() as u32));
+                    let _ = data_tx.try_send(SessionEvent::SnapshotV2(decoded, diagnostics));
+                    let _ = data_tx.try_send(SessionEvent::Stats(stats));
+                }
+                super::protocol::MSG_PING => {
+                    let Message::Ping(nonce) = Message::decode(frame.message_type, &frame.payload)?
+                    else {
+                        unreachable!()
+                    };
+                    write_common_v2(
+                        &mut transport,
+                        &mut out_sequence,
+                        session_id,
+                        Message::Pong(nonce),
+                    )?;
+                }
+                MSG_CAPTURE_BEGIN => {
+                    let MessageV2::CaptureBegin(begin) =
+                        MessageV2::decode(frame.message_type, &frame.payload)?
+                    else {
+                        unreachable!()
+                    };
+                    let mut assembler = CaptureAssembler::default();
+                    assembler.begin(begin).map_err(SessionError::Acquisition)?;
+                    capture = Some(assembler);
+                }
+                MSG_CAPTURE_DATA => {
+                    let MessageV2::CaptureData(data) =
+                        MessageV2::decode(frame.message_type, &frame.payload)?
+                    else {
+                        unreachable!()
+                    };
+                    let table = channels.as_ref().ok_or_else(|| {
+                        SessionError::Acquisition(
+                            "CAPTURE_DATA arrived before CHANNEL_TABLE".to_owned(),
+                        )
+                    })?;
+                    let stream_table = streams.as_ref().ok_or_else(|| {
+                        SessionError::Acquisition(
+                            "CAPTURE_DATA arrived before STREAM_TABLE".to_owned(),
+                        )
+                    })?;
+                    let nested = MessageV2::StreamSampleBatch(data.batch.clone()).into_frame(
+                        0,
+                        frame.sequence,
+                        session_id,
+                        frame.timestamp_ticks,
+                    )?;
+                    let _ = decode_stream_sample_frame(&nested, table, stream_table)?;
+                    capture
+                        .as_mut()
+                        .ok_or_else(|| {
+                            SessionError::Acquisition(
+                                "CAPTURE_DATA arrived before CAPTURE_BEGIN".to_owned(),
+                            )
+                        })?
+                        .push(data)
+                        .map_err(SessionError::Acquisition)?;
+                }
+                MSG_CAPTURE_END => {
+                    let MessageV2::CaptureEnd(end) =
+                        MessageV2::decode(frame.message_type, &frame.payload)?
+                    else {
+                        unreachable!()
+                    };
+                    let assembled = capture
+                        .take()
+                        .ok_or_else(|| {
+                            SessionError::Acquisition(
+                                "CAPTURE_END arrived before CAPTURE_BEGIN".to_owned(),
+                            )
+                        })?
+                        .finish(end)
+                        .map_err(SessionError::Acquisition)?;
+                    send_control(control_tx, SessionEvent::CaptureComplete(assembled))?;
+                }
+                super::protocol_v2::MSG_CAPTURE_STATUS => {
+                    let MessageV2::CaptureStatus(status) =
+                        MessageV2::decode(frame.message_type, &frame.payload)?
+                    else {
+                        unreachable!()
+                    };
+                    send_control(control_tx, SessionEvent::CaptureStatus(status))?;
+                }
+                super::protocol_v2::MSG_STREAM_TABLE => {
+                    let MessageV2::StreamTable(table) =
+                        MessageV2::decode(frame.message_type, &frame.payload)?
+                    else {
+                        unreachable!()
+                    };
+                    let channel_table = channels.as_ref().ok_or_else(|| {
+                        SessionError::Acquisition(
+                            "STREAM_TABLE arrived before CHANNEL_TABLE".to_owned(),
+                        )
+                    })?;
+                    table.validate_against_channels(channel_table)?;
+                    streams = Some(table.clone());
+                    send_control(control_tx, SessionEvent::StreamTable(table))?;
+                    send_control(control_tx, SessionEvent::State(ConnectionState::Ready))?;
+                }
+                super::protocol::MSG_STATUS
+                | super::protocol::MSG_PONG
+                | super::protocol::MSG_ERROR => {}
+                _ => {
+                    stats.unknown_messages = stats.unknown_messages.saturating_add(1);
+                }
+            }
+        }
+    }
+}
+
+fn write_common_v2(
+    transport: &mut TransportStream,
+    next_sequence: &mut u32,
+    session_id: u32,
+    message: Message,
+) -> Result<u32, SessionError> {
+    let sequence = *next_sequence;
+    let frame = Frame::new_v2(
+        message.message_type(),
+        0,
+        sequence,
+        session_id,
+        0,
+        message.encode_payload()?,
+    );
+    transport.write_all(&frame.encode()?)?;
+    transport.flush()?;
+    *next_sequence = next_sequence.wrapping_add(1);
+    Ok(sequence)
+}
+
+fn write_v2_message(
+    transport: &mut TransportStream,
+    next_sequence: &mut u32,
+    session_id: u32,
+    message: MessageV2,
+) -> Result<u32, SessionError> {
+    let sequence = *next_sequence;
+    let frame = message.into_frame(0, sequence, session_id, 0)?;
+    transport.write_all(&frame.encode()?)?;
+    transport.flush()?;
+    *next_sequence = next_sequence.wrapping_add(1);
+    Ok(sequence)
+}
+
 fn send_control(
     control_tx: &Sender<SessionEvent>,
     event: SessionEvent,
@@ -854,7 +1355,11 @@ mod tests {
     use super::*;
     use crate::live::{
         protocol::Configure,
-        simulator::{SimulatorConfig, SimulatorHandle},
+        protocol_v2::{
+            ArmCapture, CaptureEdge, CaptureTrigger, CaptureTriggerKind, ConfigureStream,
+            ManualTrigger,
+        },
+        simulator::{SimulatorConfig, SimulatorHandle, SimulatorProtocol, V2Preset},
         transport::TransportConfig,
     };
 
@@ -931,6 +1436,105 @@ mod tests {
         wait_for(&session, Duration::from_secs(2), |event| {
             matches!(event, SessionEvent::State(ConnectionState::Ready))
         });
+        session.disconnect().unwrap();
+    }
+
+    #[test]
+    fn v2_simulator_handshake_validates_a_frozen_fast_stream() {
+        let simulator = SimulatorHandle::spawn(SimulatorConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            accelerated: true,
+            protocol: SimulatorProtocol::V2,
+            preset: Some(V2Preset::Normal30k),
+            ..SimulatorConfig::default()
+        })
+        .unwrap();
+        let session = LiveSession::connect_v2(TransportConfig::Tcp {
+            address: simulator.address().to_string(),
+        })
+        .unwrap();
+        wait_for(&session, Duration::from_secs(2), |event| {
+            matches!(event, SessionEvent::StreamTable(_))
+        });
+        session
+            .configure_stream(ConfigureStream {
+                stream_id: 1,
+                batch_samples: 4,
+                channel_mask: 0b1111,
+            })
+            .unwrap();
+        wait_for(&session, Duration::from_secs(2), |event| {
+            matches!(event, SessionEvent::ConfiguredV2(_))
+        });
+        session.start().unwrap();
+        let snapshot = wait_for(
+            &session,
+            Duration::from_secs(2),
+            |event| matches!(event, SessionEvent::SnapshotV2(_, diagnostics) if diagnostics.invalid_snapshot_rows == 0),
+        );
+        assert!(
+            matches!(snapshot, SessionEvent::SnapshotV2(batch, diagnostics)
+            if batch.domain == crate::live::protocol_v2::SampleDomain::Fast32k
+                && batch.row_metadata.len() == 4
+                && diagnostics.applied_sequence_faults == 0)
+        );
+        session.disconnect().unwrap();
+    }
+
+    #[test]
+    fn v2_manual_capture_is_assembled_in_memory() {
+        let simulator = SimulatorHandle::spawn(SimulatorConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            accelerated: true,
+            protocol: SimulatorProtocol::V2,
+            preset: Some(V2Preset::CaptureManual30k),
+            ..SimulatorConfig::default()
+        })
+        .unwrap();
+        let session = LiveSession::connect_v2(TransportConfig::Tcp {
+            address: simulator.address().to_string(),
+        })
+        .unwrap();
+        wait_for(&session, Duration::from_secs(2), |event| {
+            matches!(event, SessionEvent::StreamTable(_))
+        });
+        session
+            .configure_stream(ConfigureStream {
+                stream_id: 1,
+                batch_samples: 2,
+                channel_mask: 0b1111,
+            })
+            .unwrap();
+        wait_for(&session, Duration::from_secs(2), |event| {
+            matches!(event, SessionEvent::ConfiguredV2(_))
+        });
+        session
+            .arm_capture(ArmCapture {
+                capture_id: 77,
+                stream_id: 1,
+                pretrigger_rows: 1,
+                posttrigger_rows: 1,
+                timeout_samples: 100,
+                trigger: CaptureTrigger {
+                    kind: CaptureTriggerKind::Manual,
+                    channel_id: 0,
+                    level: 0.0,
+                    edge: CaptureEdge::Rising,
+                    hysteresis: 0.0,
+                    flag_mask: 0,
+                    flag_value: 0,
+                },
+            })
+            .unwrap();
+        session
+            .manual_trigger(ManualTrigger { capture_id: 77 })
+            .unwrap();
+        let capture = wait_for(&session, Duration::from_secs(2), |event| {
+            matches!(event, SessionEvent::CaptureComplete(_))
+        });
+        assert!(
+            matches!(capture, SessionEvent::CaptureComplete(capture) if capture.diagnostics.capture_complete)
+        );
         session.disconnect().unwrap();
     }
 
