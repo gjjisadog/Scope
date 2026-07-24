@@ -9,13 +9,19 @@ use super::protocol::{
     ChannelKind, ChannelTable, Frame, ProtocolError, WireFormat, MAX_BATCH_SAMPLES,
     MAX_CHANNEL_COUNT, MAX_PAYLOAD_LEN, PROTOCOL_VERSION_V2,
 };
+pub use super::snapshot::{
+    SnapshotMeta, ADC_SAMPLE_VALID, APPLIED_SEQUENCE_VALID, CLA_RESULT_VALID, FROZEN_ROW,
+    SNAPSHOT_KNOWN_FLAGS, SNAPSHOT_VALID, SOURCE_SEQUENCE_VALID,
+};
 
 /// Advertised in the existing HELLO / HELLO_ACK capability bitfield.
 pub const CAPABILITY_V2_STREAMS: u32 = 1 << 3;
 
 pub const MSG_STREAM_TABLE: u8 = 0x30;
 pub const MSG_CONFIGURE_STREAM: u8 = 0x31;
-pub const MSG_STREAM_SAMPLE_BATCH: u8 = 0x32;
+pub const MSG_SAMPLE_BATCH_V2: u8 = 0x32;
+/// Compatibility name retained for the initial V2 foundation.
+pub const MSG_STREAM_SAMPLE_BATCH: u8 = MSG_SAMPLE_BATCH_V2;
 pub const MSG_ARM_CAPTURE: u8 = 0x40;
 pub const MSG_MANUAL_TRIGGER: u8 = 0x41;
 pub const MSG_CANCEL_CAPTURE: u8 = 0x42;
@@ -28,16 +34,12 @@ pub const MAX_STREAM_COUNT: usize = 64;
 pub const MAX_CAUSAL_RELATION_COUNT: usize = 64;
 pub const MAX_CAPTURE_ROWS: u32 = 1_048_576;
 
-pub const VALID_FLAG_CLA_COMPLETE: u32 = 1 << 0;
-pub const VALID_FLAG_ADC_VALID: u32 = 1 << 1;
-pub const VALID_FLAG_DATA_FROZEN: u32 = 1 << 2;
-pub const VALID_FLAG_SOURCE_VALID: u32 = 1 << 3;
-pub const VALID_FLAG_APPLIED_VALID: u32 = 1 << 4;
-pub const VALID_FLAG_KNOWN_MASK: u32 = VALID_FLAG_CLA_COMPLETE
-    | VALID_FLAG_ADC_VALID
-    | VALID_FLAG_DATA_FROZEN
-    | VALID_FLAG_SOURCE_VALID
-    | VALID_FLAG_APPLIED_VALID;
+pub const VALID_FLAG_CLA_COMPLETE: u32 = CLA_RESULT_VALID;
+pub const VALID_FLAG_ADC_VALID: u32 = ADC_SAMPLE_VALID;
+pub const VALID_FLAG_DATA_FROZEN: u32 = FROZEN_ROW;
+pub const VALID_FLAG_SOURCE_VALID: u32 = SOURCE_SEQUENCE_VALID;
+pub const VALID_FLAG_APPLIED_VALID: u32 = APPLIED_SEQUENCE_VALID;
+pub const VALID_FLAG_KNOWN_MASK: u32 = SNAPSHOT_KNOWN_FLAGS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -99,24 +101,60 @@ impl TryFrom<u8> for CapturePhase {
     }
 }
 
-/// Execution unit that produced a channel value at its stream's capture phase.
+/// DSP execution unit responsible for a V2 channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
-pub enum ProcessingUnit {
+pub enum SignalOwner {
     Cpu1 = 0,
-    Cla = 1,
+    Cpu1Cla1 = 1,
     Cpu2 = 2,
 }
 
-impl TryFrom<u8> for ProcessingUnit {
+impl TryFrom<u8> for SignalOwner {
     type Error = ProtocolError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::Cpu1),
-            1 => Ok(Self::Cla),
+            1 => Ok(Self::Cpu1Cla1),
             2 => Ok(Self::Cpu2),
-            _ => invalid(format!("unknown processing unit {value}")),
+            _ => invalid(format!("unknown signal owner {value}")),
+        }
+    }
+}
+
+/// Compatibility spelling used by the initial V2 table codec.
+pub type ProcessingUnit = SignalOwner;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum SignalRole {
+    PhysicalSample = 0,
+    ControlInput = 1,
+    ControlOutput = 2,
+    Command = 3,
+    AppliedCommand = 4,
+    State = 5,
+    Fault = 6,
+    Diagnostic = 7,
+    Metadata = 8,
+}
+
+impl TryFrom<u8> for SignalRole {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::PhysicalSample),
+            1 => Ok(Self::ControlInput),
+            2 => Ok(Self::ControlOutput),
+            3 => Ok(Self::Command),
+            4 => Ok(Self::AppliedCommand),
+            5 => Ok(Self::State),
+            6 => Ok(Self::Fault),
+            7 => Ok(Self::Diagnostic),
+            8 => Ok(Self::Metadata),
+            _ => invalid(format!("unknown signal role {value}")),
         }
     }
 }
@@ -130,6 +168,18 @@ pub struct StreamDescriptor {
     pub sample_rate_hz: u32,
     /// Non-zero logical control-cycle namespace used to correlate causal indices.
     pub consistency_group: u16,
+    pub channel_ids: Vec<u16>,
+}
+
+/// V2 extension; the V1 `ChannelDescriptor` byte layout remains unchanged.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChannelDescriptorV2 {
+    pub base: super::protocol::ChannelDescriptor,
+    pub owner: SignalOwner,
+    pub domain: SampleDomain,
+    pub capture_phase: CapturePhase,
+    pub consistency_group: u16,
+    pub role: SignalRole,
 }
 
 /// Binds every real-time channel to one, and only one, V2 stream.
@@ -137,7 +187,8 @@ pub struct StreamDescriptor {
 pub struct StreamChannelBinding {
     pub channel_id: u16,
     pub stream_id: u16,
-    pub producer: ProcessingUnit,
+    pub owner: SignalOwner,
+    pub role: SignalRole,
 }
 
 /// Declares a CPU/CLA causal pipeline in one consistency group.
@@ -175,6 +226,34 @@ impl StreamTable {
             .find(|binding| binding.channel_id == channel_id)
     }
 
+    /// Reconstructs V2 descriptors from the frozen V1 channel base table plus
+    /// the V2 binding metadata carried by STREAM_TABLE.
+    pub fn channel_descriptors_v2(
+        &self,
+        channels: &ChannelTable,
+    ) -> Result<Vec<ChannelDescriptorV2>, ProtocolError> {
+        self.validate_against_channels(channels)?;
+        self.bindings
+            .iter()
+            .map(|binding| {
+                let stream = self
+                    .stream(binding.stream_id)
+                    .expect("validated stream binding");
+                Ok(ChannelDescriptorV2 {
+                    base: channels
+                        .channel(binding.channel_id)
+                        .expect("validated channel binding")
+                        .clone(),
+                    owner: binding.owner,
+                    domain: stream.domain,
+                    capture_phase: stream.capture_phase,
+                    consistency_group: stream.consistency_group,
+                    role: binding.role,
+                })
+            })
+            .collect()
+    }
+
     pub fn validate(&self) -> Result<(), ProtocolError> {
         validate_count(
             self.streams.len(),
@@ -197,6 +276,9 @@ impl StreamTable {
 
         let mut stream_ids = Vec::with_capacity(self.streams.len());
         for stream in &self.streams {
+            if stream.stream_id == 0 {
+                return invalid("stream id must be non-zero");
+            }
             if stream_ids.contains(&stream.stream_id) {
                 return invalid(format!("duplicate stream id {}", stream.stream_id));
             }
@@ -224,6 +306,23 @@ impl StreamTable {
                     stream.domain,
                     stream.domain.fixed_capture_phase()
                 ));
+            }
+            if stream.channel_ids.is_empty() {
+                return invalid(format!("stream {} has no channel ids", stream.stream_id));
+            }
+            let mut stream_channels = 0_u64;
+            for channel_id in &stream.channel_ids {
+                if usize::from(*channel_id) >= MAX_CHANNEL_COUNT {
+                    return invalid(format!("stream channel id {channel_id} is out of range"));
+                }
+                let bit = 1_u64 << channel_id;
+                if stream_channels & bit != 0 {
+                    return invalid(format!(
+                        "stream {} repeats channel {channel_id}",
+                        stream.stream_id
+                    ));
+                }
+                stream_channels |= bit;
             }
         }
 
@@ -257,6 +356,21 @@ impl StreamTable {
             {
                 return invalid(format!(
                     "stream {} has no channel bindings",
+                    stream.stream_id
+                ));
+            }
+            if self
+                .bindings
+                .iter()
+                .filter(|binding| binding.stream_id == stream.stream_id)
+                .any(|binding| !stream.channel_ids.contains(&binding.channel_id))
+                || stream
+                    .channel_ids
+                    .iter()
+                    .any(|channel_id| self.binding(*channel_id).is_none())
+            {
+                return invalid(format!(
+                    "stream {} channel ids and bindings disagree",
                     stream.stream_id
                 ));
             }
@@ -325,27 +439,13 @@ pub struct ConfigureStream {
 /// being duplicated in each ordinary signal channel. It is the logical
 /// metadata-channel set `META_ROW_SEQ`, `META_SOURCE_SEQ`,
 /// `META_APPLIED_SEQ`, `META_VALID_FLAGS`, and `META_CLA_COMPLETED_SEQ`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StreamRowMetadata {
-    /// Monotonic sequence in this stream's sampling domain.
-    pub row_seq: u64,
-    /// Frozen source snapshot sequence used to calculate this row.
-    pub source_seq: u64,
-    /// Most recent command/result sequence already applied by CPU1.
-    pub applied_seq: u64,
-    /// `VALID_FLAG_*` bits describing row validity and freeze completion.
-    pub valid_flags: u32,
-    /// Latest CLA-complete sequence observed at this capture point.
-    pub cla_completed_seq: u64,
-}
+pub type StreamRowMetadata = SnapshotMeta;
 
-impl StreamRowMetadata {
-    pub const ENCODED_LEN: usize = 36;
-
+impl SnapshotMeta {
     pub fn source_alignment(&self) -> CausalAlignment {
         causal_alignment(
-            self.row_seq,
-            self.source_seq,
+            self.row_sequence,
+            self.source_sequence,
             self.valid_flags,
             VALID_FLAG_SOURCE_VALID,
         )
@@ -353,8 +453,8 @@ impl StreamRowMetadata {
 
     pub fn applied_alignment(&self) -> CausalAlignment {
         causal_alignment(
-            self.row_seq,
-            self.applied_seq,
+            self.row_sequence,
+            self.applied_sequence,
             self.valid_flags,
             VALID_FLAG_APPLIED_VALID,
         )
@@ -388,9 +488,13 @@ impl CausalAlignment {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamSampleBatch {
     pub stream_id: u16,
-    pub channel_table_revision: u32,
+    pub stream_revision: u32,
+    pub domain: SampleDomain,
+    pub capture_phase: CapturePhase,
+    pub consistency_group: u16,
+    pub first_row_sequence: u64,
     pub sample_period_ticks: u32,
-    pub sample_count: u16,
+    pub row_count: u16,
     pub channel_ids: Vec<u16>,
     pub sample_data: Vec<u8>,
     pub row_metadata: Vec<StreamRowMetadata>,
@@ -400,6 +504,10 @@ pub struct StreamSampleBatch {
 pub struct DecodedStreamSampleBatch {
     pub stream_id: u16,
     pub revision: u32,
+    pub domain: SampleDomain,
+    pub capture_phase: CapturePhase,
+    pub consistency_group: u16,
+    pub first_row_sequence: u64,
     pub sample_period_ticks: u32,
     pub timestamp_ticks: u64,
     pub channel_ids: Vec<u16>,
@@ -411,10 +519,9 @@ pub struct DecodedStreamSampleBatch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum CaptureTriggerKind {
-    AnalogRising = 0,
-    AnalogFalling = 1,
-    HardwareFlag = 2,
-    Manual = 3,
+    Manual = 0,
+    Edge = 1,
+    FaultFlag = 2,
 }
 
 impl TryFrom<u8> for CaptureTriggerKind {
@@ -422,11 +529,31 @@ impl TryFrom<u8> for CaptureTriggerKind {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(Self::AnalogRising),
-            1 => Ok(Self::AnalogFalling),
-            2 => Ok(Self::HardwareFlag),
-            3 => Ok(Self::Manual),
+            0 => Ok(Self::Manual),
+            1 => Ok(Self::Edge),
+            2 => Ok(Self::FaultFlag),
             _ => invalid(format!("unknown capture trigger kind {value}")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum CaptureEdge {
+    Rising = 0,
+    Falling = 1,
+    Either = 2,
+}
+
+impl TryFrom<u8> for CaptureEdge {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Rising),
+            1 => Ok(Self::Falling),
+            2 => Ok(Self::Either),
+            _ => invalid(format!("unknown capture edge {value}")),
         }
     }
 }
@@ -438,6 +565,7 @@ pub struct CaptureTrigger {
     pub kind: CaptureTriggerKind,
     pub channel_id: u16,
     pub level: f32,
+    pub edge: CaptureEdge,
     pub hysteresis: f32,
     pub flag_mask: u32,
     pub flag_value: u32,
@@ -449,6 +577,7 @@ pub struct ArmCapture {
     pub stream_id: u16,
     pub pretrigger_rows: u32,
     pub posttrigger_rows: u32,
+    pub timeout_samples: u32,
     pub trigger: CaptureTrigger,
 }
 
@@ -465,13 +594,17 @@ pub struct CancelCapture {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum CaptureState {
-    Armed = 0,
-    Triggered = 1,
-    Frozen = 2,
-    Uploading = 3,
-    Completed = 4,
-    Cancelled = 5,
-    Failed = 6,
+    Idle = 0,
+    Armed = 1,
+    Triggered = 2,
+    PostCapture = 3,
+    Complete = 4,
+    Uploading = 5,
+    Cancelled = 6,
+    Timeout = 7,
+    BufferOverrun = 8,
+    InvalidConfig = 9,
+    DeviceReset = 10,
 }
 
 impl TryFrom<u8> for CaptureState {
@@ -479,13 +612,17 @@ impl TryFrom<u8> for CaptureState {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(Self::Armed),
-            1 => Ok(Self::Triggered),
-            2 => Ok(Self::Frozen),
-            3 => Ok(Self::Uploading),
-            4 => Ok(Self::Completed),
-            5 => Ok(Self::Cancelled),
-            6 => Ok(Self::Failed),
+            0 => Ok(Self::Idle),
+            1 => Ok(Self::Armed),
+            2 => Ok(Self::Triggered),
+            3 => Ok(Self::PostCapture),
+            4 => Ok(Self::Complete),
+            5 => Ok(Self::Uploading),
+            6 => Ok(Self::Cancelled),
+            7 => Ok(Self::Timeout),
+            8 => Ok(Self::BufferOverrun),
+            9 => Ok(Self::InvalidConfig),
+            10 => Ok(Self::DeviceReset),
             _ => invalid(format!("unknown capture state {value}")),
         }
     }
@@ -522,6 +659,9 @@ pub struct CaptureEnd {
     pub state: CaptureState,
     pub uploaded_rows: u32,
     pub dropped_rows: u32,
+    pub total_blocks: u32,
+    pub total_samples: u32,
+    pub integrity_summary: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -700,7 +840,7 @@ pub fn validate_configure_stream_for_device(
             .checked_add(channel.wire_format.byte_width())
             .ok_or(ProtocolError::LengthOverflow)
     })?;
-    let payload_len = 14_usize
+    let payload_len = 26_usize
         .checked_add(
             selected
                 .len()
@@ -713,7 +853,7 @@ pub fn validate_configure_stream_for_device(
                 .and_then(|sample_data_len| value.checked_add(sample_data_len))
                 .and_then(|value| {
                     usize::from(configure.batch_samples)
-                        .checked_mul(StreamRowMetadata::ENCODED_LEN)
+                        .checked_mul(SnapshotMeta::ENCODED_LEN)
                         .and_then(|metadata_len| value.checked_add(metadata_len))
                 })
         })
@@ -755,11 +895,19 @@ pub fn decode_stream_sample_frame(
             batch.stream_id
         ))
     })?;
-    if batch.channel_table_revision != channels.revision {
+    if batch.stream_revision != streams.revision {
         return invalid(format!(
-            "stream sample batch references channel table revision {}, current revision is {}",
-            batch.channel_table_revision, channels.revision
+            "stream sample batch references stream revision {}, current revision is {}",
+            batch.stream_revision, streams.revision
         ));
+    }
+    if batch.domain != stream.domain
+        || batch.capture_phase != stream.capture_phase
+        || batch.consistency_group != stream.consistency_group
+    {
+        return invalid(
+            "stream sample batch domain, phase, or consistency group disagrees with descriptor",
+        );
     }
     let descriptors = batch
         .channel_ids
@@ -783,21 +931,13 @@ pub fn decode_stream_sample_frame(
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if stream.domain == SampleDomain::Fast32k
-        && batch
-            .row_metadata
-            .iter()
-            .any(|row| row.valid_flags & VALID_FLAG_CLA_COMPLETE == 0)
-    {
-        return invalid("FAST32K stream sample row is missing CLA_COMPLETE");
-    }
     let bytes_per_sample = descriptors.iter().try_fold(0_usize, |total, descriptor| {
         total
             .checked_add(descriptor.wire_format.byte_width())
             .ok_or(ProtocolError::LengthOverflow)
     })?;
     let expected_data_len = bytes_per_sample
-        .checked_mul(usize::from(batch.sample_count))
+        .checked_mul(usize::from(batch.row_count))
         .ok_or(ProtocolError::LengthOverflow)?;
     if batch.sample_data.len() != expected_data_len {
         return invalid(format!(
@@ -805,7 +945,7 @@ pub fn decode_stream_sample_frame(
             batch.sample_data.len()
         ));
     }
-    let last_sample_offset = u64::from(batch.sample_count - 1);
+    let last_sample_offset = u64::from(batch.row_count - 1);
     let tick_offset = u64::from(batch.sample_period_ticks)
         .checked_mul(last_sample_offset)
         .ok_or_else(|| invalid_error("sample timestamp offset overflow"))?;
@@ -816,9 +956,9 @@ pub fn decode_stream_sample_frame(
     let mut reader = PayloadReader::new(&batch.sample_data);
     let mut decoded_channels = descriptors
         .iter()
-        .map(|_| Vec::with_capacity(usize::from(batch.sample_count)))
+        .map(|_| Vec::with_capacity(usize::from(batch.row_count)))
         .collect::<Vec<_>>();
-    for _ in 0..batch.sample_count {
+    for _ in 0..batch.row_count {
         for (channel_index, descriptor) in descriptors.iter().enumerate() {
             decoded_channels[channel_index]
                 .push(decode_engineering_value(&mut reader, descriptor)?);
@@ -827,7 +967,11 @@ pub fn decode_stream_sample_frame(
     reader.finish()?;
     Ok(DecodedStreamSampleBatch {
         stream_id: batch.stream_id,
-        revision: batch.channel_table_revision,
+        revision: batch.stream_revision,
+        domain: batch.domain,
+        capture_phase: batch.capture_phase,
+        consistency_group: batch.consistency_group,
+        first_row_sequence: batch.first_row_sequence,
         sample_period_ticks: batch.sample_period_ticks,
         timestamp_ticks: frame.timestamp_ticks,
         channel_ids: batch.channel_ids,
@@ -861,13 +1005,20 @@ fn encode_stream_table(table: &StreamTable, bytes: &mut Vec<u8>) -> Result<(), P
         bytes.push(stream.capture_phase as u8);
         put_u32(bytes, stream.sample_rate_hz);
         put_u16(bytes, stream.consistency_group);
-        put_u16(bytes, 0);
+        put_u16(
+            bytes,
+            u16::try_from(stream.channel_ids.len())
+                .map_err(|_| invalid_error("too many stream channel ids"))?,
+        );
+        for channel_id in &stream.channel_ids {
+            put_u16(bytes, *channel_id);
+        }
     }
     for binding in &table.bindings {
         put_u16(bytes, binding.channel_id);
         put_u16(bytes, binding.stream_id);
-        bytes.push(binding.producer as u8);
-        bytes.push(0);
+        bytes.push(binding.owner as u8);
+        bytes.push(binding.role as u8);
     }
     for relation in &table.causal_relations {
         put_u16(bytes, relation.input_stream_id);
@@ -907,8 +1058,16 @@ fn decode_stream_table(reader: &mut PayloadReader<'_>) -> Result<StreamTable, Pr
         let capture_phase = CapturePhase::try_from(reader.u8()?)?;
         let sample_rate_hz = reader.u32()?;
         let consistency_group = reader.u16()?;
-        if reader.u16()? != 0 {
-            return invalid("STREAM_TABLE stream reserved field must be zero");
+        let channel_count = usize::from(reader.u16()?);
+        validate_count(
+            channel_count,
+            1,
+            MAX_CHANNEL_COUNT,
+            "stream channel id count",
+        )?;
+        let mut channel_ids = Vec::with_capacity(channel_count);
+        for _ in 0..channel_count {
+            channel_ids.push(reader.u16()?);
         }
         streams.push(StreamDescriptor {
             stream_id,
@@ -916,20 +1075,20 @@ fn decode_stream_table(reader: &mut PayloadReader<'_>) -> Result<StreamTable, Pr
             capture_phase,
             sample_rate_hz,
             consistency_group,
+            channel_ids,
         });
     }
     let mut bindings = Vec::with_capacity(binding_count);
     for _ in 0..binding_count {
         let channel_id = reader.u16()?;
         let stream_id = reader.u16()?;
-        let producer = ProcessingUnit::try_from(reader.u8()?)?;
-        if reader.u8()? != 0 {
-            return invalid("STREAM_TABLE channel binding reserved field must be zero");
-        }
+        let owner = SignalOwner::try_from(reader.u8()?)?;
+        let role = SignalRole::try_from(reader.u8()?)?;
         bindings.push(StreamChannelBinding {
             channel_id,
             stream_id,
-            producer,
+            owner,
+            role,
         });
     }
     let mut causal_relations = Vec::with_capacity(causal_relation_count);
@@ -958,9 +1117,13 @@ fn encode_stream_sample_batch(
 ) -> Result<(), ProtocolError> {
     validate_stream_sample_batch_header(batch)?;
     put_u16(bytes, batch.stream_id);
-    put_u32(bytes, batch.channel_table_revision);
+    put_u32(bytes, batch.stream_revision);
+    bytes.push(batch.domain as u8);
+    bytes.push(batch.capture_phase as u8);
+    put_u16(bytes, batch.consistency_group);
+    put_u64(bytes, batch.first_row_sequence);
+    put_u16(bytes, batch.row_count);
     put_u32(bytes, batch.sample_period_ticks);
-    put_u16(bytes, batch.sample_count);
     put_u16(
         bytes,
         u16::try_from(batch.channel_ids.len())
@@ -971,11 +1134,10 @@ fn encode_stream_sample_batch(
     }
     bytes.extend_from_slice(&batch.sample_data);
     for row in &batch.row_metadata {
-        put_u64(bytes, row.row_seq);
-        put_u64(bytes, row.source_seq);
-        put_u64(bytes, row.applied_seq);
+        put_u64(bytes, row.row_sequence);
+        put_u64(bytes, row.source_sequence);
+        put_u64(bytes, row.applied_sequence);
         put_u32(bytes, row.valid_flags);
-        put_u64(bytes, row.cla_completed_seq);
     }
     Ok(())
 }
@@ -984,9 +1146,13 @@ fn decode_stream_sample_batch(
     reader: &mut PayloadReader<'_>,
 ) -> Result<StreamSampleBatch, ProtocolError> {
     let stream_id = reader.u16()?;
-    let channel_table_revision = reader.u32()?;
+    let stream_revision = reader.u32()?;
+    let domain = SampleDomain::try_from(reader.u8()?)?;
+    let capture_phase = CapturePhase::try_from(reader.u8()?)?;
+    let consistency_group = reader.u16()?;
+    let first_row_sequence = reader.u64()?;
+    let row_count = reader.u16()?;
     let sample_period_ticks = reader.u32()?;
-    let sample_count = reader.u16()?;
     let channel_count = usize::from(reader.u16()?);
     validate_count(
         channel_count,
@@ -999,8 +1165,8 @@ fn decode_stream_sample_batch(
         channel_ids.push(reader.u16()?);
     }
     let channel_data_len = reader.remaining().len();
-    let metadata_len = usize::from(sample_count)
-        .checked_mul(StreamRowMetadata::ENCODED_LEN)
+    let metadata_len = usize::from(row_count)
+        .checked_mul(SnapshotMeta::ENCODED_LEN)
         .ok_or(ProtocolError::LengthOverflow)?;
     if channel_data_len < metadata_len {
         return invalid("stream sample batch is missing per-row metadata");
@@ -1009,21 +1175,24 @@ fn decode_stream_sample_batch(
     let sample_data = reader
         .bytes(signal_data_len, "stream sample data")?
         .to_vec();
-    let mut row_metadata = Vec::with_capacity(usize::from(sample_count));
-    for _ in 0..sample_count {
+    let mut row_metadata = Vec::with_capacity(usize::from(row_count));
+    for _ in 0..row_count {
         row_metadata.push(StreamRowMetadata {
-            row_seq: reader.u64()?,
-            source_seq: reader.u64()?,
-            applied_seq: reader.u64()?,
+            row_sequence: reader.u64()?,
+            source_sequence: reader.u64()?,
+            applied_sequence: reader.u64()?,
             valid_flags: reader.u32()?,
-            cla_completed_seq: reader.u64()?,
         });
     }
     let batch = StreamSampleBatch {
         stream_id,
-        channel_table_revision,
+        stream_revision,
+        domain,
+        capture_phase,
+        consistency_group,
+        first_row_sequence,
         sample_period_ticks,
-        sample_count,
+        row_count,
         channel_ids,
         sample_data,
         row_metadata,
@@ -1039,8 +1208,9 @@ fn encode_arm_capture(capture: &ArmCapture, bytes: &mut Vec<u8>) -> Result<(), P
     put_u16(bytes, 0);
     put_u32(bytes, capture.pretrigger_rows);
     put_u32(bytes, capture.posttrigger_rows);
+    put_u32(bytes, capture.timeout_samples);
     bytes.push(capture.trigger.kind as u8);
-    bytes.push(0);
+    bytes.push(capture.trigger.edge as u8);
     put_u16(bytes, capture.trigger.channel_id);
     put_f32(bytes, capture.trigger.level);
     put_f32(bytes, capture.trigger.hysteresis);
@@ -1057,14 +1227,14 @@ fn decode_arm_capture(reader: &mut PayloadReader<'_>) -> Result<ArmCapture, Prot
     }
     let pretrigger_rows = reader.u32()?;
     let posttrigger_rows = reader.u32()?;
+    let timeout_samples = reader.u32()?;
     let kind = CaptureTriggerKind::try_from(reader.u8()?)?;
-    if reader.u8()? != 0 {
-        return invalid("ARM_CAPTURE trigger reserved field must be zero");
-    }
+    let edge = CaptureEdge::try_from(reader.u8()?)?;
     let trigger = CaptureTrigger {
         kind,
         channel_id: reader.u16()?,
         level: reader.f32()?,
+        edge,
         hysteresis: reader.f32()?,
         flag_mask: reader.u32()?,
         flag_value: reader.u32()?,
@@ -1074,6 +1244,7 @@ fn decode_arm_capture(reader: &mut PayloadReader<'_>) -> Result<ArmCapture, Prot
         stream_id,
         pretrigger_rows,
         posttrigger_rows,
+        timeout_samples,
         trigger,
     };
     validate_arm_capture(&capture)?;
@@ -1172,6 +1343,9 @@ fn encode_capture_end(end: &CaptureEnd, bytes: &mut Vec<u8>) {
     bytes.extend_from_slice(&[0; 3]);
     put_u32(bytes, end.uploaded_rows);
     put_u32(bytes, end.dropped_rows);
+    put_u32(bytes, end.total_blocks);
+    put_u32(bytes, end.total_samples);
+    put_u32(bytes, end.integrity_summary);
 }
 
 fn decode_capture_end(reader: &mut PayloadReader<'_>) -> Result<CaptureEnd, ProtocolError> {
@@ -1185,6 +1359,9 @@ fn decode_capture_end(reader: &mut PayloadReader<'_>) -> Result<CaptureEnd, Prot
         state,
         uploaded_rows: reader.u32()?,
         dropped_rows: reader.u32()?,
+        total_blocks: reader.u32()?,
+        total_samples: reader.u32()?,
+        integrity_summary: reader.u32()?,
     })
 }
 
@@ -1208,7 +1385,7 @@ fn validate_arm_capture(capture: &ArmCapture) -> Result<(), ProtocolError> {
     if capture.trigger.hysteresis < 0.0 {
         return invalid("capture trigger hysteresis must be non-negative");
     }
-    if capture.trigger.kind == CaptureTriggerKind::HardwareFlag && capture.trigger.flag_mask == 0 {
+    if capture.trigger.kind == CaptureTriggerKind::FaultFlag && capture.trigger.flag_mask == 0 {
         return invalid("hardware capture trigger flag mask must be non-zero");
     }
     Ok(())
@@ -1248,33 +1425,43 @@ fn validate_configure_stream_shape(configure: &ConfigureStream) -> Result<(), Pr
 }
 
 fn validate_stream_sample_batch_header(batch: &StreamSampleBatch) -> Result<(), ProtocolError> {
+    if batch.stream_id == 0 || batch.stream_revision == 0 || batch.consistency_group == 0 {
+        return invalid("stream id, stream revision, and consistency group must be non-zero");
+    }
+    if batch.capture_phase != batch.domain.fixed_capture_phase() {
+        return invalid("stream sample batch has an invalid domain/capture phase combination");
+    }
     if batch.sample_period_ticks == 0 {
         return invalid("stream sample period ticks must be greater than zero");
     }
     validate_count(
-        usize::from(batch.sample_count),
+        usize::from(batch.row_count),
         1,
         MAX_BATCH_SAMPLES,
         "stream sample count",
     )?;
-    if batch.row_metadata.len() != usize::from(batch.sample_count) {
+    if batch.row_metadata.len() != usize::from(batch.row_count) {
         return invalid(format!(
             "stream sample metadata count {} does not match sample count {}",
             batch.row_metadata.len(),
-            batch.sample_count
+            batch.row_count
         ));
     }
     for row in &batch.row_metadata {
         if row.valid_flags & !VALID_FLAG_KNOWN_MASK != 0 {
             return invalid("stream row metadata contains unknown valid flag bits");
         }
-        if row.valid_flags & VALID_FLAG_DATA_FROZEN == 0 {
-            return invalid("stream row metadata is not DSP-frozen");
-        }
+    }
+    if batch
+        .row_metadata
+        .first()
+        .is_none_or(|row| row.row_sequence != batch.first_row_sequence)
+    {
+        return invalid("first row sequence does not match the first SnapshotMeta");
     }
     for pair in batch.row_metadata.windows(2) {
-        if pair[1].row_seq <= pair[0].row_seq {
-            return invalid("stream row sequences must be strictly increasing");
+        if pair[1].row_sequence != pair[0].row_sequence.saturating_add(1) {
+            return invalid("stream row sequences must be continuous within a batch");
         }
     }
     validate_count(
@@ -1501,6 +1688,7 @@ mod tests {
                     capture_phase: CapturePhase::AfterClaComplete,
                     sample_rate_hz: 32_000,
                     consistency_group: 1,
+                    channel_ids: vec![1],
                 },
                 StreamDescriptor {
                     stream_id: 20,
@@ -1508,6 +1696,7 @@ mod tests {
                     capture_phase: CapturePhase::ControlCycleEnd,
                     sample_rate_hz: 8_000,
                     consistency_group: 1,
+                    channel_ids: vec![0, 3],
                 },
                 StreamDescriptor {
                     stream_id: 30,
@@ -1515,28 +1704,33 @@ mod tests {
                     capture_phase: CapturePhase::LogicTaskEnd,
                     sample_rate_hz: 1_000,
                     consistency_group: 1,
+                    channel_ids: vec![2],
                 },
             ],
             bindings: vec![
                 StreamChannelBinding {
                     channel_id: 0,
                     stream_id: 20,
-                    producer: ProcessingUnit::Cpu1,
+                    owner: SignalOwner::Cpu1,
+                    role: SignalRole::ControlInput,
                 },
                 StreamChannelBinding {
                     channel_id: 1,
                     stream_id: 10,
-                    producer: ProcessingUnit::Cla,
+                    owner: SignalOwner::Cpu1Cla1,
+                    role: SignalRole::ControlOutput,
                 },
                 StreamChannelBinding {
                     channel_id: 2,
                     stream_id: 30,
-                    producer: ProcessingUnit::Cpu2,
+                    owner: SignalOwner::Cpu2,
+                    role: SignalRole::State,
                 },
                 StreamChannelBinding {
                     channel_id: 3,
                     stream_id: 20,
-                    producer: ProcessingUnit::Cpu1,
+                    owner: SignalOwner::Cpu1,
+                    role: SignalRole::AppliedCommand,
                 },
             ],
             causal_relations: vec![CausalRelation {
@@ -1552,17 +1746,46 @@ mod tests {
     fn rows(first: u64, count: usize) -> Vec<StreamRowMetadata> {
         (0..count)
             .map(|offset| StreamRowMetadata {
-                row_seq: first + offset as u64,
-                source_seq: first + offset as u64,
-                applied_seq: first.saturating_add(offset as u64).saturating_sub(1),
-                valid_flags: VALID_FLAG_CLA_COMPLETE
+                row_sequence: first + offset as u64,
+                source_sequence: first + offset as u64,
+                applied_sequence: first.saturating_add(offset as u64).saturating_sub(1),
+                valid_flags: SNAPSHOT_VALID
+                    | VALID_FLAG_CLA_COMPLETE
                     | VALID_FLAG_ADC_VALID
                     | VALID_FLAG_DATA_FROZEN
                     | VALID_FLAG_SOURCE_VALID
                     | VALID_FLAG_APPLIED_VALID,
-                cla_completed_seq: first + offset as u64,
             })
             .collect()
+    }
+
+    fn stream_batch(
+        stream_id: u16,
+        channel_ids: Vec<u16>,
+        sample_data: Vec<u8>,
+        row_metadata: Vec<StreamRowMetadata>,
+    ) -> StreamSampleBatch {
+        let stream = streams().stream(stream_id).unwrap().clone();
+        StreamSampleBatch {
+            stream_id,
+            stream_revision: 4,
+            domain: stream.domain,
+            capture_phase: stream.capture_phase,
+            consistency_group: stream.consistency_group,
+            first_row_sequence: row_metadata
+                .first()
+                .map(|row| row.row_sequence)
+                .unwrap_or(0),
+            sample_period_ticks: match stream.domain {
+                SampleDomain::Fast32k => 31,
+                SampleDomain::Control8k => 125,
+                SampleDomain::Slow1k => 1_000,
+            },
+            row_count: u16::try_from(row_metadata.len()).unwrap(),
+            channel_ids,
+            sample_data,
+            row_metadata,
+        }
     }
 
     #[test]
@@ -1575,8 +1798,25 @@ mod tests {
             MessageV2::decode(MSG_STREAM_TABLE, &payload).unwrap(),
             message
         );
-        assert_eq!(table.bindings[2].producer, ProcessingUnit::Cpu2);
+        assert_eq!(table.bindings[2].owner, SignalOwner::Cpu2);
         assert_eq!(table.causal_relations[0].application_result_offset, 1);
+    }
+
+    #[test]
+    fn v2_manual_trigger_golden_frame_is_little_endian_and_version_isolated() {
+        let frame = MessageV2::ManualTrigger(ManualTrigger {
+            capture_id: 0xa1b2_c3d4,
+        })
+        .into_frame(0, 0x1122_3344, 0x5566_7788, 0x0102_0304_0506_0708)
+        .unwrap();
+        assert_eq!(
+            frame.encode().unwrap(),
+            vec![
+                b'S', b'C', b'P', b'1', 2, 0x41, 0, 0, 0x44, 0x33, 0x22, 0x11, 4, 0, 0, 0, 0x88,
+                0x77, 0x66, 0x55, 8, 7, 6, 5, 4, 3, 2, 1, 0xd4, 0xc3, 0xb2, 0xa1, 0x30, 0xc8, 0xde,
+                0xcb,
+            ]
+        );
     }
 
     #[test]
@@ -1610,15 +1850,12 @@ mod tests {
 
     #[test]
     fn stream_batch_rejects_channels_from_another_stream() {
-        let message = MessageV2::StreamSampleBatch(StreamSampleBatch {
-            stream_id: 20,
-            channel_table_revision: 7,
-            sample_period_ticks: 125,
-            sample_count: 1,
-            channel_ids: vec![0, 2],
-            sample_data: [10_i16.to_le_bytes(), 20_i16.to_le_bytes()].concat(),
-            row_metadata: rows(100, 1),
-        });
+        let message = MessageV2::StreamSampleBatch(stream_batch(
+            20,
+            vec![0, 2],
+            [10_i16.to_le_bytes(), 20_i16.to_le_bytes()].concat(),
+            rows(100, 1),
+        ));
         let frame = message.into_frame(0, 3, 2, 1_000).unwrap();
 
         assert!(matches!(
@@ -1629,21 +1866,18 @@ mod tests {
 
     #[test]
     fn stream_batch_round_trips_in_a_v2_frame_with_causality_index() {
-        let message = MessageV2::StreamSampleBatch(StreamSampleBatch {
-            stream_id: 20,
-            channel_table_revision: 7,
-            sample_period_ticks: 125,
-            sample_count: 2,
-            channel_ids: vec![0, 3],
-            sample_data: [
+        let message = MessageV2::StreamSampleBatch(stream_batch(
+            20,
+            vec![0, 3],
+            [
                 10_i16.to_le_bytes(),
                 20_i16.to_le_bytes(),
                 30_i16.to_le_bytes(),
                 40_i16.to_le_bytes(),
             ]
             .concat(),
-            row_metadata: rows(100, 2),
-        });
+            rows(100, 2),
+        ));
         let frame = message.into_frame(0, 3, 2, 1_000).unwrap();
         let encoded = frame.encode().unwrap();
         let decoded_frame = Frame::decode(&encoded).unwrap();
@@ -1651,7 +1885,7 @@ mod tests {
         assert_eq!(decoded_frame.version, PROTOCOL_VERSION_V2);
         let batch = decode_stream_sample_frame(&decoded_frame, &channels(), &streams()).unwrap();
         assert_eq!(batch.stream_id, 20);
-        assert_eq!(batch.row_metadata[0].row_seq, 100);
+        assert_eq!(batch.row_metadata[0].row_sequence, 100);
         assert_eq!(
             batch.row_metadata[1].applied_alignment(),
             CausalAlignment::PreviousShot
@@ -1673,15 +1907,13 @@ mod tests {
 
     #[test]
     fn stream_batch_requires_one_metadata_row_per_sample() {
-        let batch = StreamSampleBatch {
-            stream_id: 20,
-            channel_table_revision: 7,
-            sample_period_ticks: 125,
-            sample_count: 2,
-            channel_ids: vec![0],
-            sample_data: [10_i16.to_le_bytes(), 20_i16.to_le_bytes()].concat(),
-            row_metadata: rows(100, 1),
-        };
+        let mut batch = stream_batch(
+            20,
+            vec![0],
+            [10_i16.to_le_bytes(), 20_i16.to_le_bytes()].concat(),
+            rows(100, 1),
+        );
+        batch.row_count = 2;
 
         assert!(MessageV2::StreamSampleBatch(batch)
             .encode_payload()
@@ -1692,34 +1924,16 @@ mod tests {
     fn stream_batch_rejects_rows_that_are_not_frozen_or_cla_complete() {
         let mut metadata = rows(100, 1);
         metadata[0].valid_flags &= !VALID_FLAG_DATA_FROZEN;
-        let batch = StreamSampleBatch {
-            stream_id: 20,
-            channel_table_revision: 7,
-            sample_period_ticks: 125,
-            sample_count: 1,
-            channel_ids: vec![0],
-            sample_data: 10_i16.to_le_bytes().to_vec(),
-            row_metadata: metadata,
-        };
-        assert!(MessageV2::StreamSampleBatch(batch)
-            .encode_payload()
-            .is_err());
+        let batch = stream_batch(20, vec![0], 10_i16.to_le_bytes().to_vec(), metadata);
+        assert!(MessageV2::StreamSampleBatch(batch).encode_payload().is_ok());
 
         let mut metadata = rows(100, 1);
         metadata[0].valid_flags &= !VALID_FLAG_CLA_COMPLETE;
-        let batch = StreamSampleBatch {
-            stream_id: 10,
-            channel_table_revision: 7,
-            sample_period_ticks: 31,
-            sample_count: 1,
-            channel_ids: vec![1],
-            sample_data: 10_i16.to_le_bytes().to_vec(),
-            row_metadata: metadata,
-        };
+        let batch = stream_batch(10, vec![1], 10_i16.to_le_bytes().to_vec(), metadata);
         let frame = MessageV2::StreamSampleBatch(batch)
             .into_frame(0, 3, 2, 1_000)
             .unwrap();
-        assert!(decode_stream_sample_frame(&frame, &channels(), &streams()).is_err());
+        assert!(decode_stream_sample_frame(&frame, &channels(), &streams()).is_ok());
     }
 
     #[test]
@@ -1729,10 +1943,12 @@ mod tests {
             stream_id: 10,
             pretrigger_rows: 1_024,
             posttrigger_rows: 2_048,
+            timeout_samples: 4_096,
             trigger: CaptureTrigger {
-                kind: CaptureTriggerKind::HardwareFlag,
+                kind: CaptureTriggerKind::FaultFlag,
                 channel_id: 0,
                 level: 0.0,
+                edge: CaptureEdge::Rising,
                 hysteresis: 0.0,
                 flag_mask: 0x20,
                 flag_value: 0x20,
@@ -1744,15 +1960,7 @@ mod tests {
         let data = MessageV2::CaptureData(CaptureData {
             capture_id: 9,
             block_index: 3,
-            batch: StreamSampleBatch {
-                stream_id: 10,
-                channel_table_revision: 7,
-                sample_period_ticks: 31,
-                sample_count: 1,
-                channel_ids: vec![1],
-                sample_data: 10_i16.to_le_bytes().to_vec(),
-                row_metadata: rows(88, 1),
-            },
+            batch: stream_batch(10, vec![1], 10_i16.to_le_bytes().to_vec(), rows(88, 1)),
         });
         let payload = data.encode_payload().unwrap();
         assert_eq!(MessageV2::decode(MSG_CAPTURE_DATA, &payload).unwrap(), data);
