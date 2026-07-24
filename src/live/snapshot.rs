@@ -4,9 +4,11 @@
 //! variables.  It only accepts the row frozen and emitted by the DSP, then
 //! records semantic defects for diagnostics.
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
-use super::protocol_v2::{SampleDomain, StreamDescriptor};
+use super::protocol_v2::{CausalRelation, SampleDomain, SignalRole, StreamDescriptor, StreamTable};
 
 pub const SNAPSHOT_VALID: u32 = 1 << 0;
 pub const SOURCE_SEQUENCE_VALID: u32 = 1 << 1;
@@ -45,14 +47,29 @@ pub struct SnapshotDiagnostics {
     pub source_sequence_faults: u64,
     pub applied_sequence_faults: u64,
     pub invalid_snapshot_rows: u64,
+    pub missing_causal_source: u64,
+    pub causal_source_mismatch: u64,
+    pub causal_application_mismatch: u64,
+    pub causal_sequence_reorder: u64,
+    pub causal_group_mismatch: u64,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct SnapshotValidator {
+    streams: BTreeMap<u16, StreamSequenceState>,
+    /// Rows are keyed by stream-local *logical control-cycle sequence*.  They
+    /// are never compared as physical timestamps across sampling domains.
+    causal_rows: BTreeMap<(u16, u64), SnapshotMeta>,
+    causal_last_result: BTreeMap<(u16, u16, u16), u64>,
+    causal_last_application: BTreeMap<(u16, u16, u16), u64>,
+    diagnostics: SnapshotDiagnostics,
+}
+
+#[derive(Clone, Debug, Default)]
+struct StreamSequenceState {
     last_row_sequence: Option<u64>,
     last_source_sequence: Option<u64>,
     last_applied_sequence: Option<u64>,
-    diagnostics: SnapshotDiagnostics,
 }
 
 impl SnapshotValidator {
@@ -61,16 +78,71 @@ impl SnapshotValidator {
     }
 
     pub fn observe(&mut self, descriptor: &StreamDescriptor, meta: SnapshotMeta) {
+        self.observe_inner(descriptor, meta, false, false);
+        // Compatibility-only local diagnostics for callers that have not
+        // negotiated a STREAM_TABLE.  The table-aware path intentionally does
+        // not apply this rule: causal offsets are defined by CausalRelation.
+        if meta.valid_flags & SOURCE_SEQUENCE_VALID != 0 && meta.source_sequence > meta.row_sequence
+        {
+            self.diagnostics.source_sequence_faults =
+                self.diagnostics.source_sequence_faults.saturating_add(1);
+        }
+        if meta.valid_flags & APPLIED_SEQUENCE_VALID != 0
+            && meta.applied_sequence >= meta.row_sequence
+        {
+            self.diagnostics.applied_sequence_faults =
+                self.diagnostics.applied_sequence_faults.saturating_add(1);
+        }
+    }
+
+    /// Observes one frozen row using the negotiated STREAM_TABLE.  Relations
+    /// are evaluated strictly in their declared consistency group and use
+    /// logical control-cycle sequences, never the wall-clock coincidence of
+    /// a 32 kHz, 8 kHz, or 1 kHz row.
+    pub fn observe_with_table(
+        &mut self,
+        table: &StreamTable,
+        descriptor: &StreamDescriptor,
+        meta: SnapshotMeta,
+    ) {
+        let source_required = matches!(
+            descriptor.domain,
+            SampleDomain::Fast32k | SampleDomain::Control8k
+        ) || table
+            .causal_relations
+            .iter()
+            .any(|relation| relation.result_stream_id == descriptor.stream_id);
+        let applied_required = table.bindings.iter().any(|binding| {
+            binding.stream_id == descriptor.stream_id && binding.role == SignalRole::AppliedCommand
+        }) || table
+            .causal_relations
+            .iter()
+            .any(|relation| relation.application_stream_id == descriptor.stream_id);
+        self.observe_inner(descriptor, meta, source_required, applied_required);
+        self.causal_rows
+            .insert((descriptor.stream_id, meta.row_sequence), meta);
+        for relation in &table.causal_relations {
+            self.observe_relation(table, descriptor, meta, relation);
+        }
+    }
+
+    fn observe_inner(
+        &mut self,
+        descriptor: &StreamDescriptor,
+        meta: SnapshotMeta,
+        source_required: bool,
+        applied_required: bool,
+    ) {
+        let required_flags = required_flags(descriptor, source_required, applied_required);
         if !meta.is_frozen()
             || meta.valid_flags & !SNAPSHOT_KNOWN_FLAGS != 0
-            || (descriptor.domain == SampleDomain::Fast32k
-                && meta.valid_flags & CLA_RESULT_VALID == 0)
+            || meta.valid_flags & required_flags != required_flags
         {
             self.diagnostics.invalid_snapshot_rows =
                 self.diagnostics.invalid_snapshot_rows.saturating_add(1);
         }
-
-        if let Some(previous) = self.last_row_sequence {
+        let state = self.streams.entry(descriptor.stream_id).or_default();
+        if let Some(previous) = state.last_row_sequence {
             if meta.row_sequence <= previous {
                 self.diagnostics.row_sequence_reorders =
                     self.diagnostics.row_sequence_reorders.saturating_add(1);
@@ -81,42 +153,163 @@ impl SnapshotValidator {
         }
 
         if meta.valid_flags & SOURCE_SEQUENCE_VALID != 0 {
-            if self
+            if state
                 .last_source_sequence
                 .is_some_and(|previous| meta.source_sequence < previous)
-                || matches!(
-                    descriptor.domain,
-                    SampleDomain::Fast32k | SampleDomain::Control8k
-                ) && meta.source_sequence > meta.row_sequence
             {
                 self.diagnostics.source_sequence_faults =
                     self.diagnostics.source_sequence_faults.saturating_add(1);
             }
-            self.last_source_sequence = Some(meta.source_sequence);
-        } else {
+            state.last_source_sequence = Some(meta.source_sequence);
+        } else if source_required {
             self.diagnostics.source_sequence_faults =
                 self.diagnostics.source_sequence_faults.saturating_add(1);
         }
 
         if meta.valid_flags & APPLIED_SEQUENCE_VALID != 0 {
-            let future = matches!(
-                descriptor.domain,
-                SampleDomain::Fast32k | SampleDomain::Control8k
-            ) && meta.applied_sequence >= meta.row_sequence;
-            let reversed = self
+            let reversed = state
                 .last_applied_sequence
                 .is_some_and(|previous| meta.applied_sequence < previous);
-            if future || reversed {
+            if reversed {
                 self.diagnostics.applied_sequence_faults =
                     self.diagnostics.applied_sequence_faults.saturating_add(1);
             }
-            self.last_applied_sequence = Some(meta.applied_sequence);
-        } else {
+            state.last_applied_sequence = Some(meta.applied_sequence);
+        } else if applied_required {
             self.diagnostics.applied_sequence_faults =
                 self.diagnostics.applied_sequence_faults.saturating_add(1);
         }
 
-        self.last_row_sequence = Some(meta.row_sequence);
+        state.last_row_sequence = Some(meta.row_sequence);
+    }
+
+    fn observe_relation(
+        &mut self,
+        table: &StreamTable,
+        descriptor: &StreamDescriptor,
+        meta: SnapshotMeta,
+        relation: &CausalRelation,
+    ) {
+        if !relation_group_matches(table, relation, descriptor) {
+            self.diagnostics.causal_group_mismatch =
+                self.diagnostics.causal_group_mismatch.saturating_add(1);
+            return;
+        }
+        let key = (
+            relation.input_stream_id,
+            relation.result_stream_id,
+            relation.application_stream_id,
+        );
+        if descriptor.stream_id == relation.result_stream_id {
+            if self
+                .causal_last_result
+                .insert(key, meta.row_sequence)
+                .is_some_and(|previous| meta.row_sequence <= previous)
+            {
+                self.diagnostics.causal_sequence_reorder =
+                    self.diagnostics.causal_sequence_reorder.saturating_add(1);
+            }
+            let Some(input) = self
+                .causal_rows
+                .get(&(relation.input_stream_id, meta.row_sequence))
+            else {
+                self.diagnostics.missing_causal_source =
+                    self.diagnostics.missing_causal_source.saturating_add(1);
+                return;
+            };
+            let expected = add_offset(input.row_sequence, relation.result_input_offset);
+            if meta.valid_flags & SOURCE_SEQUENCE_VALID == 0
+                || expected != Some(meta.source_sequence)
+            {
+                self.diagnostics.causal_source_mismatch =
+                    self.diagnostics.causal_source_mismatch.saturating_add(1);
+            }
+        }
+        if descriptor.stream_id == relation.application_stream_id {
+            if self
+                .causal_last_application
+                .insert(key, meta.row_sequence)
+                .is_some_and(|previous| meta.row_sequence <= previous)
+            {
+                self.diagnostics.causal_sequence_reorder =
+                    self.diagnostics.causal_sequence_reorder.saturating_add(1);
+            }
+            let Some(result_sequence) =
+                add_offset(meta.row_sequence, -relation.application_result_offset)
+            else {
+                self.diagnostics.causal_application_mismatch = self
+                    .diagnostics
+                    .causal_application_mismatch
+                    .saturating_add(1);
+                return;
+            };
+            let Some(result) = self
+                .causal_rows
+                .get(&(relation.result_stream_id, result_sequence))
+            else {
+                self.diagnostics.missing_causal_source =
+                    self.diagnostics.missing_causal_source.saturating_add(1);
+                return;
+            };
+            let expected = add_offset(result.row_sequence, relation.application_result_offset);
+            if meta.valid_flags & APPLIED_SEQUENCE_VALID == 0
+                || expected != Some(meta.applied_sequence)
+            {
+                self.diagnostics.causal_application_mismatch = self
+                    .diagnostics
+                    .causal_application_mismatch
+                    .saturating_add(1);
+            }
+        }
+    }
+}
+
+fn required_flags(
+    descriptor: &StreamDescriptor,
+    source_required: bool,
+    applied_required: bool,
+) -> u32 {
+    let mut flags = SNAPSHOT_VALID | FROZEN_ROW;
+    match descriptor.domain {
+        SampleDomain::Fast32k => {
+            flags |= SOURCE_SEQUENCE_VALID | ADC_SAMPLE_VALID | CLA_RESULT_VALID;
+        }
+        SampleDomain::Control8k => flags |= SOURCE_SEQUENCE_VALID,
+        SampleDomain::Slow1k => {}
+    }
+    if source_required {
+        flags |= SOURCE_SEQUENCE_VALID;
+    }
+    if applied_required {
+        flags |= APPLIED_SEQUENCE_VALID;
+    }
+    flags
+}
+
+fn relation_group_matches(
+    table: &StreamTable,
+    relation: &CausalRelation,
+    descriptor: &StreamDescriptor,
+) -> bool {
+    let Some(input) = table.stream(relation.input_stream_id) else {
+        return false;
+    };
+    let Some(result) = table.stream(relation.result_stream_id) else {
+        return false;
+    };
+    let Some(application) = table.stream(relation.application_stream_id) else {
+        return false;
+    };
+    input.consistency_group == result.consistency_group
+        && result.consistency_group == application.consistency_group
+        && descriptor.consistency_group == input.consistency_group
+}
+
+fn add_offset(sequence: u64, offset: i16) -> Option<u64> {
+    if offset >= 0 {
+        sequence.checked_add(offset as u64)
+    } else {
+        sequence.checked_sub(u64::from(offset.unsigned_abs()))
     }
 }
 
@@ -150,6 +343,58 @@ mod tests {
         }
     }
 
+    fn causal_table() -> StreamTable {
+        StreamTable {
+            revision: 1,
+            streams: vec![
+                fast(),
+                StreamDescriptor {
+                    stream_id: 2,
+                    domain: SampleDomain::Control8k,
+                    capture_phase: CapturePhase::ControlCycleEnd,
+                    sample_rate_hz: 8_000,
+                    consistency_group: 1,
+                    channel_ids: vec![2],
+                },
+                StreamDescriptor {
+                    stream_id: 3,
+                    domain: SampleDomain::Slow1k,
+                    capture_phase: CapturePhase::LogicTaskEnd,
+                    sample_rate_hz: 1_000,
+                    consistency_group: 1,
+                    channel_ids: vec![3],
+                },
+            ],
+            bindings: vec![
+                super::super::protocol_v2::StreamChannelBinding {
+                    channel_id: 1,
+                    stream_id: 1,
+                    owner: super::super::protocol_v2::SignalOwner::Cpu1Cla1,
+                    role: SignalRole::ControlInput,
+                },
+                super::super::protocol_v2::StreamChannelBinding {
+                    channel_id: 2,
+                    stream_id: 2,
+                    owner: super::super::protocol_v2::SignalOwner::Cpu1,
+                    role: SignalRole::ControlOutput,
+                },
+                super::super::protocol_v2::StreamChannelBinding {
+                    channel_id: 3,
+                    stream_id: 3,
+                    owner: super::super::protocol_v2::SignalOwner::Cpu2,
+                    role: SignalRole::AppliedCommand,
+                },
+            ],
+            causal_relations: vec![CausalRelation {
+                input_stream_id: 1,
+                result_stream_id: 2,
+                application_stream_id: 3,
+                result_input_offset: 0,
+                application_result_offset: 1,
+            }],
+        }
+    }
+
     #[test]
     fn accepts_a_legal_one_cycle_pipeline() {
         let mut validator = SnapshotValidator::default();
@@ -172,5 +417,60 @@ mod tests {
         assert_eq!(diagnostics.source_sequence_faults, 1);
         assert_eq!(diagnostics.applied_sequence_faults, 1);
         assert_eq!(diagnostics.invalid_snapshot_rows, 1);
+    }
+
+    #[test]
+    fn validates_cross_domain_causal_offsets_without_claiming_simultaneity() {
+        let table = causal_table();
+        let mut validator = SnapshotValidator::default();
+        let input = table.stream(1).unwrap();
+        let result = table.stream(2).unwrap();
+        let application = table.stream(3).unwrap();
+        validator.observe_with_table(&table, input, valid(40));
+        validator.observe_with_table(&table, result, valid(40));
+        let mut applied = valid(41);
+        applied.applied_sequence = 41;
+        validator.observe_with_table(&table, application, applied);
+        assert_eq!(validator.diagnostics(), &SnapshotDiagnostics::default());
+    }
+
+    #[test]
+    fn diagnoses_missing_and_mismatched_causal_sequences() {
+        let table = causal_table();
+        let mut validator = SnapshotValidator::default();
+        let result = table.stream(2).unwrap();
+        validator.observe_with_table(&table, result, valid(7));
+        assert_eq!(validator.diagnostics().missing_causal_source, 1);
+
+        let mut validator = SnapshotValidator::default();
+        let input = table.stream(1).unwrap();
+        validator.observe_with_table(&table, input, valid(7));
+        let mut result_meta = valid(7);
+        result_meta.source_sequence = 8;
+        validator.observe_with_table(&table, result, result_meta);
+        assert_eq!(validator.diagnostics().causal_source_mismatch, 1);
+    }
+
+    #[test]
+    fn diagnoses_early_application_reorder_and_group_mismatch() {
+        let table = causal_table();
+        let mut validator = SnapshotValidator::default();
+        let input = table.stream(1).unwrap();
+        let result = table.stream(2).unwrap();
+        let application = table.stream(3).unwrap();
+        validator.observe_with_table(&table, input, valid(12));
+        validator.observe_with_table(&table, result, valid(12));
+        let mut early = valid(13);
+        early.applied_sequence = 12;
+        validator.observe_with_table(&table, application, early);
+        validator.observe_with_table(&table, input, valid(11));
+        validator.observe_with_table(&table, result, valid(11));
+        let mut wrong_group = input.clone();
+        wrong_group.consistency_group = 2;
+        validator.observe_with_table(&table, &wrong_group, valid(14));
+        let diagnostics = validator.diagnostics();
+        assert_eq!(diagnostics.causal_application_mismatch, 1);
+        assert_eq!(diagnostics.causal_sequence_reorder, 1);
+        assert_eq!(diagnostics.causal_group_mismatch, 1);
     }
 }

@@ -3,6 +3,8 @@
 //! V2 deliberately leaves the frozen V1 messages untouched. A V2 session uses
 //! version-2 frames and these new message types after capability negotiation.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde::{Deserialize, Serialize};
 
 use super::protocol::{
@@ -33,6 +35,11 @@ pub const MSG_CAPTURE_END: u8 = 0x46;
 pub const MAX_STREAM_COUNT: usize = 64;
 pub const MAX_CAUSAL_RELATION_COUNT: usize = 64;
 pub const MAX_CAPTURE_ROWS: u32 = 1_048_576;
+/// Capture limits are deliberately protocol constants: reject malformed or
+/// hostile uploads before allocating their advertised amount of memory.
+pub const MAX_CAPTURE_BLOCKS: u32 = 4_096;
+pub const MAX_CAPTURE_BLOCK_ROWS: u16 = 4_096;
+pub const MAX_CAPTURE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 pub const VALID_FLAG_CLA_COMPLETE: u32 = CLA_RESULT_VALID;
 pub const VALID_FLAG_ADC_VALID: u32 = ADC_SAMPLE_VALID;
@@ -274,15 +281,15 @@ impl StreamTable {
             "causal relation count",
         )?;
 
-        let mut stream_ids = Vec::with_capacity(self.streams.len());
+        let mut stream_ids = BTreeSet::new();
+        let mut descriptor_channel_ids = BTreeSet::new();
         for stream in &self.streams {
             if stream.stream_id == 0 {
                 return invalid("stream id must be non-zero");
             }
-            if stream_ids.contains(&stream.stream_id) {
+            if !stream_ids.insert(stream.stream_id) {
                 return invalid(format!("duplicate stream id {}", stream.stream_id));
             }
-            stream_ids.push(stream.stream_id);
             if stream.consistency_group == 0 {
                 return invalid(format!(
                     "stream {} must declare a non-zero consistency group",
@@ -310,23 +317,26 @@ impl StreamTable {
             if stream.channel_ids.is_empty() {
                 return invalid(format!("stream {} has no channel ids", stream.stream_id));
             }
-            let mut stream_channels = 0_u64;
+            let mut stream_channels = BTreeSet::new();
             for channel_id in &stream.channel_ids {
                 if usize::from(*channel_id) >= MAX_CHANNEL_COUNT {
                     return invalid(format!("stream channel id {channel_id} is out of range"));
                 }
-                let bit = 1_u64 << channel_id;
-                if stream_channels & bit != 0 {
+                if !stream_channels.insert(*channel_id) {
                     return invalid(format!(
                         "stream {} repeats channel {channel_id}",
                         stream.stream_id
                     ));
                 }
-                stream_channels |= bit;
+                if !descriptor_channel_ids.insert(*channel_id) {
+                    return invalid(format!(
+                        "channel {channel_id} appears in more than one stream descriptor"
+                    ));
+                }
             }
         }
 
-        let mut channel_ids = Vec::with_capacity(self.bindings.len());
+        let mut binding_channel_ids = BTreeSet::new();
         for binding in &self.bindings {
             if usize::from(binding.channel_id) >= MAX_CHANNEL_COUNT {
                 return invalid(format!(
@@ -334,13 +344,12 @@ impl StreamTable {
                     binding.channel_id
                 ));
             }
-            if channel_ids.contains(&binding.channel_id) {
+            if !binding_channel_ids.insert(binding.channel_id) {
                 return invalid(format!(
                     "channel {} is bound to more than one stream",
                     binding.channel_id
                 ));
             }
-            channel_ids.push(binding.channel_id);
             if self.stream(binding.stream_id).is_none() {
                 return invalid(format!(
                     "channel {} references unknown stream {}",
@@ -349,26 +358,14 @@ impl StreamTable {
             }
         }
         for stream in &self.streams {
-            if !self
-                .bindings
-                .iter()
-                .any(|binding| binding.stream_id == stream.stream_id)
-            {
-                return invalid(format!(
-                    "stream {} has no channel bindings",
-                    stream.stream_id
-                ));
-            }
-            if self
+            let descriptor_set = stream.channel_ids.iter().copied().collect::<BTreeSet<_>>();
+            let binding_set = self
                 .bindings
                 .iter()
                 .filter(|binding| binding.stream_id == stream.stream_id)
-                .any(|binding| !stream.channel_ids.contains(&binding.channel_id))
-                || stream
-                    .channel_ids
-                    .iter()
-                    .any(|channel_id| self.binding(*channel_id).is_none())
-            {
+                .map(|binding| binding.channel_id)
+                .collect::<BTreeSet<_>>();
+            if descriptor_set != binding_set {
                 return invalid(format!(
                     "stream {} channel ids and bindings disagree",
                     stream.stream_id
@@ -376,6 +373,8 @@ impl StreamTable {
             }
         }
 
+        let mut relations = BTreeSet::new();
+        let mut result_definitions = BTreeMap::new();
         for relation in &self.causal_relations {
             let input = self.stream(relation.input_stream_id).ok_or_else(|| {
                 invalid_error(format!(
@@ -407,6 +406,25 @@ impl StreamTable {
             {
                 return invalid("causal relation streams must share one consistency group");
             }
+            let relation_key = (
+                relation.input_stream_id,
+                relation.result_stream_id,
+                relation.application_stream_id,
+                relation.result_input_offset,
+                relation.application_result_offset,
+            );
+            if !relations.insert(relation_key) {
+                return invalid("duplicate causal relation");
+            }
+            if result_definitions
+                .insert(relation.result_stream_id, relation_key)
+                .is_some()
+            {
+                return invalid(format!(
+                    "result stream {} has more than one causal relation",
+                    relation.result_stream_id
+                ));
+            }
         }
         Ok(())
     }
@@ -424,6 +442,39 @@ impl StreamTable {
         }
         Ok(())
     }
+}
+
+/// Validates the exact tick period advertised by a fixed-rate V2 stream.
+///
+/// SCP1 V2 deliberately freezes the rule to an integral division.  A device
+/// whose timer cannot represent a domain period exactly must reject the V2
+/// stream instead of silently rounding and accumulating timestamp drift.
+pub fn validate_stream_sample_period(
+    tick_hz: u64,
+    descriptor: &StreamDescriptor,
+    sample_period_ticks: u32,
+) -> Result<(), ProtocolError> {
+    if tick_hz == 0 {
+        return invalid("HELLO_ACK tick_hz must be non-zero for SCP1 V2 streams");
+    }
+    let rate = u64::from(descriptor.sample_rate_hz);
+    if !tick_hz.is_multiple_of(rate) {
+        return invalid(format!(
+            "tick_hz {tick_hz} is not exactly divisible by stream {} rate {}",
+            descriptor.stream_id, descriptor.sample_rate_hz
+        ));
+    }
+    let expected = tick_hz / rate;
+    if expected == 0 || expected > u64::from(u32::MAX) {
+        return invalid("fixed stream sample period is outside the wire range");
+    }
+    if u64::from(sample_period_ticks) != expected {
+        return invalid(format!(
+            "stream {} sample period {sample_period_ticks} does not match fixed period {expected}",
+            descriptor.stream_id
+        ));
+    }
+    Ok(())
 }
 
 /// V2 stream configuration. There is no caller-chosen sample rate: the stream
@@ -772,6 +823,28 @@ impl MessageV2 {
             self.encode_payload()?,
         ))
     }
+}
+
+/// Computes the frozen CAPTURE_END integrity summary.
+///
+/// The input is the little-endian capture id followed by the encoded
+/// CAPTURE_DATA payloads in ascending block-index order.  The payload bytes,
+/// rather than decoded floating-point values, make this independent of host
+/// architecture and preserve exactly what the DSP uploaded.
+pub fn capture_integrity_summary(
+    capture_id: u32,
+    blocks: &[CaptureData],
+) -> Result<u32, ProtocolError> {
+    let mut sorted = blocks.to_vec();
+    sorted.sort_by_key(|block| block.block_index);
+    let mut bytes = capture_id.to_le_bytes().to_vec();
+    for block in sorted {
+        bytes.extend_from_slice(&MessageV2::CaptureData(block).encode_payload()?);
+        if bytes.len() > MAX_CAPTURE_PAYLOAD_BYTES {
+            return Err(ProtocolError::PayloadTooLarge(bytes.len()));
+        }
+    }
+    Ok(crc32c(&bytes))
 }
 
 /// Validates the negotiated V2 configuration and rejects any mixed-domain mask.
@@ -1540,6 +1613,21 @@ fn put_f32(bytes: &mut Vec<u8>, value: f32) {
     bytes.extend_from_slice(&value.to_le_bytes());
 }
 
+fn crc32c(bytes: &[u8]) -> u32 {
+    let mut crc = !0_u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0x82F6_3B78
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
 fn invalid<T>(message: impl Into<String>) -> Result<T, ProtocolError> {
     Err(invalid_error(message))
 }
@@ -1828,6 +1916,48 @@ mod tests {
         let mut invalid_table = streams();
         invalid_table.streams[1].capture_phase = CapturePhase::LogicTaskEnd;
         assert!(invalid_table.validate().is_err());
+    }
+
+    #[test]
+    fn stream_table_requires_exact_descriptor_and_binding_sets() {
+        let mut missing = streams();
+        missing.bindings.retain(|binding| binding.channel_id != 3);
+        assert!(missing.validate().is_err());
+
+        let mut extra = streams();
+        extra.bindings[0].stream_id = 10;
+        assert!(extra.validate().is_err());
+
+        let mut repeated_channel = streams();
+        repeated_channel.streams[1].channel_ids.push(1);
+        assert!(repeated_channel.validate().is_err());
+
+        let mut contradictory = streams();
+        contradictory.causal_relations.push(CausalRelation {
+            input_stream_id: 10,
+            result_stream_id: 30,
+            application_stream_id: 20,
+            result_input_offset: 1,
+            application_result_offset: 1,
+        });
+        assert!(contradictory.validate().is_err());
+    }
+
+    #[test]
+    fn fixed_stream_period_requires_exact_integral_tick_division() {
+        let table = streams();
+        assert!(
+            validate_stream_sample_period(32_000_000, table.stream(10).unwrap(), 1_000).is_ok()
+        );
+        assert!(
+            validate_stream_sample_period(32_000_000, table.stream(20).unwrap(), 4_000).is_ok()
+        );
+        assert!(
+            validate_stream_sample_period(32_000_000, table.stream(30).unwrap(), 32_000).is_ok()
+        );
+        assert!(validate_stream_sample_period(32_000_000, table.stream(10).unwrap(), 0).is_err());
+        assert!(validate_stream_sample_period(32_000_000, table.stream(10).unwrap(), 999).is_err());
+        assert!(validate_stream_sample_period(1_000_000, table.stream(10).unwrap(), 31).is_err());
     }
 
     #[test]
