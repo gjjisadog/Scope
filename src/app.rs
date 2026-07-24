@@ -19905,12 +19905,7 @@ impl ScopeApp {
                 cancel,
             )
         } else {
-            source.read_range_segments(
-                meta.start_time,
-                meta.end_time,
-                &[channel],
-                max_points,
-            )
+            source.read_range_segments(meta.start_time, meta.end_time, &[channel], max_points)
         }
         .map_err(|error| error.to_string())?;
         let segments = blocks

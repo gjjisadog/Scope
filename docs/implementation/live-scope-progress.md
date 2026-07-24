@@ -1,6 +1,6 @@
 # DSP 实时软件示波器 V1 + V2 实施进度
 
-最后更新：2026-07-24（Scope Analyzer 0.15.0）
+最后更新：2026-07-24（Scope Analyzer 0.15.1）
 
 ## 当前里程碑
 
@@ -14,6 +14,7 @@
 - TCP simulator 提供可重复的 `30k-*` V2 预设；这是 simulator/client 验证，不是 DSP 硬件验证。
 - 现有 LAUNCHXL-F28P65X V1 客户端实测仍是 V1 证据；真实 Hybrid30K 的 CPU1/CPU2/CLA V2 冻结实现、DMA/RAMGS 与真机验收均未进行。
 - 异步 V1 录波 writer 的实际有界队列容量为 **1024** 项；V2 Capture 不进入该队列。
+- 0.15.1 完成 V2 加固：CausalRelation 跨 stream 逻辑序号、Capture CRC32C/边界、精确 stream/binding 集合、固定 period、双向心跳、STATUS/ERROR 和主机背压诊断均已由单元及 15 preset 会话矩阵覆盖。
 
 ## 已完成内容
 

@@ -20,4 +20,6 @@
 | `30k-capture-chunk-reorder` | 检测乱序块 |
 | `30k-device-reset` | 检测 DeviceReset，Capture 失败 |
 
+0.15.1 的自动化端到端矩阵逐项执行“TCP simulator → LiveSession V2 → 帧解码 → Stream/Snapshot/Capture 校验 → 最终 SessionEvent”；所有 15 项通过。`live-inspect` 对快照诊断或协议拒绝返回非零退出码，`capture-inspect` 对 CaptureFailure 或失败状态返回非零退出码；正常预设返回 JSON `ok=true`。
+
 这些是 TCP simulator/client 验证，绝不是 Hybrid30K DSP 硬件验证。

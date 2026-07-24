@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
-$version = "0.15.0"
+$version = "0.15.1"
 $dist = Join-Path $root "dist"
 $stage = Join-Path $dist "ScopeAnalyzer-$version-win-x64"
 $zip = Join-Path $dist "ScopeAnalyzer-$version-win-x64.zip"
