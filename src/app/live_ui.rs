@@ -1846,10 +1846,11 @@ impl ScopeApp {
                 }
                 if let Some(batch) = &self.live.v2_last_snapshot {
                     if let Some(row) = batch.row_metadata.last() {
-                        ui.label("Row / Source / Applied");
+                        ui.label("Row / Logical / Source / Applied");
                         ui.label(format!(
-                            "{} / {} / {} (flags 0x{:08x})",
+                            "{} / {} / {} / {} (flags 0x{:08x})",
                             row.row_sequence,
+                            row.logical_cycle_sequence,
                             row.source_sequence,
                             row.applied_sequence,
                             row.valid_flags
@@ -1871,6 +1872,9 @@ impl ScopeApp {
                     diagnostics.applied_sequence_faults,
                     diagnostics.invalid_snapshot_rows
                 ));
+                ui.end_row();
+                ui.label("V2 causal cache evictions");
+                ui.label(diagnostics.causal_cache_evictions.to_string());
                 ui.end_row();
             });
     }

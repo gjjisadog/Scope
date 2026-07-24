@@ -297,6 +297,7 @@ struct V2DiagnosticReport {
     causal_application_mismatch: u64,
     causal_sequence_reorder: u64,
     causal_group_mismatch: u64,
+    causal_cache_evictions: u64,
     capture_complete: bool,
     capture_missing_chunks: u32,
     capture_duplicate_chunks: u32,
@@ -575,6 +576,7 @@ fn empty_v2_report(stream_id: u16) -> V2DiagnosticReport {
         causal_application_mismatch: 0,
         causal_sequence_reorder: 0,
         causal_group_mismatch: 0,
+        causal_cache_evictions: 0,
         capture_complete: false,
         capture_missing_chunks: 0,
         capture_duplicate_chunks: 0,
@@ -596,6 +598,7 @@ fn copy_snapshot_diagnostics(
     report.causal_application_mismatch = diagnostics.causal_application_mismatch;
     report.causal_sequence_reorder = diagnostics.causal_sequence_reorder;
     report.causal_group_mismatch = diagnostics.causal_group_mismatch;
+    report.causal_cache_evictions = diagnostics.causal_cache_evictions;
 }
 
 fn v2_report_has_failure(report: &V2DiagnosticReport) -> bool {
@@ -609,6 +612,7 @@ fn v2_report_has_failure(report: &V2DiagnosticReport) -> bool {
         || report.causal_application_mismatch != 0
         || report.causal_sequence_reorder != 0
         || report.causal_group_mismatch != 0
+        || report.causal_cache_evictions != 0
 }
 
 fn parse_args<I, S>(args: I) -> Result<CliArgs, CliError>

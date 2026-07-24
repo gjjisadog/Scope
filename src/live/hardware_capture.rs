@@ -231,6 +231,12 @@ impl CaptureAssembler {
     }
 
     pub fn finish(&mut self, end: CaptureEnd) -> Result<AssembledCapture, String> {
+        let result = self.finish_inner(end);
+        self.release_buffers();
+        result
+    }
+
+    fn finish_inner(&mut self, end: CaptureEnd) -> Result<AssembledCapture, String> {
         let begin = self
             .begin
             .take()
@@ -323,17 +329,30 @@ impl CaptureAssembler {
     }
 
     pub fn device_reset(&mut self) {
-        self.begin = None;
-        self.blocks.clear();
-        self.descriptor = None;
-        self.expected_descriptor = None;
-        self.total_rows = 0;
-        self.total_payload_bytes = 0;
+        self.release_buffers();
         self.diagnostics.capture_complete = false;
     }
 
     pub fn diagnostics(&self) -> &CaptureDiagnostics {
         &self.diagnostics
+    }
+
+    pub fn buffered_block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub fn buffered_payload_bytes(&self) -> usize {
+        self.total_payload_bytes
+    }
+
+    fn release_buffers(&mut self) {
+        self.begin = None;
+        self.blocks.clear();
+        self.descriptor = None;
+        self.expected_descriptor = None;
+        self.expected_next_block = 0;
+        self.total_rows = 0;
+        self.total_payload_bytes = 0;
     }
 
     fn validate_adjacent_rows(&mut self) -> Result<(), String> {
@@ -393,6 +412,7 @@ mod tests {
             sample_data: 0_i16.to_le_bytes().to_vec(),
             row_metadata: vec![SnapshotMeta {
                 row_sequence: row,
+                logical_cycle_sequence: row,
                 source_sequence: row,
                 applied_sequence: row.saturating_sub(1),
                 valid_flags: SNAPSHOT_VALID | FROZEN_ROW | APPLIED_SEQUENCE_VALID,
@@ -567,5 +587,26 @@ mod tests {
             .finish(failed)
             .unwrap_err()
             .contains("non-success"));
+    }
+
+    #[test]
+    fn every_capture_end_releases_buffered_blocks() {
+        let mut assembler = CaptureAssembler::default();
+        assembler.begin(begin()).unwrap();
+        assembler
+            .push(CaptureData {
+                capture_id: 7,
+                block_index: 0,
+                batch: batch(10),
+            })
+            .unwrap();
+        assert_eq!(assembler.buffered_block_count(), 1);
+        assert!(assembler.buffered_payload_bytes() > 0);
+
+        let mut failed = end();
+        failed.state = CaptureState::Timeout;
+        assert!(assembler.finish(failed).is_err());
+        assert_eq!(assembler.buffered_block_count(), 0);
+        assert_eq!(assembler.buffered_payload_bytes(), 0);
     }
 }

@@ -58,12 +58,13 @@ SnapshotMeta[row_count]
 
 ```text
 u64 row_sequence
+u64 logical_cycle_sequence
 u64 source_sequence
 u64 applied_sequence
 u32 valid_flags
 ```
 
-Known validity bits are `SNAPSHOT_VALID` (0), `SOURCE_SEQUENCE_VALID` (1), `APPLIED_SEQUENCE_VALID` (2), `CLA_RESULT_VALID` (3), `ADC_SAMPLE_VALID` (4), and `FROZEN_ROW` (5). Unknown bits are rejected. `row_sequence` must be continuous inside a batch. Across batches an explicit gap is legal and is recorded; overlap or reversal is recorded as a reorder. Frame domain, phase, group, revision, selected channels, metadata count and exact data length must match `STREAM_TABLE`/`CHANNEL_TABLE`.
+Known validity bits are `SNAPSHOT_VALID` (0), `SOURCE_SEQUENCE_VALID` (1), `APPLIED_SEQUENCE_VALID` (2), `CLA_RESULT_VALID` (3), `ADC_SAMPLE_VALID` (4), and `FROZEN_ROW` (5). Unknown bits are rejected. `row_sequence` is only the local stream row number and must be continuous inside a batch；`logical_cycle_sequence` is the independent cross-stream causal key. Across batches an explicit row gap is legal and is recorded；overlap or reversal is recorded as a reorder. Frame domain, phase, group, revision, selected channels, metadata count and exact data length must match `STREAM_TABLE`/`CHANNEL_TABLE`.
 
 `CausalRelation` is evaluated in its declared consistency group using the protocol's logical control-cycle sequence, not a physical-time comparison of local row counters. For every relation, the client checks:
 
@@ -72,9 +73,9 @@ result.source_sequence == input.logical_sequence + result_input_offset
 application.applied_sequence == result.logical_sequence + application_result_offset
 ```
 
-The client records `missing_causal_source`, `causal_source_mismatch`, `causal_application_mismatch`, `causal_sequence_reorder`, and `causal_group_mismatch` separately. A legal `(0, 1)` relation therefore means “result uses input N, application occurs at N+1”; it does not imply that CPU1, CPU2 and CLA were physically simultaneous. FAST32K requires `SNAPSHOT_VALID|FROZEN_ROW|SOURCE_SEQUENCE_VALID|ADC_SAMPLE_VALID|CLA_RESULT_VALID`; CTRL8K additionally requires source validity, and `APPLIED_SEQUENCE_VALID` is required when an `AppliedCommand` role or causal application needs it. SLOW1K always requires a frozen valid row and requires source/applied validity only when its role or a causal contract uses that sequence.
+The client records `missing_causal_source`, `causal_source_mismatch`, `causal_application_mismatch`, `causal_sequence_reorder`, `causal_group_mismatch`, and `causal_cache_evictions` separately. Result/application rows may arrive before their causal source；matching is delayed instead of immediately reporting a missing source. Both cached rows and pending matches are bounded to 4,096 entries, with deterministic eviction and an observable missing-source/eviction diagnostic. A legal `(0, 1)` relation therefore means “result uses input N, application occurs at N+1”; it does not imply that CPU1, CPU2 and CLA were physically simultaneous. FAST32K requires `SNAPSHOT_VALID|FROZEN_ROW|SOURCE_SEQUENCE_VALID|ADC_SAMPLE_VALID|CLA_RESULT_VALID`; CTRL8K additionally requires source validity, and `APPLIED_SEQUENCE_VALID` is required when an `AppliedCommand` role or causal application needs it. SLOW1K always requires a frozen valid row and requires source/applied validity only when its role or a causal contract uses that sequence.
 
-For all domains `sample_period_ticks == tick_hz / sample_rate_hz` is exact. `tick_hz` must be divisible by the fixed stream rate; V2 does not round. Zero, a non-integral timer, a mismatched period, an in-session period change, or a timestamp overflow/non-monotonic sequence is rejected.
+For all domains `sample_period_ticks == tick_hz / sample_rate_hz` is exact. `tick_hz` must be divisible by the fixed stream rate; V2 does not round. Across batches of the same stream, `current_timestamp == previous_last_timestamp + (current_first_row_sequence - previous_last_row_sequence) * sample_period_ticks` must hold exactly. Zero, a non-integral timer, a mismatched period, an in-session period change, row reversal/overlap, timestamp drift, or overflow is rejected.
 
 The `MANUAL_TRIGGER` golden frame is regression-tested as fixed bytes (including CRC):
 
@@ -103,11 +104,11 @@ CRC32C(little_endian(capture_id) +
        CAPTURE_DATA encoded payloads sorted by block_index)
 ```
 
-The client recomputes this CRC32C and rejects a mismatch. Protocol allocation limits are `MAX_CAPTURE_ROWS=1,048,576`, `MAX_CAPTURE_BLOCKS=4,096`, `MAX_CAPTURE_BLOCK_ROWS=4,096`, and `MAX_CAPTURE_PAYLOAD_BYTES=64 MiB`; all are checked before allocation. Errors/diagnostics distinguish `CaptureTooLarge`, `CaptureTooManyBlocks`, `CaptureRowOverflow`, `CaptureIntegrityMismatch`, `CaptureRowDiscontinuity`, and `CaptureDescriptorMismatch`. Capture remains in memory in this stage and is never written to `.scope V1`.
+The client recomputes this CRC32C and rejects a mismatch. Protocol allocation limits are `MAX_CAPTURE_ROWS=1,048,576`, `MAX_CAPTURE_BLOCKS=4,096`, `MAX_CAPTURE_BLOCK_ROWS=4,096`, and `MAX_CAPTURE_PAYLOAD_BYTES=64 MiB`; all are checked before allocation. Errors/diagnostics distinguish `CaptureTooLarge`, `CaptureTooManyBlocks`, `CaptureRowOverflow`, `CaptureIntegrityMismatch`, `CaptureRowDiscontinuity`, and `CaptureDescriptorMismatch`. Every `CAPTURE_END` and every terminal/exception `CAPTURE_STATUS` releases buffered blocks and payload accounting. A Capture-specific decode, descriptor, integrity, timeout, loss, or reset failure emits `CaptureFailure`/`CaptureStatus` but does not tear down the negotiated V2 connection, so a later Capture or heartbeat can continue. Capture remains in memory in this stage and is never written to `.scope V1`.
 
 ## V2 connection health and host backpressure
 
-After HELLO, client and simulator send `PING` once per second and reply immediately with the same `PONG` nonce. Any valid V2 frame refreshes the three-second liveness deadline; CRC-invalid frames do not. The session records `last_pong_nonce`, round trips and timeouts. `STATUS` updates device state, DSP dropped rows and TX overruns; `ERROR` is delivered as `SessionEvent::Error`.
+After HELLO, client and simulator send `PING` once per second and reply immediately with the same `PONG` nonce. The client retains an eight-entry outstanding nonce window, accepts valid PONGs out of order, expires each nonce after three seconds, and never lets a newer PING overwrite an older outstanding one. Any valid V2 frame refreshes the three-second liveness deadline; CRC-invalid frames do not. The session records `last_pong_nonce`, round trips and actual expirations. `STATUS` updates device state, DSP dropped rows and TX overruns; `ERROR` is delivered as `SessionEvent::Error`.
 
 Control events (`State`, `Error`, `CommandResult`, stream table and Capture status/result) use the bounded control path and fail explicitly on sustained backpressure. Continuous snapshots may be dropped only at the host UI queue, where `host_dropped_v2_batches`, `host_dropped_v2_rows`, queue overruns and the affected stream/row range are recorded. These host drops never increment DSP row-gap diagnostics. Capture data is assembled in the worker and is never routed through the UI snapshot queue.
 

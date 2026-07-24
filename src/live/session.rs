@@ -21,9 +21,10 @@ use super::{
         HelloAck, Message, ProtocolError, ResultCode, MAX_PAYLOAD_LEN, PROTOCOL_VERSION_V2,
     },
     protocol_v2::{
-        decode_stream_sample_frame, ArmCapture, CancelCapture, CaptureStatus, ConfigureStream,
-        DecodedStreamSampleBatch, ManualTrigger, MessageV2, StreamTable, CAPABILITY_V2_STREAMS,
-        MSG_CAPTURE_BEGIN, MSG_CAPTURE_DATA, MSG_CAPTURE_END, MSG_STREAM_SAMPLE_BATCH,
+        decode_stream_sample_frame, ArmCapture, CancelCapture, CaptureState, CaptureStatus,
+        ConfigureStream, DecodedStreamSampleBatch, ManualTrigger, MessageV2, StreamTable,
+        CAPABILITY_V2_STREAMS, MSG_CAPTURE_BEGIN, MSG_CAPTURE_DATA, MSG_CAPTURE_END,
+        MSG_STREAM_SAMPLE_BATCH,
     },
     recording::{RecordingError, RecordingIngress},
     snapshot::{SnapshotDiagnostics, SnapshotValidator},
@@ -38,6 +39,55 @@ const CONTROL_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 const COMMAND_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 const DISPLAY_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(33);
 const DISPLAY_SNAPSHOT_POINTS: usize = 8_000;
+const HEARTBEAT_NONCE_WINDOW: usize = 8;
+const HEARTBEAT_REPLY_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Debug)]
+struct HeartbeatWindow {
+    sent_at: HashMap<u64, Instant>,
+    capacity: usize,
+}
+
+impl HeartbeatWindow {
+    fn new(capacity: usize) -> Self {
+        Self {
+            sent_at: HashMap::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn record(&mut self, nonce: u64, now: Instant) -> u64 {
+        self.sent_at.insert(nonce, now);
+        if self.sent_at.len() <= self.capacity {
+            return 0;
+        }
+        let oldest = self
+            .sent_at
+            .iter()
+            .min_by_key(|(_, sent_at)| *sent_at)
+            .map(|(nonce, _)| *nonce);
+        oldest.map_or(0, |nonce| u64::from(self.sent_at.remove(&nonce).is_some()))
+    }
+
+    fn acknowledge(&mut self, nonce: u64) -> bool {
+        self.sent_at.remove(&nonce).is_some()
+    }
+
+    fn expire(&mut self, now: Instant) -> u64 {
+        let expired = self
+            .sent_at
+            .iter()
+            .filter_map(|(nonce, sent_at)| {
+                (now.saturating_duration_since(*sent_at) >= HEARTBEAT_REPLY_TIMEOUT)
+                    .then_some(*nonce)
+            })
+            .collect::<Vec<_>>();
+        for nonce in &expired {
+            self.sent_at.remove(nonce);
+        }
+        expired.len() as u64
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct AcquisitionConfig {
@@ -95,6 +145,7 @@ pub struct SessionStats {
     pub causal_application_mismatch: u64,
     pub causal_sequence_reorder: u64,
     pub causal_group_mismatch: u64,
+    pub causal_cache_evictions: u64,
     pub host_dropped_v2_batches: u64,
     pub host_dropped_v2_rows: u64,
     pub v2_snapshot_queue_overruns: u64,
@@ -947,8 +998,8 @@ fn worker_loop_v2(
     let mut last_received = Instant::now();
     let mut last_ping = Instant::now();
     let mut ping_nonce = 1_u64;
-    let mut outstanding_ping: Option<u64> = None;
-    let mut stream_timing: HashMap<u16, (u32, u64)> = HashMap::new();
+    let mut heartbeat_window = HeartbeatWindow::new(HEARTBEAT_NONCE_WINDOW);
+    let mut stream_timing: HashMap<u16, StreamTiming> = HashMap::new();
 
     loop {
         while let Ok(command) = command_rx.try_recv() {
@@ -991,6 +1042,9 @@ fn worker_loop_v2(
                         session_id,
                         Message::Ping(nonce),
                     )?;
+                    stats.heartbeat_timeout_count = stats
+                        .heartbeat_timeout_count
+                        .saturating_add(heartbeat_window.record(nonce, Instant::now()));
                 }
                 SessionCommand::ArmCapture(value) => {
                     write_v2_message(
@@ -1051,6 +1105,13 @@ fn worker_loop_v2(
                 "no valid SCP1 V2 frame received for 3 seconds".to_owned(),
             ));
         }
+        let expired_heartbeats = heartbeat_window.expire(Instant::now());
+        if expired_heartbeats != 0 {
+            stats.heartbeat_timeout_count = stats
+                .heartbeat_timeout_count
+                .saturating_add(expired_heartbeats);
+            let _ = data_tx.try_send(SessionEvent::Stats(stats));
+        }
         if session_id != 0 && last_ping.elapsed() >= Duration::from_secs(1) {
             write_common_v2(
                 &mut transport,
@@ -1058,7 +1119,9 @@ fn worker_loop_v2(
                 session_id,
                 Message::Ping(ping_nonce),
             )?;
-            outstanding_ping = Some(ping_nonce);
+            stats.heartbeat_timeout_count = stats
+                .heartbeat_timeout_count
+                .saturating_add(heartbeat_window.record(ping_nonce, Instant::now()));
             ping_nonce = ping_nonce.wrapping_add(1);
             last_ping = Instant::now();
         }
@@ -1213,6 +1276,7 @@ fn worker_loop_v2(
                     stats.causal_application_mismatch = diagnostics.causal_application_mismatch;
                     stats.causal_sequence_reorder = diagnostics.causal_sequence_reorder;
                     stats.causal_group_mismatch = diagnostics.causal_group_mismatch;
+                    stats.causal_cache_evictions = diagnostics.causal_cache_evictions;
                     stats.received_batches = stats.received_batches.saturating_add(1);
                     stats.received_samples = stats
                         .received_samples
@@ -1262,97 +1326,119 @@ fn worker_loop_v2(
                     )?;
                 }
                 MSG_CAPTURE_BEGIN => {
-                    let MessageV2::CaptureBegin(begin) =
-                        MessageV2::decode(frame.message_type, &frame.payload)?
-                    else {
-                        unreachable!()
-                    };
-                    let stream_table = streams.as_ref().ok_or_else(|| {
-                        SessionError::Acquisition(
-                            "CAPTURE_BEGIN arrived before STREAM_TABLE".to_owned(),
-                        )
-                    })?;
-                    let descriptor = stream_table.stream(begin.stream_id).ok_or_else(|| {
-                        SessionError::Acquisition(
-                            "CAPTURE_BEGIN references unknown stream".to_owned(),
-                        )
-                    })?;
-                    let mut assembler = CaptureAssembler::default();
-                    assembler
-                        .begin_with_descriptor(begin, descriptor, stream_table.revision)
-                        .map_err(SessionError::Acquisition)?;
-                    capture = Some(assembler);
-                }
-                MSG_CAPTURE_DATA => {
-                    let MessageV2::CaptureData(data) =
-                        MessageV2::decode(frame.message_type, &frame.payload)?
-                    else {
-                        unreachable!()
-                    };
-                    let table = channels.as_ref().ok_or_else(|| {
-                        SessionError::Acquisition(
-                            "CAPTURE_DATA arrived before CHANNEL_TABLE".to_owned(),
-                        )
-                    })?;
-                    let stream_table = streams.as_ref().ok_or_else(|| {
-                        SessionError::Acquisition(
-                            "CAPTURE_DATA arrived before STREAM_TABLE".to_owned(),
-                        )
-                    })?;
-                    let nested = MessageV2::StreamSampleBatch(data.batch.clone()).into_frame(
-                        0,
-                        frame.sequence,
-                        session_id,
-                        frame.timestamp_ticks,
-                    )?;
-                    let _ = decode_stream_sample_frame(&nested, table, stream_table)?;
-                    let descriptor =
-                        stream_table.stream(data.batch.stream_id).ok_or_else(|| {
+                    let result: Result<CaptureAssembler, SessionError> = (|| {
+                        let MessageV2::CaptureBegin(begin) =
+                            MessageV2::decode(frame.message_type, &frame.payload)?
+                        else {
+                            unreachable!()
+                        };
+                        let stream_table = streams.as_ref().ok_or_else(|| {
                             SessionError::Acquisition(
-                                "CAPTURE_DATA references unknown stream".to_owned(),
+                                "CAPTURE_BEGIN arrived before STREAM_TABLE".to_owned(),
                             )
                         })?;
-                    let hello = hello_ack.as_ref().ok_or_else(|| {
-                        SessionError::Acquisition(
-                            "CAPTURE_DATA arrived before HELLO_ACK".to_owned(),
-                        )
-                    })?;
-                    super::protocol_v2::validate_stream_sample_period(
-                        hello.tick_hz,
-                        descriptor,
-                        data.batch.sample_period_ticks,
-                    )?;
-                    capture
-                        .as_mut()
-                        .ok_or_else(|| {
+                        let descriptor = stream_table.stream(begin.stream_id).ok_or_else(|| {
                             SessionError::Acquisition(
-                                "CAPTURE_DATA arrived before CAPTURE_BEGIN".to_owned(),
+                                "CAPTURE_BEGIN references unknown stream".to_owned(),
                             )
-                        })?
-                        .push(data)
-                        .map_err(SessionError::Acquisition)?;
+                        })?;
+                        let mut assembler = CaptureAssembler::default();
+                        assembler
+                            .begin_with_descriptor(begin, descriptor, stream_table.revision)
+                            .map_err(SessionError::Acquisition)?;
+                        Ok(assembler)
+                    })();
+                    match result {
+                        Ok(assembler) => capture = Some(assembler),
+                        Err(error) => {
+                            capture = None;
+                            report_capture_failure(
+                                control_tx,
+                                data_tx,
+                                &mut stats,
+                                error.to_string(),
+                            )?;
+                        }
+                    }
+                }
+                MSG_CAPTURE_DATA => {
+                    let result: Result<(), SessionError> =
+                        (|| {
+                            let MessageV2::CaptureData(data) =
+                                MessageV2::decode(frame.message_type, &frame.payload)?
+                            else {
+                                unreachable!()
+                            };
+                            let table = channels.as_ref().ok_or_else(|| {
+                                SessionError::Acquisition(
+                                    "CAPTURE_DATA arrived before CHANNEL_TABLE".to_owned(),
+                                )
+                            })?;
+                            let stream_table = streams.as_ref().ok_or_else(|| {
+                                SessionError::Acquisition(
+                                    "CAPTURE_DATA arrived before STREAM_TABLE".to_owned(),
+                                )
+                            })?;
+                            let nested = MessageV2::StreamSampleBatch(data.batch.clone())
+                                .into_frame(0, frame.sequence, session_id, frame.timestamp_ticks)?;
+                            let _ = decode_stream_sample_frame(&nested, table, stream_table)?;
+                            let descriptor =
+                                stream_table.stream(data.batch.stream_id).ok_or_else(|| {
+                                    SessionError::Acquisition(
+                                        "CAPTURE_DATA references unknown stream".to_owned(),
+                                    )
+                                })?;
+                            let hello = hello_ack.as_ref().ok_or_else(|| {
+                                SessionError::Acquisition(
+                                    "CAPTURE_DATA arrived before HELLO_ACK".to_owned(),
+                                )
+                            })?;
+                            super::protocol_v2::validate_stream_sample_period(
+                                hello.tick_hz,
+                                descriptor,
+                                data.batch.sample_period_ticks,
+                            )?;
+                            capture
+                                .as_mut()
+                                .ok_or_else(|| {
+                                    SessionError::Acquisition(
+                                        "CAPTURE_DATA arrived before CAPTURE_BEGIN".to_owned(),
+                                    )
+                                })?
+                                .push(data)
+                                .map_err(SessionError::Acquisition)
+                        })();
+                    if let Err(error) = result {
+                        capture = None;
+                        report_capture_failure(control_tx, data_tx, &mut stats, error.to_string())?;
+                    }
                 }
                 MSG_CAPTURE_END => {
-                    let MessageV2::CaptureEnd(end) =
-                        MessageV2::decode(frame.message_type, &frame.payload)?
-                    else {
-                        unreachable!()
-                    };
-                    let mut assembler = capture.take().ok_or_else(|| {
-                        SessionError::Acquisition(
-                            "CAPTURE_END arrived before CAPTURE_BEGIN".to_owned(),
-                        )
-                    })?;
-                    match assembler.finish(end) {
+                    let result: Result<AssembledCapture, SessionError> = (|| {
+                        let MessageV2::CaptureEnd(end) =
+                            MessageV2::decode(frame.message_type, &frame.payload)?
+                        else {
+                            unreachable!()
+                        };
+                        let mut assembler = capture.take().ok_or_else(|| {
+                            SessionError::Acquisition(
+                                "CAPTURE_END arrived before CAPTURE_BEGIN".to_owned(),
+                            )
+                        })?;
+                        assembler.finish(end).map_err(SessionError::Acquisition)
+                    })();
+                    capture = None;
+                    match result {
                         Ok(assembled) => {
                             send_control(control_tx, SessionEvent::CaptureComplete(assembled))?
                         }
                         Err(error) => {
-                            stats.capture_processing_overruns =
-                                stats.capture_processing_overruns.saturating_add(1);
-                            let _ = data_tx.try_send(SessionEvent::Stats(stats));
-                            send_control(control_tx, SessionEvent::CaptureFailure(error.clone()))?;
-                            return Err(SessionError::Acquisition(error));
+                            report_capture_failure(
+                                control_tx,
+                                data_tx,
+                                &mut stats,
+                                error.to_string(),
+                            )?;
                         }
                     }
                 }
@@ -1362,6 +1448,17 @@ fn worker_loop_v2(
                     else {
                         unreachable!()
                     };
+                    if matches!(
+                        status.state,
+                        CaptureState::Idle
+                            | CaptureState::Cancelled
+                            | CaptureState::Timeout
+                            | CaptureState::BufferOverrun
+                            | CaptureState::InvalidConfig
+                            | CaptureState::DeviceReset
+                    ) {
+                        capture = None;
+                    }
                     send_control(control_tx, SessionEvent::CaptureStatus(status))?;
                 }
                 super::protocol_v2::MSG_STREAM_TABLE => {
@@ -1397,13 +1494,10 @@ fn worker_loop_v2(
                         unreachable!()
                     };
                     stats.last_pong_nonce = Some(nonce);
-                    if outstanding_ping == Some(nonce) {
+                    if heartbeat_window.acknowledge(nonce) {
                         stats.heartbeat_round_trip_count =
                             stats.heartbeat_round_trip_count.saturating_add(1);
-                        outstanding_ping = None;
                     } else {
-                        stats.heartbeat_timeout_count =
-                            stats.heartbeat_timeout_count.saturating_add(1);
                         stats.protocol_errors = stats.protocol_errors.saturating_add(1);
                         send_control(
                             control_tx,
@@ -1428,8 +1522,15 @@ fn worker_loop_v2(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct StreamTiming {
+    sample_period_ticks: u32,
+    last_row_sequence: u64,
+    last_timestamp_ticks: u64,
+}
+
 fn validate_v2_stream_timing(
-    timing: &mut HashMap<u16, (u32, u64)>,
+    timing: &mut HashMap<u16, StreamTiming>,
     batch: &DecodedStreamSampleBatch,
 ) -> Result<(), SessionError> {
     let row_count = u64::try_from(batch.row_metadata.len()).map_err(|_| {
@@ -1442,22 +1543,62 @@ fn validate_v2_stream_timing(
         .timestamp_ticks
         .checked_add(last_offset)
         .ok_or_else(|| SessionError::Acquisition("V2 sample timestamp overflow".to_owned()))?;
-    if let Some((period, previous_last_timestamp)) = timing.get(&batch.stream_id) {
-        if *period != batch.sample_period_ticks {
+    let last_row_sequence = batch
+        .row_metadata
+        .last()
+        .map(|row| row.row_sequence)
+        .ok_or_else(|| SessionError::Acquisition("V2 stream batch has no rows".to_owned()))?;
+    if let Some(previous) = timing.get(&batch.stream_id) {
+        if previous.sample_period_ticks != batch.sample_period_ticks {
             return Err(SessionError::Acquisition(format!(
                 "V2 stream {} changed sample_period_ticks during the session",
                 batch.stream_id
             )));
         }
-        if batch.timestamp_ticks <= *previous_last_timestamp {
+        let row_delta = batch
+            .first_row_sequence
+            .checked_sub(previous.last_row_sequence)
+            .filter(|delta| *delta != 0)
+            .ok_or_else(|| {
+                SessionError::Acquisition(format!(
+                    "V2 stream {} row_sequence is not strictly increasing",
+                    batch.stream_id
+                ))
+            })?;
+        let timestamp_delta = u64::from(batch.sample_period_ticks)
+            .checked_mul(row_delta)
+            .ok_or_else(|| SessionError::Acquisition("V2 sample timestamp overflow".to_owned()))?;
+        let expected_timestamp = previous
+            .last_timestamp_ticks
+            .checked_add(timestamp_delta)
+            .ok_or_else(|| SessionError::Acquisition("V2 sample timestamp overflow".to_owned()))?;
+        if batch.timestamp_ticks != expected_timestamp {
             return Err(SessionError::Acquisition(format!(
-                "V2 stream {} timestamp is not monotonic with row sequence",
+                "V2 stream {} timestamp does not correspond to row_sequence",
                 batch.stream_id
             )));
         }
     }
-    timing.insert(batch.stream_id, (batch.sample_period_ticks, last_timestamp));
+    timing.insert(
+        batch.stream_id,
+        StreamTiming {
+            sample_period_ticks: batch.sample_period_ticks,
+            last_row_sequence,
+            last_timestamp_ticks: last_timestamp,
+        },
+    );
     Ok(())
+}
+
+fn report_capture_failure(
+    control_tx: &Sender<SessionEvent>,
+    data_tx: &Sender<SessionEvent>,
+    stats: &mut SessionStats,
+    error: String,
+) -> Result<(), SessionError> {
+    stats.capture_processing_overruns = stats.capture_processing_overruns.saturating_add(1);
+    let _ = data_tx.try_send(SessionEvent::Stats(*stats));
+    send_control(control_tx, SessionEvent::CaptureFailure(error))
 }
 
 fn write_common_v2(
@@ -1563,6 +1704,7 @@ mod tests {
 
     fn v2_timing_batch(
         stream_id: u16,
+        first_row_sequence: u64,
         sample_period_ticks: u32,
         timestamp_ticks: u64,
         rows: u64,
@@ -1573,14 +1715,15 @@ mod tests {
             domain: SampleDomain::Fast32k,
             capture_phase: CapturePhase::AfterClaComplete,
             consistency_group: 1,
-            first_row_sequence: 1,
+            first_row_sequence,
             sample_period_ticks,
             timestamp_ticks,
             channel_ids: vec![0],
             channels: vec![vec![0.0; rows as usize]],
             row_metadata: (0..rows)
-                .map(|row_sequence| SnapshotMeta {
-                    row_sequence,
+                .map(|offset| SnapshotMeta {
+                    row_sequence: first_row_sequence + offset,
+                    logical_cycle_sequence: first_row_sequence + offset,
                     ..SnapshotMeta::default()
                 })
                 .collect(),
@@ -1591,27 +1734,53 @@ mod tests {
     #[test]
     fn v2_stream_timing_requires_fixed_period_monotonicity_and_no_overflow() {
         let mut timing = HashMap::new();
-        validate_v2_stream_timing(&mut timing, &v2_timing_batch(1, 1_000, 10_000, 4)).unwrap();
-        validate_v2_stream_timing(&mut timing, &v2_timing_batch(1, 1_000, 14_000, 2)).unwrap();
+        validate_v2_stream_timing(&mut timing, &v2_timing_batch(1, 10, 1_000, 10_000, 4)).unwrap();
+        validate_v2_stream_timing(&mut timing, &v2_timing_batch(1, 14, 1_000, 14_000, 2)).unwrap();
 
         let changed_period =
-            validate_v2_stream_timing(&mut timing, &v2_timing_batch(1, 4_000, 16_000, 1))
+            validate_v2_stream_timing(&mut timing, &v2_timing_batch(1, 16, 4_000, 16_000, 1))
                 .unwrap_err();
         assert!(changed_period
             .to_string()
             .contains("changed sample_period_ticks"));
 
-        let non_monotonic =
-            validate_v2_stream_timing(&mut timing, &v2_timing_batch(1, 1_000, 14_000, 1))
+        let wrong_row_timestamp =
+            validate_v2_stream_timing(&mut timing, &v2_timing_batch(1, 17, 1_000, 17_500, 1))
                 .unwrap_err();
-        assert!(non_monotonic.to_string().contains("not monotonic"));
+        assert!(wrong_row_timestamp
+            .to_string()
+            .contains("does not correspond to row_sequence"));
+
+        let reordered =
+            validate_v2_stream_timing(&mut timing, &v2_timing_batch(1, 15, 1_000, 15_000, 1))
+                .unwrap_err();
+        assert!(reordered
+            .to_string()
+            .contains("row_sequence is not strictly increasing"));
 
         let overflow = validate_v2_stream_timing(
             &mut HashMap::new(),
-            &v2_timing_batch(2, 1_000, u64::MAX - 500, 2),
+            &v2_timing_batch(2, 1, 1_000, u64::MAX - 500, 2),
         )
         .unwrap_err();
         assert!(overflow.to_string().contains("timestamp overflow"));
+    }
+
+    #[test]
+    fn heartbeat_window_accepts_multiple_out_of_order_pongs_and_is_bounded() {
+        let now = Instant::now();
+        let mut window = HeartbeatWindow::new(2);
+        assert_eq!(window.record(10, now), 0);
+        assert_eq!(window.record(11, now + Duration::from_millis(1)), 0);
+        assert!(window.acknowledge(11));
+        assert!(window.acknowledge(10));
+
+        assert_eq!(window.record(20, now), 0);
+        assert_eq!(window.record(21, now + Duration::from_millis(1)), 0);
+        assert_eq!(window.record(22, now + Duration::from_millis(2)), 1);
+        assert!(!window.acknowledge(20));
+        assert!(window.acknowledge(21));
+        assert!(window.acknowledge(22));
     }
 
     #[test]
@@ -2194,40 +2363,25 @@ mod tests {
 
     #[test]
     fn all_30k_presets_complete_the_v2_session_acceptance_matrix() {
-        #[derive(Clone, Copy)]
-        enum Expected {
-            CleanSnapshot,
-            DiagnosticSnapshot,
-            RejectedStream,
-            CaptureComplete,
-            CaptureFailure,
-            CaptureStatus(CaptureState),
-        }
-        let matrix = [
-            (V2Preset::Normal30k, Expected::CleanSnapshot),
-            (V2Preset::CausalDelay30k, Expected::CleanSnapshot),
-            (V2Preset::ClaStale30k, Expected::DiagnosticSnapshot),
-            (V2Preset::RowGap30k, Expected::DiagnosticSnapshot),
-            (V2Preset::RowReorder30k, Expected::DiagnosticSnapshot),
-            (V2Preset::PhaseMismatch30k, Expected::RejectedStream),
-            (V2Preset::GroupMismatch30k, Expected::RejectedStream),
-            (V2Preset::UnfrozenRow30k, Expected::DiagnosticSnapshot),
-            (V2Preset::CaptureManual30k, Expected::CaptureComplete),
-            (V2Preset::CaptureEdge30k, Expected::CaptureComplete),
-            (V2Preset::CaptureFault30k, Expected::CaptureComplete),
-            (
-                V2Preset::CaptureTimeout30k,
-                Expected::CaptureStatus(CaptureState::Timeout),
-            ),
-            (V2Preset::CaptureChunkLoss30k, Expected::CaptureFailure),
-            (V2Preset::CaptureChunkReorder30k, Expected::CaptureComplete),
-            (
-                V2Preset::DeviceReset30k,
-                Expected::CaptureStatus(CaptureState::DeviceReset),
-            ),
+        let presets = [
+            V2Preset::Normal30k,
+            V2Preset::CausalDelay30k,
+            V2Preset::ClaStale30k,
+            V2Preset::RowGap30k,
+            V2Preset::RowReorder30k,
+            V2Preset::PhaseMismatch30k,
+            V2Preset::GroupMismatch30k,
+            V2Preset::UnfrozenRow30k,
+            V2Preset::CaptureManual30k,
+            V2Preset::CaptureEdge30k,
+            V2Preset::CaptureFault30k,
+            V2Preset::CaptureTimeout30k,
+            V2Preset::CaptureChunkLoss30k,
+            V2Preset::CaptureChunkReorder30k,
+            V2Preset::DeviceReset30k,
         ];
 
-        for (preset, expected) in matrix {
+        for preset in presets {
             let simulator = SimulatorHandle::spawn(SimulatorConfig {
                 listen: "127.0.0.1:0".parse().unwrap(),
                 accelerated: true,
@@ -2254,51 +2408,107 @@ mod tests {
                 matches!(event, SessionEvent::ConfiguredV2(_))
             });
 
-            match expected {
-                Expected::CleanSnapshot
-                | Expected::DiagnosticSnapshot
-                | Expected::RejectedStream => {
+            match preset {
+                V2Preset::Normal30k | V2Preset::CausalDelay30k => {
                     session.start().unwrap();
-                    let event =
-                        wait_for(&session, Duration::from_secs(2), |event| match expected {
-                            Expected::CleanSnapshot => matches!(
-                                event,
-                                SessionEvent::SnapshotV2(_, diagnostics)
-                                    if diagnostics.invalid_snapshot_rows == 0
-                            ),
-                            Expected::DiagnosticSnapshot => matches!(
-                                event,
-                                SessionEvent::SnapshotV2(_, diagnostics)
-                                    if diagnostics.invalid_snapshot_rows > 0
-                                        || diagnostics.row_sequence_gaps > 0
-                                        || diagnostics.row_sequence_reorders > 0
-                            ),
-                            Expected::RejectedStream => matches!(event, SessionEvent::Error(_)),
-                            _ => false,
-                        });
-                    match expected {
-                        Expected::CleanSnapshot => assert!(matches!(
+                    let event = wait_for(&session, Duration::from_secs(2), |event| {
+                        matches!(
                             event,
-                            SessionEvent::SnapshotV2(_, diagnostics)
-                                if diagnostics.invalid_snapshot_rows == 0
-                        )),
-                        Expected::DiagnosticSnapshot => assert!(matches!(
-                            event,
-                            SessionEvent::SnapshotV2(_, diagnostics)
-                                if diagnostics.invalid_snapshot_rows > 0
-                                    || diagnostics.row_sequence_gaps > 0
-                                    || diagnostics.row_sequence_reorders > 0
-                        )),
-                        Expected::RejectedStream => {
-                            assert!(matches!(event, SessionEvent::Error(_)))
-                        }
-                        _ => unreachable!(),
-                    }
+                            SessionEvent::SnapshotV2(batch, diagnostics)
+                                if diagnostics == &SnapshotDiagnostics::default()
+                                    && batch.row_metadata.iter().all(|row| {
+                                        row.source_sequence == row.logical_cycle_sequence
+                                            && row.applied_sequence
+                                                == row.logical_cycle_sequence.saturating_sub(1)
+                                    })
+                        )
+                    });
+                    assert!(matches!(
+                        event,
+                        SessionEvent::SnapshotV2(_, diagnostics)
+                            if diagnostics == SnapshotDiagnostics::default()
+                    ));
                 }
-                Expected::CaptureComplete
-                | Expected::CaptureFailure
-                | Expected::CaptureStatus(_) => {
+                V2Preset::ClaStale30k | V2Preset::UnfrozenRow30k => {
+                    session.start().unwrap();
+                    let event = wait_for(&session, Duration::from_secs(2), |event| {
+                        matches!(
+                            event,
+                            SessionEvent::SnapshotV2(_, diagnostics)
+                                if diagnostics.invalid_snapshot_rows == 2
+                                    && diagnostics.row_sequence_gaps == 0
+                                    && diagnostics.row_sequence_reorders == 0
+                        )
+                    });
+                    assert!(matches!(
+                        event,
+                        SessionEvent::SnapshotV2(_, diagnostics)
+                            if diagnostics.invalid_snapshot_rows == 2
+                    ));
+                }
+                V2Preset::RowGap30k => {
+                    session.start().unwrap();
+                    let event = wait_for(&session, Duration::from_secs(2), |event| {
+                        matches!(
+                            event,
+                            SessionEvent::SnapshotV2(_, diagnostics)
+                                if diagnostics.row_sequence_gaps == 1
+                                    && diagnostics.row_sequence_reorders == 0
+                                    && diagnostics.invalid_snapshot_rows == 0
+                        )
+                    });
+                    assert!(matches!(
+                        event,
+                        SessionEvent::SnapshotV2(_, diagnostics)
+                            if diagnostics.row_sequence_gaps == 1
+                    ));
+                }
+                V2Preset::RowReorder30k => {
+                    session.start().unwrap();
+                    let event = wait_for(&session, Duration::from_secs(2), |event| {
+                        matches!(
+                            event,
+                            SessionEvent::Error(error)
+                                if error.contains("row_sequence is not strictly increasing")
+                        )
+                    });
+                    assert!(matches!(event, SessionEvent::Error(_)));
+                }
+                V2Preset::PhaseMismatch30k => {
+                    session.start().unwrap();
+                    let event = wait_for(&session, Duration::from_secs(2), |event| {
+                        matches!(
+                            event,
+                            SessionEvent::Error(error)
+                                if error.contains("invalid domain/capture phase combination")
+                        )
+                    });
+                    assert!(matches!(event, SessionEvent::Error(_)));
+                }
+                V2Preset::GroupMismatch30k => {
+                    session.start().unwrap();
+                    let event = wait_for(&session, Duration::from_secs(2), |event| {
+                        matches!(
+                            event,
+                            SessionEvent::Error(error)
+                                if error.contains("domain, phase, or consistency group")
+                        )
+                    });
+                    assert!(matches!(event, SessionEvent::Error(_)));
+                }
+                V2Preset::CaptureManual30k
+                | V2Preset::CaptureEdge30k
+                | V2Preset::CaptureFault30k
+                | V2Preset::CaptureTimeout30k
+                | V2Preset::CaptureChunkLoss30k
+                | V2Preset::CaptureChunkReorder30k
+                | V2Preset::DeviceReset30k => {
                     let capture_id = 700 + preset as u32;
+                    let trigger_kind = match preset {
+                        V2Preset::CaptureEdge30k => CaptureTriggerKind::Edge,
+                        V2Preset::CaptureFault30k => CaptureTriggerKind::FaultFlag,
+                        _ => CaptureTriggerKind::Manual,
+                    };
                     session
                         .arm_capture(ArmCapture {
                             capture_id,
@@ -2307,13 +2517,15 @@ mod tests {
                             posttrigger_rows: 1,
                             timeout_samples: 100,
                             trigger: CaptureTrigger {
-                                kind: CaptureTriggerKind::Manual,
+                                kind: trigger_kind,
                                 channel_id: 0,
                                 level: 0.0,
                                 edge: CaptureEdge::Rising,
                                 hysteresis: 0.0,
-                                flag_mask: 0,
-                                flag_value: 0,
+                                flag_mask: u32::from(trigger_kind == CaptureTriggerKind::FaultFlag),
+                                flag_value: u32::from(
+                                    trigger_kind == CaptureTriggerKind::FaultFlag,
+                                ),
                             },
                         })
                         .unwrap();
@@ -2327,47 +2539,66 @@ mod tests {
                             .manual_trigger(ManualTrigger { capture_id })
                             .unwrap();
                     }
-                    let event = wait_for(&session, Duration::from_secs(2), |event| {
-                        matches!(
-                            event,
-                            SessionEvent::CaptureComplete(_)
-                                | SessionEvent::CaptureFailure(_)
-                                | SessionEvent::CaptureStatus(_)
-                        )
-                    });
-                    match expected {
-                        Expected::CaptureComplete => {
-                            // The first status is normally Armed; keep waiting for completion.
-                            let event = if matches!(event, SessionEvent::CaptureComplete(_)) {
-                                event
-                            } else {
-                                wait_for(&session, Duration::from_secs(2), |event| {
-                                    matches!(event, SessionEvent::CaptureComplete(_))
-                                })
+                    match preset {
+                        V2Preset::CaptureManual30k
+                        | V2Preset::CaptureEdge30k
+                        | V2Preset::CaptureFault30k
+                        | V2Preset::CaptureChunkReorder30k => {
+                            let event = wait_for(&session, Duration::from_secs(2), |event| {
+                                matches!(event, SessionEvent::CaptureComplete(_))
+                            });
+                            let SessionEvent::CaptureComplete(capture) = event else {
+                                unreachable!()
                             };
-                            assert!(matches!(event, SessionEvent::CaptureComplete(_)));
+                            assert_eq!(capture.begin.capture_id, capture_id);
+                            assert_eq!(capture.begin.row_count, 2);
+                            assert_eq!(capture.blocks.len(), 2);
+                            assert!(capture.diagnostics.capture_complete);
+                            assert_eq!(
+                                capture.diagnostics.capture_reordered_chunks,
+                                2 * u32::from(preset == V2Preset::CaptureChunkReorder30k)
+                            );
+                            assert_eq!(capture.diagnostics.capture_missing_chunks, 0);
                         }
-                        Expected::CaptureFailure => {
-                            let event = if matches!(event, SessionEvent::CaptureFailure(_)) {
-                                event
-                            } else {
-                                wait_for(&session, Duration::from_secs(2), |event| {
-                                    matches!(event, SessionEvent::CaptureFailure(_))
-                                })
-                            };
-                            assert!(matches!(event, SessionEvent::CaptureFailure(_)));
-                        }
-                        Expected::CaptureStatus(expected_state) => {
-                            let event = if matches!(event, SessionEvent::CaptureStatus(status) if status.state == expected_state)
-                            {
-                                event
-                            } else {
-                                wait_for(
-                                    &session,
-                                    Duration::from_secs(2),
-                                    |event| matches!(event, SessionEvent::CaptureStatus(status) if status.state == expected_state),
+                        V2Preset::CaptureChunkLoss30k => {
+                            let event = wait_for(&session, Duration::from_secs(2), |event| {
+                                matches!(
+                                    event,
+                                    SessionEvent::CaptureFailure(error)
+                                        if error.contains("uploaded or dropped row count")
                                 )
+                            });
+                            assert!(matches!(event, SessionEvent::CaptureFailure(_)));
+                            let nonce = 0xCAFE_0000 + u64::from(preset as u8);
+                            session.ping(nonce).unwrap();
+                            let pong = wait_for(&session, Duration::from_secs(2), |event| {
+                                matches!(
+                                    event,
+                                    SessionEvent::Stats(stats)
+                                        if stats.last_pong_nonce == Some(nonce)
+                                )
+                            });
+                            assert!(matches!(
+                                pong,
+                                SessionEvent::Stats(stats)
+                                    if stats.heartbeat_round_trip_count > 0
+                            ));
+                        }
+                        V2Preset::CaptureTimeout30k | V2Preset::DeviceReset30k => {
+                            let expected_state = if preset == V2Preset::CaptureTimeout30k {
+                                CaptureState::Timeout
+                            } else {
+                                CaptureState::DeviceReset
                             };
+                            let event = wait_for(&session, Duration::from_secs(2), |event| {
+                                matches!(
+                                    event,
+                                    SessionEvent::CaptureStatus(status)
+                                        if status.state == expected_state
+                                            && status.captured_rows == 0
+                                            && status.dropped_rows == 0
+                                )
+                            });
                             assert!(
                                 matches!(event, SessionEvent::CaptureStatus(status) if status.state == expected_state)
                             );

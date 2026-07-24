@@ -471,6 +471,7 @@ fn serve_v2_client(
     let mut configured: Option<ConfigureStream> = None;
     let mut streaming = false;
     let mut row_sequence = 1_u64;
+    let mut logical_cycle_sequence = 1_u64;
     let mut emitted_batches = 0_u64;
     let mut armed_capture: Option<ArmCapture> = None;
     let mut session_established = false;
@@ -740,7 +741,14 @@ fn serve_v2_client(
             update_stats(stats, |value| {
                 value.emitted_batches = value.emitted_batches.saturating_add(1)
             });
-            let mut batch = v2_sample_batch(&streams, &channels, configure, row_sequence, preset)?;
+            let mut batch = v2_sample_batch(
+                &streams,
+                &channels,
+                configure,
+                row_sequence,
+                logical_cycle_sequence,
+                preset,
+            )?;
             if preset == V2Preset::RowReorder30k && emitted_batches >= 2 {
                 for row in &mut batch.row_metadata {
                     row.row_sequence = row
@@ -771,6 +779,11 @@ fn serve_v2_client(
                 .checked_add(u64::from(configure.batch_samples))
                 .ok_or_else(|| {
                     SimulatorError::InvalidConfig("V2 row sequence overflow".to_owned())
+                })?;
+            logical_cycle_sequence = logical_cycle_sequence
+                .checked_add(u64::from(configure.batch_samples))
+                .ok_or_else(|| {
+                    SimulatorError::InvalidConfig("V2 logical cycle sequence overflow".to_owned())
                 })?;
             if preset == V2Preset::RowGap30k && emitted_batches == 1 {
                 row_sequence = row_sequence.saturating_add(1);
@@ -952,6 +965,7 @@ fn v2_sample_batch(
     channels: &ChannelTable,
     configure: &ConfigureStream,
     first_row_sequence: u64,
+    first_logical_cycle_sequence: u64,
     preset: V2Preset,
 ) -> Result<StreamSampleBatch, SimulatorError> {
     let descriptor = streams
@@ -967,6 +981,7 @@ fn v2_sample_batch(
     let mut row_metadata = Vec::with_capacity(usize::from(configure.batch_samples));
     for offset in 0..configure.batch_samples {
         let row = first_row_sequence.saturating_add(u64::from(offset));
+        let logical_cycle_sequence = first_logical_cycle_sequence.saturating_add(u64::from(offset));
         for channel_id in &channel_ids {
             let channel = channels.channel(*channel_id).ok_or_else(|| {
                 SimulatorError::InvalidConfig("missing V2 channel descriptor".to_owned())
@@ -996,8 +1011,9 @@ fn v2_sample_batch(
         }
         row_metadata.push(SnapshotMeta {
             row_sequence: row,
-            source_sequence: row,
-            applied_sequence: row.saturating_sub(1),
+            logical_cycle_sequence,
+            source_sequence: logical_cycle_sequence,
+            applied_sequence: logical_cycle_sequence.saturating_sub(1),
             valid_flags,
         });
     }
@@ -1071,12 +1087,14 @@ fn upload_simulated_capture(
         channels,
         &configure,
         first_row_sequence,
+        first_row_sequence,
         V2Preset::Normal30k,
     )?;
     let second = v2_sample_batch(
         streams,
         channels,
         &configure,
+        first_row_sequence.saturating_add(1),
         first_row_sequence.saturating_add(1),
         V2Preset::Normal30k,
     )?;
@@ -1415,8 +1433,8 @@ mod v2_tests {
             assert_eq!(V2Preset::parse(name), Some(preset));
             assert_eq!(preset.name(), name);
             assert_eq!(
-                v2_sample_batch(&streams, &channels, &configure, 100, preset).unwrap(),
-                v2_sample_batch(&streams, &channels, &configure, 100, preset).unwrap(),
+                v2_sample_batch(&streams, &channels, &configure, 100, 25, preset).unwrap(),
+                v2_sample_batch(&streams, &channels, &configure, 100, 25, preset).unwrap(),
                 "preset {name} must not depend on random probability"
             );
         }
@@ -1432,10 +1450,41 @@ mod v2_tests {
             channel_mask: 0b1111,
         };
         let stale =
-            v2_sample_batch(&streams, &channels, &configure, 1, V2Preset::ClaStale30k).unwrap();
+            v2_sample_batch(&streams, &channels, &configure, 1, 1, V2Preset::ClaStale30k).unwrap();
         assert_eq!(stale.row_metadata[0].valid_flags & CLA_RESULT_VALID, 0);
-        let unfrozen =
-            v2_sample_batch(&streams, &channels, &configure, 1, V2Preset::UnfrozenRow30k).unwrap();
+        let unfrozen = v2_sample_batch(
+            &streams,
+            &channels,
+            &configure,
+            1,
+            1,
+            V2Preset::UnfrozenRow30k,
+        )
+        .unwrap();
         assert_eq!(unfrozen.row_metadata[0].valid_flags & FROZEN_ROW, 0);
+    }
+
+    #[test]
+    fn simulator_tracks_row_and_logical_cycle_sequences_independently() {
+        let streams = v2_stream_table();
+        let channels = v2_channel_table();
+        let configure = ConfigureStream {
+            stream_id: 1,
+            batch_samples: 2,
+            channel_mask: 0b1111,
+        };
+        let batch = v2_sample_batch(
+            &streams,
+            &channels,
+            &configure,
+            100,
+            25,
+            V2Preset::CausalDelay30k,
+        )
+        .unwrap();
+        assert_eq!(batch.row_metadata[0].row_sequence, 100);
+        assert_eq!(batch.row_metadata[0].logical_cycle_sequence, 25);
+        assert_eq!(batch.row_metadata[0].source_sequence, 25);
+        assert_eq!(batch.row_metadata[0].applied_sequence, 24);
     }
 }

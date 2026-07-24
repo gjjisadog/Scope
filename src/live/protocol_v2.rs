@@ -488,14 +488,14 @@ pub struct ConfigureStream {
 
 /// Per-row metadata is transmitted once for every sampled row, rather than
 /// being duplicated in each ordinary signal channel. It is the logical
-/// metadata-channel set `META_ROW_SEQ`, `META_SOURCE_SEQ`,
+/// metadata-channel set `META_ROW_SEQ`, `META_LOGICAL_CYCLE_SEQ`, `META_SOURCE_SEQ`,
 /// `META_APPLIED_SEQ`, `META_VALID_FLAGS`, and `META_CLA_COMPLETED_SEQ`.
 pub type StreamRowMetadata = SnapshotMeta;
 
 impl SnapshotMeta {
     pub fn source_alignment(&self) -> CausalAlignment {
         causal_alignment(
-            self.row_sequence,
+            self.logical_cycle_sequence,
             self.source_sequence,
             self.valid_flags,
             VALID_FLAG_SOURCE_VALID,
@@ -504,7 +504,7 @@ impl SnapshotMeta {
 
     pub fn applied_alignment(&self) -> CausalAlignment {
         causal_alignment(
-            self.row_sequence,
+            self.logical_cycle_sequence,
             self.applied_sequence,
             self.valid_flags,
             VALID_FLAG_APPLIED_VALID,
@@ -1208,6 +1208,7 @@ fn encode_stream_sample_batch(
     bytes.extend_from_slice(&batch.sample_data);
     for row in &batch.row_metadata {
         put_u64(bytes, row.row_sequence);
+        put_u64(bytes, row.logical_cycle_sequence);
         put_u64(bytes, row.source_sequence);
         put_u64(bytes, row.applied_sequence);
         put_u32(bytes, row.valid_flags);
@@ -1252,6 +1253,7 @@ fn decode_stream_sample_batch(
     for _ in 0..row_count {
         row_metadata.push(StreamRowMetadata {
             row_sequence: reader.u64()?,
+            logical_cycle_sequence: reader.u64()?,
             source_sequence: reader.u64()?,
             applied_sequence: reader.u64()?,
             valid_flags: reader.u32()?,
@@ -1835,6 +1837,7 @@ mod tests {
         (0..count)
             .map(|offset| StreamRowMetadata {
                 row_sequence: first + offset as u64,
+                logical_cycle_sequence: first + offset as u64,
                 source_sequence: first + offset as u64,
                 applied_sequence: first.saturating_add(offset as u64).saturating_sub(1),
                 valid_flags: SNAPSHOT_VALID
@@ -1996,6 +1999,12 @@ mod tests {
 
     #[test]
     fn stream_batch_round_trips_in_a_v2_frame_with_causality_index() {
+        let mut metadata = rows(100, 2);
+        for (offset, row) in metadata.iter_mut().enumerate() {
+            row.logical_cycle_sequence = 500 + offset as u64;
+            row.source_sequence = row.logical_cycle_sequence;
+            row.applied_sequence = row.logical_cycle_sequence.saturating_sub(1);
+        }
         let message = MessageV2::StreamSampleBatch(stream_batch(
             20,
             vec![0, 3],
@@ -2006,9 +2015,10 @@ mod tests {
                 40_i16.to_le_bytes(),
             ]
             .concat(),
-            rows(100, 2),
+            metadata,
         ));
         let frame = message.into_frame(0, 3, 2, 1_000).unwrap();
+        assert_eq!(frame.payload.len(), 110);
         let encoded = frame.encode().unwrap();
         let decoded_frame = Frame::decode(&encoded).unwrap();
 
@@ -2016,6 +2026,7 @@ mod tests {
         let batch = decode_stream_sample_frame(&decoded_frame, &channels(), &streams()).unwrap();
         assert_eq!(batch.stream_id, 20);
         assert_eq!(batch.row_metadata[0].row_sequence, 100);
+        assert_eq!(batch.row_metadata[0].logical_cycle_sequence, 500);
         assert_eq!(
             batch.row_metadata[1].applied_alignment(),
             CausalAlignment::PreviousShot
