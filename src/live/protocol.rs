@@ -3,7 +3,10 @@ use std::collections::VecDeque;
 use thiserror::Error;
 
 pub const FRAME_MAGIC: [u8; 4] = *b"SCP1";
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION_V1: u8 = 1;
+pub const PROTOCOL_VERSION_V2: u8 = 2;
+/// The frozen SCP1 V1 frame version. Kept as an alias for existing callers.
+pub const PROTOCOL_VERSION: u8 = PROTOCOL_VERSION_V1;
 pub const FRAME_HEADER_LEN: usize = 28;
 pub const FRAME_CRC_LEN: usize = 4;
 pub const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
@@ -23,6 +26,10 @@ pub const MSG_ERROR: u8 = 0x22;
 
 pub const MAX_CHANNEL_COUNT: usize = 64;
 pub const MAX_BATCH_SAMPLES: usize = 4096;
+
+pub fn is_supported_version(version: u8) -> bool {
+    matches!(version, PROTOCOL_VERSION_V1 | PROTOCOL_VERSION_V2)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hello {
@@ -566,6 +573,7 @@ impl Message {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
+    pub version: u8,
     pub message_type: u8,
     pub flags: u16,
     pub sequence: u32,
@@ -583,7 +591,47 @@ impl Frame {
         timestamp_ticks: u64,
         payload: Vec<u8>,
     ) -> Self {
+        Self::new_with_version(
+            PROTOCOL_VERSION_V1,
+            message_type,
+            flags,
+            sequence,
+            session_id,
+            timestamp_ticks,
+            payload,
+        )
+    }
+
+    pub fn new_v2(
+        message_type: u8,
+        flags: u16,
+        sequence: u32,
+        session_id: u32,
+        timestamp_ticks: u64,
+        payload: Vec<u8>,
+    ) -> Self {
+        Self::new_with_version(
+            PROTOCOL_VERSION_V2,
+            message_type,
+            flags,
+            sequence,
+            session_id,
+            timestamp_ticks,
+            payload,
+        )
+    }
+
+    pub fn new_with_version(
+        version: u8,
+        message_type: u8,
+        flags: u16,
+        sequence: u32,
+        session_id: u32,
+        timestamp_ticks: u64,
+        payload: Vec<u8>,
+    ) -> Self {
         Self {
+            version,
             message_type,
             flags,
             sequence,
@@ -594,6 +642,9 @@ impl Frame {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
+        if !is_supported_version(self.version) {
+            return Err(ProtocolError::UnsupportedVersion(self.version));
+        }
         if self.payload.len() > MAX_PAYLOAD_LEN {
             return Err(ProtocolError::PayloadTooLarge(self.payload.len()));
         }
@@ -605,7 +656,7 @@ impl Frame {
             .ok_or(ProtocolError::LengthOverflow)?;
         let mut bytes = Vec::with_capacity(total_len);
         bytes.extend_from_slice(&FRAME_MAGIC);
-        bytes.push(PROTOCOL_VERSION);
+        bytes.push(self.version);
         bytes.push(self.message_type);
         bytes.extend_from_slice(&self.flags.to_le_bytes());
         bytes.extend_from_slice(&self.sequence.to_le_bytes());
@@ -628,7 +679,7 @@ impl Frame {
         if bytes[..4] != FRAME_MAGIC {
             return Err(ProtocolError::InvalidMagic);
         }
-        if bytes[4] != PROTOCOL_VERSION {
+        if !is_supported_version(bytes[4]) {
             return Err(ProtocolError::UnsupportedVersion(bytes[4]));
         }
         let payload_len = read_u32(bytes, 12)? as usize;
@@ -655,6 +706,7 @@ impl Frame {
             });
         }
         Ok(Self {
+            version: bytes[4],
             message_type: bytes[5],
             flags: read_u16(bytes, 6)?,
             sequence: read_u32(bytes, 8)?,
@@ -669,6 +721,9 @@ pub fn decode_sample_frame(
     frame: &Frame,
     table: &ChannelTable,
 ) -> Result<DecodedSampleBatch, ProtocolError> {
+    if frame.version != PROTOCOL_VERSION_V1 {
+        return Err(ProtocolError::UnsupportedVersion(frame.version));
+    }
     if frame.message_type != MSG_SAMPLE_BATCH {
         return Err(ProtocolError::UnexpectedMessageType {
             expected: MSG_SAMPLE_BATCH,
@@ -1191,7 +1246,7 @@ impl FrameDecoder {
             if self.buffer.len() < FRAME_HEADER_LEN {
                 break;
             }
-            if self.buffer[4] != PROTOCOL_VERSION {
+            if !is_supported_version(self.buffer[4]) {
                 self.stats.malformed_headers = self.stats.malformed_headers.saturating_add(1);
                 self.discard_front(1);
                 continue;

@@ -3,6 +3,7 @@ pub mod buffer;
 pub mod capture_history;
 pub mod hardware_smoke;
 pub mod protocol;
+pub mod protocol_v2;
 pub mod recording;
 pub mod scope_source;
 pub mod session;

@@ -13,7 +13,7 @@ use crossbeam_channel::{after, bounded, select, Receiver, RecvTimeoutError, Send
 use thiserror::Error;
 
 use super::{
-    buffer::{GapReason, LiveGap},
+    buffer::{GapReason, LiveBuffer, LiveGap, LiveSnapshot},
     protocol::{
         decode_configure_result_detail, decode_sample_frame, validate_configure_for_device,
         ChannelTable, CommandResult, Configure, DecodedSampleBatch, Frame, FrameDecoder, Hello,
@@ -21,6 +21,7 @@ use super::{
     },
     recording::{RecordingError, RecordingIngress},
     transport::{TransportConfig, TransportError, TransportStream},
+    trigger::{TriggerCapture, TriggerConfig, TriggerEngine},
 };
 
 const COMMAND_CAPACITY: usize = 32;
@@ -28,6 +29,23 @@ const CONTROL_EVENT_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 256;
 const CONTROL_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 const COMMAND_SEND_TIMEOUT: Duration = Duration::from_millis(100);
+const DISPLAY_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(33);
+const DISPLAY_SNAPSHOT_POINTS: usize = 8_000;
+
+#[derive(Clone, Debug)]
+pub struct AcquisitionConfig {
+    pub history_seconds: u32,
+    pub trigger: TriggerConfig,
+}
+
+impl Default for AcquisitionConfig {
+    fn default() -> Self {
+        Self {
+            history_seconds: 1,
+            trigger: TriggerConfig::default(),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -62,15 +80,22 @@ pub enum SessionEvent {
     ChannelTable(ChannelTable),
     Configured(Configure),
     CommandResult(CommandResult),
+    /// Retained for source compatibility; acquisition workers no longer emit
+    /// a batch to the UI event queue.
     Batch(DecodedSampleBatch),
     Gap(LiveGap),
+    DisplaySnapshot(Arc<LiveSnapshot>),
+    TriggerCapture(TriggerCapture, TriggerConfig),
+    TriggerArmed(bool),
     Stats(SessionStats),
     RecordingError(String),
     Error(String),
 }
 
 enum SessionCommand {
-    Configure(Configure),
+    Configure(Configure, AcquisitionConfig),
+    SetTriggerConfig(TriggerConfig),
+    ArmTrigger,
     Start,
     Stop,
     Ping(u64),
@@ -80,7 +105,7 @@ enum SessionCommand {
 
 #[derive(Clone)]
 enum PendingCommand {
-    Configure(Configure),
+    Configure(Configure, AcquisitionConfig),
     Start,
     Stop,
 }
@@ -103,6 +128,8 @@ pub enum SessionError {
     ControlEventBackpressure,
     #[error("live session recording attachment timed out")]
     RecordingAttachmentTimeout,
+    #[error("live acquisition worker error: {0}")]
+    Acquisition(String),
 }
 
 pub struct LiveSession {
@@ -142,7 +169,23 @@ impl LiveSession {
     }
 
     pub fn configure(&self, configure: Configure) -> Result<(), SessionError> {
-        self.send(SessionCommand::Configure(configure))
+        self.configure_with_acquisition(configure, AcquisitionConfig::default())
+    }
+
+    pub fn configure_with_acquisition(
+        &self,
+        configure: Configure,
+        acquisition: AcquisitionConfig,
+    ) -> Result<(), SessionError> {
+        self.send(SessionCommand::Configure(configure, acquisition))
+    }
+
+    pub fn set_trigger_config(&self, config: TriggerConfig) -> Result<(), SessionError> {
+        self.send(SessionCommand::SetTriggerConfig(config))
+    }
+
+    pub fn arm_trigger(&self) -> Result<(), SessionError> {
+        self.send(SessionCommand::ArmTrigger)
     }
 
     pub fn start(&self) -> Result<(), SessionError> {
@@ -231,6 +274,87 @@ impl Drop for LiveSession {
     }
 }
 
+struct AcquisitionWorker {
+    buffer: LiveBuffer,
+    trigger: TriggerEngine,
+    last_snapshot: Instant,
+}
+
+impl AcquisitionWorker {
+    fn new(
+        configure: &Configure,
+        hello: &HelloAck,
+        table: &ChannelTable,
+        config: AcquisitionConfig,
+    ) -> Result<Self, SessionError> {
+        let channel_ids = table
+            .channels
+            .iter()
+            .filter(|channel| configure.channel_mask & (1_u64 << channel.channel_id) != 0)
+            .map(|channel| channel.channel_id)
+            .collect::<Vec<_>>();
+        let capacity = u64::from(configure.sample_rate_hz)
+            .checked_mul(u64::from(config.history_seconds))
+            .ok_or_else(|| SessionError::Acquisition("live history capacity overflow".to_owned()))?
+            .clamp(1, 5_000_000) as usize;
+        if !channel_ids.contains(&config.trigger.source_channel) {
+            return Err(SessionError::Acquisition(format!(
+                "trigger source channel {} is not in the configured stream",
+                config.trigger.source_channel
+            )));
+        }
+        Ok(Self {
+            buffer: LiveBuffer::new(channel_ids, capacity, hello.tick_hz)
+                .map_err(|error| SessionError::Acquisition(error.to_string()))?,
+            trigger: TriggerEngine::new(config.trigger)
+                .map_err(|error| SessionError::Acquisition(error.to_string()))?,
+            last_snapshot: Instant::now() - DISPLAY_SNAPSHOT_INTERVAL,
+        })
+    }
+
+    fn set_trigger_config(&mut self, config: TriggerConfig) -> Result<(), SessionError> {
+        if !self.buffer.channel_ids().contains(&config.source_channel) {
+            return Err(SessionError::Acquisition(format!(
+                "trigger source channel {} is not in the configured stream",
+                config.source_channel
+            )));
+        }
+        self.trigger
+            .set_config(config)
+            .map_err(|error| SessionError::Acquisition(error.to_string()))
+    }
+
+    fn arm_trigger(&mut self) {
+        self.trigger.arm();
+    }
+
+    fn on_gap(&mut self, gap: LiveGap) {
+        self.trigger.on_gap();
+        self.buffer
+            .push_gap(gap.start_sample_index, gap.missing_samples, gap.reason);
+    }
+
+    fn process(
+        &mut self,
+        batch: DecodedSampleBatch,
+    ) -> Result<(Vec<TriggerCapture>, Option<Arc<LiveSnapshot>>), SessionError> {
+        let captures = self
+            .trigger
+            .feed_all(&batch)
+            .map_err(|error| SessionError::Acquisition(error.to_string()))?;
+        self.buffer
+            .push_batch(batch)
+            .map_err(|error| SessionError::Acquisition(error.to_string()))?;
+        let snapshot = if self.last_snapshot.elapsed() >= DISPLAY_SNAPSHOT_INTERVAL {
+            self.last_snapshot = Instant::now();
+            Some(Arc::new(self.buffer.snapshot(DISPLAY_SNAPSHOT_POINTS)))
+        } else {
+            None
+        };
+        Ok((captures, snapshot))
+    }
+}
+
 fn run_worker(
     config: TransportConfig,
     command_rx: Receiver<SessionCommand>,
@@ -290,8 +414,8 @@ fn worker_loop(
     let mut last_received = Instant::now();
     let mut last_ping = Instant::now();
     let mut ping_nonce = 1_u64;
-    let mut pending_host_gap: Option<LiveGap> = None;
     let mut recording: Option<RecordingIngress> = None;
+    let mut acquisition: Option<AcquisitionWorker> = None;
     let mut streaming = false;
     let mut disconnecting = false;
     let mut disconnect_deadline = None;
@@ -299,7 +423,7 @@ fn worker_loop(
     loop {
         while let Ok(command) = command_rx.try_recv() {
             match command {
-                SessionCommand::Configure(configure) => {
+                SessionCommand::Configure(configure, acquisition_config) => {
                     let requested = configure.clone();
                     let sequence = write_message(
                         &mut transport,
@@ -307,11 +431,29 @@ fn worker_loop(
                         session_id,
                         Message::Configure(configure),
                     )?;
-                    pending.insert(sequence, PendingCommand::Configure(requested));
+                    pending.insert(
+                        sequence,
+                        PendingCommand::Configure(requested, acquisition_config),
+                    );
                     send_control(
                         control_tx,
                         SessionEvent::State(ConnectionState::Configuring),
                     )?;
+                }
+                SessionCommand::SetTriggerConfig(config) => {
+                    if let Some(worker) = &mut acquisition {
+                        worker.set_trigger_config(config)?;
+                        send_control(
+                            control_tx,
+                            SessionEvent::TriggerArmed(worker.trigger.is_armed()),
+                        )?;
+                    }
+                }
+                SessionCommand::ArmTrigger => {
+                    if let Some(worker) = &mut acquisition {
+                        worker.arm_trigger();
+                        send_control(control_tx, SessionEvent::TriggerArmed(true))?;
+                    }
                 }
                 SessionCommand::Start => {
                     let sequence = write_message(
@@ -499,7 +641,7 @@ fn worker_loop(
                     if result.result_code == ResultCode::Ok {
                         if let Some(command) = pending.remove(&result.request_sequence) {
                             let state = match command {
-                                PendingCommand::Configure(requested) => {
+                                PendingCommand::Configure(requested, acquisition_config) => {
                                     let actual = decode_configure_result_detail(&result.detail)?;
                                     let hello = hello_ack.as_ref().ok_or_else(|| {
                                         ProtocolError::InvalidPayload(
@@ -521,6 +663,12 @@ fn worker_loop(
                                         )
                                         .into());
                                     }
+                                    acquisition = Some(AcquisitionWorker::new(
+                                        &actual,
+                                        hello,
+                                        channel_table,
+                                        acquisition_config,
+                                    )?);
                                     send_control(control_tx, SessionEvent::Configured(actual))?;
                                     ConnectionState::Ready
                                 }
@@ -538,7 +686,7 @@ fn worker_loop(
                         }
                     } else if pending
                         .remove(&result.request_sequence)
-                        .is_some_and(|command| matches!(command, PendingCommand::Configure(_)))
+                        .is_some_and(|command| matches!(command, PendingCommand::Configure(_, _)))
                     {
                         send_control(control_tx, SessionEvent::State(ConnectionState::Ready))?;
                     }
@@ -580,7 +728,9 @@ fn worker_loop(
                                     )?;
                                 }
                             }
-                            let _ = data_tx.try_send(SessionEvent::Gap(gap));
+                            if let Some(worker) = &mut acquisition {
+                                worker.on_gap(gap);
+                            }
                         } else if decoded.first_sample_index < expected {
                             stats.protocol_errors = stats.protocol_errors.saturating_add(1);
                             continue;
@@ -599,33 +749,36 @@ fn worker_loop(
                     stats.received_batches = stats.received_batches.saturating_add(1);
                     stats.received_samples =
                         stats.received_samples.saturating_add(sample_count as u64);
-                    if let Some(gap) = pending_host_gap {
-                        match data_tx.try_send(SessionEvent::Gap(gap)) {
-                            Ok(()) => pending_host_gap = None,
+                    let worker = acquisition.as_mut().ok_or_else(|| {
+                        SessionError::Acquisition(
+                            "received samples before acquisition configuration completed"
+                                .to_owned(),
+                        )
+                    })?;
+                    let was_armed = worker.trigger.is_armed();
+                    let (captures, snapshot) = worker.process(decoded)?;
+                    for capture in captures {
+                        send_control(
+                            control_tx,
+                            SessionEvent::TriggerCapture(capture, worker.trigger.config().clone()),
+                        )?;
+                    }
+                    if worker.trigger.is_armed() != was_armed {
+                        send_control(
+                            control_tx,
+                            SessionEvent::TriggerArmed(worker.trigger.is_armed()),
+                        )?;
+                    }
+                    let publish_stats = snapshot.is_some();
+                    if let Some(snapshot) = snapshot {
+                        match data_tx.try_send(SessionEvent::DisplaySnapshot(snapshot)) {
+                            Ok(()) | Err(TrySendError::Full(_)) => {}
                             Err(TrySendError::Disconnected(_)) => return Ok(()),
-                            Err(TrySendError::Full(_)) => {}
                         }
                     }
-                    let dropped_start = decoded.first_sample_index;
-                    match data_tx.try_send(SessionEvent::Batch(decoded)) {
-                        Ok(()) => {}
-                        Err(TrySendError::Full(_)) => {
-                            stats.host_dropped_batches =
-                                stats.host_dropped_batches.saturating_add(1);
-                            if let Some(gap) = &mut pending_host_gap {
-                                gap.missing_samples =
-                                    gap.missing_samples.saturating_add(sample_count as u64);
-                            } else {
-                                pending_host_gap = Some(LiveGap {
-                                    start_sample_index: dropped_start,
-                                    missing_samples: sample_count as u64,
-                                    reason: GapReason::HostBackpressure,
-                                });
-                            }
-                        }
-                        Err(TrySendError::Disconnected(_)) => return Ok(()),
+                    if publish_stats {
+                        let _ = data_tx.try_send(SessionEvent::Stats(stats));
                     }
-                    let _ = data_tx.try_send(SessionEvent::Stats(stats));
                 }
                 Message::Error(error) => {
                     send_control(control_tx, SessionEvent::Error(error.detail))?;
@@ -754,18 +907,25 @@ mod tests {
         wait_for(&session, Duration::from_secs(2), |event| {
             matches!(event, SessionEvent::State(ConnectionState::Streaming))
         });
-        let first = wait_for(&session, Duration::from_secs(2), |event| {
-            matches!(event, SessionEvent::Batch(_))
+        let snapshot = wait_for(&session, Duration::from_secs(2), |event| {
+            matches!(event, SessionEvent::DisplaySnapshot(_))
         });
-        let second = wait_for(&session, Duration::from_secs(2), |event| {
-            matches!(event, SessionEvent::Batch(_))
-        });
-        let (SessionEvent::Batch(first), SessionEvent::Batch(second)) = (first, second) else {
+        let SessionEvent::DisplaySnapshot(snapshot) = snapshot else {
             unreachable!();
         };
-        assert_eq!(first.channel_ids, vec![0, 1, 2, 3]);
-        assert_eq!(first.channels[0].len(), 10);
-        assert_eq!(second.first_sample_index, first.first_sample_index + 10);
+        assert_eq!(snapshot.channel_ids, vec![0, 1, 2, 3]);
+        assert!(snapshot
+            .segments
+            .iter()
+            .all(|segment| segment.channels.len() == 4));
+        assert!(
+            snapshot
+                .segments
+                .iter()
+                .map(|segment| segment.times.len())
+                .sum::<usize>()
+                >= 10
+        );
 
         session.stop().unwrap();
         wait_for(&session, Duration::from_secs(2), |event| {
@@ -804,13 +964,15 @@ mod tests {
         );
         session.start().unwrap();
 
-        let gap = wait_for(&session, Duration::from_secs(2), |event| {
-            matches!(event, SessionEvent::Gap(_))
-        });
-        let SessionEvent::Gap(gap) = gap else {
+        let snapshot = wait_for(
+            &session,
+            Duration::from_secs(2),
+            |event| matches!(event, SessionEvent::DisplaySnapshot(snapshot) if snapshot.segments.len() >= 2),
+        );
+        let SessionEvent::DisplaySnapshot(snapshot) = snapshot else {
             unreachable!();
         };
-        assert_eq!(gap.missing_samples, 5);
+        assert!(snapshot.segments.len() >= 2);
         session.disconnect().unwrap();
     }
 

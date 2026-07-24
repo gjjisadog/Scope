@@ -11,7 +11,7 @@ pub mod rules;
 mod release_tests {
     #[test]
     fn live_scope_release_version_is_synchronized() {
-        const VERSION: &str = "0.12.0";
+        const VERSION: &str = "0.14.0";
         let cargo_toml = include_str!("../Cargo.toml");
         let package_script = include_str!("../scripts/package-windows.ps1");
         let wix = include_str!("../scripts/ScopeAnalyzer.wxs");

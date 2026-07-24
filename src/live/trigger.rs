@@ -63,26 +63,89 @@ pub enum TriggerError {
     InvalidBatch(String),
 }
 
-#[derive(Clone)]
-struct SamplePoint {
-    sample_index: u64,
-    timestamp: u64,
-    values: Vec<f32>,
-}
-
 struct CaptureBuilder {
     channel_ids: Vec<u16>,
-    points: Vec<SamplePoint>,
+    sample_indices: Vec<u64>,
+    timestamps: Vec<u64>,
+    channels: Vec<Vec<f32>>,
     trigger_position: usize,
     remaining_post: usize,
     auto_timeout: bool,
+}
+
+/// Fixed-column pre-trigger storage. Values are appended directly from the
+/// decoded batch, so arming a trigger does not allocate one `Vec<f32>` per
+/// sample.
+struct SampleHistory {
+    channel_ids: Vec<u16>,
+    capacity: usize,
+    sample_indices: VecDeque<u64>,
+    timestamps: VecDeque<u64>,
+    channels: Vec<VecDeque<f32>>,
+}
+
+impl SampleHistory {
+    fn clear(&mut self) {
+        self.sample_indices.clear();
+        self.timestamps.clear();
+        for channel in &mut self.channels {
+            channel.clear();
+        }
+    }
+
+    fn prepare(&mut self, channel_ids: &[u16], capacity: usize) {
+        if self.channel_ids == channel_ids && self.capacity == capacity {
+            return;
+        }
+        self.channel_ids = channel_ids.to_vec();
+        self.capacity = capacity;
+        self.sample_indices = VecDeque::with_capacity(capacity);
+        self.timestamps = VecDeque::with_capacity(capacity);
+        self.channels = channel_ids
+            .iter()
+            .map(|_| VecDeque::with_capacity(capacity))
+            .collect();
+    }
+
+    fn push(&mut self, batch: &DecodedSampleBatch, sample_offset: usize, capacity: usize) {
+        self.sample_indices.push_back(
+            batch.first_sample_index
+                + u64::try_from(sample_offset).expect("sample offset was validated"),
+        );
+        self.timestamps.push_back(
+            batch.timestamp_ticks
+                + u64::from(batch.sample_period_ticks)
+                    * u64::try_from(sample_offset).expect("sample offset was validated"),
+        );
+        for (history, source) in self.channels.iter_mut().zip(&batch.channels) {
+            history.push_back(source[sample_offset]);
+        }
+        while self.sample_indices.len() > capacity {
+            self.sample_indices.pop_front();
+            self.timestamps.pop_front();
+            for channel in &mut self.channels {
+                channel.pop_front();
+            }
+        }
+    }
+
+    fn drain_capture_columns(&mut self) -> (Vec<u64>, Vec<u64>, Vec<Vec<f32>>) {
+        (
+            self.sample_indices.drain(..).collect(),
+            self.timestamps.drain(..).collect(),
+            self.channels
+                .iter_mut()
+                .map(|channel| channel.drain(..).collect())
+                .collect(),
+        )
+    }
 }
 
 pub struct TriggerEngine {
     config: TriggerConfig,
     armed: bool,
     edge_latch: Option<TriggerEdge>,
-    pre_history: VecDeque<SamplePoint>,
+    pre_history: SampleHistory,
     active_capture: Option<CaptureBuilder>,
     samples_since_arm: usize,
 }
@@ -94,7 +157,13 @@ impl TriggerEngine {
             config,
             armed: true,
             edge_latch: None,
-            pre_history: VecDeque::new(),
+            pre_history: SampleHistory {
+                channel_ids: Vec::new(),
+                capacity: 0,
+                sample_indices: VecDeque::new(),
+                timestamps: VecDeque::new(),
+                channels: Vec::new(),
+            },
             active_capture: None,
             samples_since_arm: 0,
         })
@@ -186,20 +255,11 @@ impl TriggerEngine {
             )
             .ok_or_else(|| TriggerError::InvalidBatch("timestamp overflow".to_owned()))?;
 
+        self.pre_history
+            .prepare(&batch.channel_ids, self.config.pre_samples);
         let mut captures = Vec::new();
         for sample_offset in 0..sample_count {
-            let offset = u64::try_from(sample_offset)
-                .map_err(|_| TriggerError::InvalidBatch("sample offset overflow".to_owned()))?;
-            let point = SamplePoint {
-                sample_index: batch.first_sample_index + offset,
-                timestamp: batch.timestamp_ticks + u64::from(batch.sample_period_ticks) * offset,
-                values: batch
-                    .channels
-                    .iter()
-                    .map(|channel| channel[sample_offset])
-                    .collect(),
-            };
-            if let Some(capture) = self.push_point(point, source_position, &batch.channel_ids)? {
+            if let Some(capture) = self.push_sample(batch, sample_offset, source_position)? {
                 captures.push(capture);
                 if !self.armed {
                     break;
@@ -209,14 +269,14 @@ impl TriggerEngine {
         Ok(captures)
     }
 
-    fn push_point(
+    fn push_sample(
         &mut self,
-        point: SamplePoint,
+        batch: &DecodedSampleBatch,
+        sample_offset: usize,
         source_position: usize,
-        channel_ids: &[u16],
     ) -> Result<Option<TriggerCapture>, TriggerError> {
         if let Some(builder) = &mut self.active_capture {
-            builder.points.push(point);
+            append_sample(builder, batch, sample_offset);
             builder.remaining_post = builder.remaining_post.saturating_sub(1);
             if builder.remaining_post == 0 {
                 return Ok(Some(self.finish_capture()));
@@ -224,10 +284,10 @@ impl TriggerEngine {
             return Ok(None);
         }
 
-        let source = point.values[source_position];
+        let source = batch.channels[source_position][sample_offset];
         if !source.is_finite() {
             self.edge_latch = None;
-            self.push_pre_history(point);
+            self.push_pre_history(batch, sample_offset);
             return Ok(None);
         }
         self.samples_since_arm = self.samples_since_arm.saturating_add(1);
@@ -235,22 +295,25 @@ impl TriggerEngine {
         let auto_timeout = self.config.mode == TriggerMode::Auto
             && self.samples_since_arm >= self.config.auto_timeout_samples;
         if edge_hit || auto_timeout {
-            let mut points = self.pre_history.drain(..).collect::<Vec<_>>();
-            let trigger_position = points.len();
-            points.push(point);
-            self.active_capture = Some(CaptureBuilder {
-                channel_ids: channel_ids.to_vec(),
-                points,
+            let trigger_position = self.pre_history.sample_indices.len();
+            let (sample_indices, timestamps, channels) = self.pre_history.drain_capture_columns();
+            let mut builder = CaptureBuilder {
+                channel_ids: batch.channel_ids.clone(),
+                sample_indices,
+                timestamps,
+                channels,
                 trigger_position,
                 remaining_post: self.config.post_samples,
                 auto_timeout: !edge_hit && auto_timeout,
-            });
+            };
+            append_sample(&mut builder, batch, sample_offset);
+            self.active_capture = Some(builder);
             if self.config.post_samples == 0 {
                 return Ok(Some(self.finish_capture()));
             }
             return Ok(None);
         }
-        self.push_pre_history(point);
+        self.push_pre_history(batch, sample_offset);
         Ok(None)
     }
 
@@ -297,11 +360,9 @@ impl TriggerEngine {
         }
     }
 
-    fn push_pre_history(&mut self, point: SamplePoint) {
-        self.pre_history.push_back(point);
-        while self.pre_history.len() > self.config.pre_samples {
-            self.pre_history.pop_front();
-        }
+    fn push_pre_history(&mut self, batch: &DecodedSampleBatch, sample_offset: usize) {
+        self.pre_history
+            .push(batch, sample_offset, self.config.pre_samples);
     }
 
     fn finish_capture(&mut self) -> TriggerCapture {
@@ -309,28 +370,15 @@ impl TriggerEngine {
             .active_capture
             .take()
             .expect("finish_capture requires an active capture");
-        let channel_count = builder.channel_ids.len();
-        let mut channels = (0..channel_count)
-            .map(|_| Vec::with_capacity(builder.points.len()))
-            .collect::<Vec<_>>();
-        let mut sample_indices = Vec::with_capacity(builder.points.len());
-        let mut timestamps = Vec::with_capacity(builder.points.len());
-        for point in builder.points {
-            sample_indices.push(point.sample_index);
-            timestamps.push(point.timestamp);
-            for (channel, value) in channels.iter_mut().zip(point.values) {
-                channel.push(value);
-            }
-        }
         if self.config.mode == TriggerMode::Single {
             self.armed = false;
         }
         self.reset_history();
         TriggerCapture {
             channel_ids: builder.channel_ids,
-            sample_indices,
-            timestamps,
-            channels,
+            sample_indices: builder.sample_indices,
+            timestamps: builder.timestamps,
+            channels: builder.channels,
             trigger_position: builder.trigger_position,
             auto_timeout: builder.auto_timeout,
         }
@@ -341,6 +389,21 @@ impl TriggerEngine {
         self.pre_history.clear();
         self.active_capture = None;
         self.samples_since_arm = 0;
+    }
+}
+
+fn append_sample(builder: &mut CaptureBuilder, batch: &DecodedSampleBatch, sample_offset: usize) {
+    let offset = u64::try_from(sample_offset).expect("sample offset was validated");
+    builder
+        .sample_indices
+        .push(batch.first_sample_index.saturating_add(offset));
+    builder.timestamps.push(
+        batch
+            .timestamp_ticks
+            .saturating_add(u64::from(batch.sample_period_ticks).saturating_mul(offset)),
+    );
+    for (target, source) in builder.channels.iter_mut().zip(&batch.channels) {
+        target.push(source[sample_offset]);
     }
 }
 

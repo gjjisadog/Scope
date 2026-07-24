@@ -314,8 +314,13 @@ fn capture_for_duration(
     let mut gap_events = 0_u64;
     while Instant::now() < deadline {
         match session.recv_timeout(EVENT_POLL_TIMEOUT) {
-            Ok(SessionEvent::Batch(_)) => batch_events = batch_events.saturating_add(1),
-            Ok(SessionEvent::Gap(_)) => gap_events = gap_events.saturating_add(1),
+            // The acquisition worker keeps raw batches and gaps off the UI
+            // queue. Its periodic statistics retain the same evidence for
+            // the smoke result without reintroducing batch work here.
+            Ok(SessionEvent::Stats(stats)) => {
+                batch_events = batch_events.max(stats.received_batches);
+                gap_events = gap_events.max(stats.sequence_gaps);
+            }
             Ok(SessionEvent::Error(error) | SessionEvent::RecordingError(error)) => {
                 return Err(HardwareSmokeError::Device(error));
             }

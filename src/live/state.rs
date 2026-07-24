@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -12,7 +13,7 @@ use super::{
     capture_history::{CaptureHistory, CapturePayload},
     protocol::{validate_configure_for_device, ChannelTable, Configure, HelloAck, ResultCode},
     recording::{AsyncScopeRecorder, RecordingMetadata, RecordingStats},
-    session::{ConnectionState, LiveSession, SessionEvent, SessionStats},
+    session::{AcquisitionConfig, ConnectionState, LiveSession, SessionEvent, SessionStats},
     transport::TransportConfig,
     trigger::{TriggerCapture, TriggerConfig, TriggerEngine, TriggerMode},
 };
@@ -33,6 +34,9 @@ pub struct LiveScopeState {
     pub acquisition: Configure,
     pub configuration_applied: bool,
     pub history_seconds: u32,
+    /// Latest immutable acquisition-worker snapshot. UI reads this only; it
+    /// never mutates the live ring buffer or runs trigger processing.
+    pub latest_display_snapshot: Option<Arc<LiveSnapshot>>,
     pub buffer: Option<LiveBuffer>,
     pub trigger: TriggerEngine,
     pub last_capture: Option<TriggerCapture>,
@@ -67,6 +71,7 @@ impl Default for LiveScopeState {
             },
             configuration_applied: false,
             history_seconds: 1,
+            latest_display_snapshot: None,
             buffer: None,
             trigger: TriggerEngine::new(TriggerConfig::default())
                 .expect("default trigger configuration is valid"),
@@ -98,6 +103,7 @@ impl LiveScopeState {
         self.hello_ack = None;
         self.channel_table = None;
         self.buffer = None;
+        self.latest_display_snapshot = None;
         self.configuration_applied = false;
         self.stats = SessionStats::default();
         self.start_after_configure = false;
@@ -129,11 +135,30 @@ impl LiveScopeState {
             .as_ref()
             .ok_or_else(|| "device channel table is not available".to_owned())?;
         validate_configure_for_device(&configure, hello, table).map_err(error_string)?;
+        if configure.channel_mask & (1_u64 << self.trigger.config().source_channel) == 0 {
+            let source_channel = table
+                .channels
+                .iter()
+                .find(|channel| configure.channel_mask & (1_u64 << channel.channel_id) != 0)
+                .map(|channel| channel.channel_id)
+                .ok_or_else(|| "channel mask selects no known channels".to_owned())?;
+            let mut trigger = self.trigger.config().clone();
+            trigger.source_channel = source_channel;
+            self.trigger.set_config(trigger).map_err(error_string)?;
+        }
         let session = self
             .session
             .as_ref()
             .ok_or_else(|| "live session is not connected".to_owned())?;
-        session.configure(configure.clone()).map_err(error_string)?;
+        session
+            .configure_with_acquisition(
+                configure.clone(),
+                AcquisitionConfig {
+                    history_seconds: self.history_seconds,
+                    trigger: self.trigger.config().clone(),
+                },
+            )
+            .map_err(error_string)?;
         self.configuration_applied = false;
         Ok(())
     }
@@ -250,9 +275,14 @@ impl LiveScopeState {
     }
 
     pub fn snapshot(&self, max_points: usize) -> Option<LiveSnapshot> {
-        self.buffer
+        self.latest_display_snapshot
             .as_ref()
-            .map(|buffer| buffer.snapshot(max_points))
+            .map(|snapshot| (**snapshot).clone())
+            .or_else(|| {
+                self.buffer
+                    .as_ref()
+                    .map(|buffer| buffer.snapshot(max_points))
+            })
     }
 
     pub fn measurement_snapshot(&self, max_samples: usize) -> Option<LiveSnapshot> {
@@ -262,9 +292,14 @@ impl LiveScopeState {
         if self.display_paused {
             return self.frozen_snapshot.clone();
         }
-        self.buffer
+        self.latest_display_snapshot
             .as_ref()
-            .map(|buffer| buffer.snapshot_recent(max_samples))
+            .map(|snapshot| (**snapshot).clone())
+            .or_else(|| {
+                self.buffer
+                    .as_ref()
+                    .map(|buffer| buffer.snapshot_recent(max_samples))
+            })
     }
 
     pub fn set_display_paused(&mut self, paused: bool) {
@@ -284,9 +319,9 @@ impl LiveScopeState {
         }
     }
 
-    /// Returns an immutable, full-resolution analysis input. A completed
-    /// trigger capture takes precedence; otherwise the currently frozen view
-    /// or the full retained ring buffer is used.
+    /// Returns the latest immutable analysis input. A completed trigger
+    /// capture takes precedence; otherwise this is the currently frozen view
+    /// or the worker-published display snapshot.
     pub fn analysis_snapshot(&self) -> Option<LiveSnapshot> {
         if let Some(capture) = self.selected_trigger_capture() {
             return self.trigger_capture_snapshot(capture, usize::MAX);
@@ -300,6 +335,10 @@ impl LiveScopeState {
     pub fn has_analysis_snapshot(&self) -> bool {
         self.selected_trigger_capture().is_some()
             || (self.display_paused && self.frozen_snapshot.is_some())
+            || self
+                .latest_display_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.segments.is_empty())
             || self
                 .buffer
                 .as_ref()
@@ -318,10 +357,20 @@ impl LiveScopeState {
     pub fn arm_trigger(&mut self) {
         self.last_capture = None;
         self.trigger.arm();
+        if let Some(session) = &self.session {
+            if let Err(error) = session.arm_trigger() {
+                self.last_error = Some(error_string(error));
+            }
+        }
     }
 
     pub fn set_trigger_config(&mut self, config: TriggerConfig) -> Result<(), String> {
-        self.trigger.set_config(config).map_err(error_string)?;
+        self.trigger
+            .set_config(config.clone())
+            .map_err(error_string)?;
+        if let Some(session) = &self.session {
+            session.set_trigger_config(config).map_err(error_string)?;
+        }
         self.last_capture = None;
         Ok(())
     }
@@ -486,43 +535,46 @@ impl LiveScopeState {
                     ));
                 }
             }
-            SessionEvent::Batch(batch) => {
-                for capture in self.trigger.feed_all(&batch).map_err(error_string)? {
-                    if let Some(writer) = &mut self.recording {
-                        if let Err(error) =
-                            writer.try_write_trigger(capture.clone(), self.trigger.config().clone())
-                        {
-                            self.recording.take();
-                            return Err(error_string(error));
-                        }
-                    }
-                    let created_unix_ms = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis()
-                        .min(u128::from(u64::MAX)) as u64;
-                    match self.capture_history.insert_live(
-                        capture.clone(),
-                        self.trigger.config().clone(),
-                        created_unix_ms,
-                        !self.keep_capture_selection,
-                    ) {
-                        Ok(_) => capture_history_changed = true,
-                        Err(error) => self.last_error = Some(error.to_string()),
-                    }
-                    self.last_capture = Some(capture);
-                }
-                let buffer = self
-                    .buffer
-                    .as_mut()
-                    .ok_or_else(|| "live buffer is not initialized".to_owned())?;
-                buffer.push_batch(batch).map_err(error_string)?;
+            SessionEvent::Batch(_) => {
+                return Err("received an unprocessed live batch on the UI path".to_owned());
             }
-            SessionEvent::Gap(gap) => {
-                self.trigger.on_gap();
-                if let Some(buffer) = &mut self.buffer {
-                    buffer.push_gap(gap.start_sample_index, gap.missing_samples, gap.reason);
+            SessionEvent::Gap(_) => {
+                // Gap detection and live-ring mutation occur in the acquisition worker.
+            }
+            SessionEvent::DisplaySnapshot(snapshot) => {
+                self.latest_display_snapshot = Some(snapshot)
+            }
+            SessionEvent::TriggerArmed(armed) => {
+                if armed {
+                    self.trigger.arm();
+                } else {
+                    self.trigger.disarm();
                 }
+            }
+            SessionEvent::TriggerCapture(capture, trigger_config) => {
+                if let Some(writer) = &mut self.recording {
+                    if let Err(error) =
+                        writer.try_write_trigger(capture.clone(), trigger_config.clone())
+                    {
+                        self.recording.take();
+                        return Err(error_string(error));
+                    }
+                }
+                let created_unix_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64;
+                match self.capture_history.insert_live(
+                    capture.clone(),
+                    trigger_config,
+                    created_unix_ms,
+                    !self.keep_capture_selection,
+                ) {
+                    Ok(_) => capture_history_changed = true,
+                    Err(error) => self.last_error = Some(error.to_string()),
+                }
+                self.last_capture = Some(capture);
             }
             SessionEvent::Stats(stats) => self.stats = stats,
             SessionEvent::RecordingError(error) => {
@@ -542,28 +594,25 @@ impl LiveScopeState {
         let Some(table) = &self.channel_table else {
             return Ok(());
         };
-        let Some(hello) = &self.hello_ack else {
-            return Ok(());
-        };
         let channel_ids = table
             .channels
             .iter()
             .filter(|channel| self.acquisition.channel_mask & (1_u64 << channel.channel_id) != 0)
             .map(|channel| channel.channel_id)
             .collect::<Vec<_>>();
-        let capacity = u64::from(self.acquisition.sample_rate_hz)
-            .checked_mul(u64::from(self.history_seconds))
-            .ok_or_else(|| "live history capacity overflow".to_owned())?
-            .clamp(1, 5_000_000) as usize;
-        self.buffer = Some(
-            LiveBuffer::new(channel_ids.clone(), capacity, hello.tick_hz).map_err(error_string)?,
-        );
+        self.buffer = None;
+        self.latest_display_snapshot = None;
         if !channel_ids.contains(&self.trigger.config().source_channel) {
             let mut config = self.trigger.config().clone();
             config.source_channel = *channel_ids
                 .first()
                 .ok_or_else(|| "channel mask selects no known channels".to_owned())?;
             self.trigger.set_config(config).map_err(error_string)?;
+            if let Some(session) = &self.session {
+                session
+                    .set_trigger_config(self.trigger.config().clone())
+                    .map_err(error_string)?;
+            }
         }
         Ok(())
     }
@@ -620,7 +669,6 @@ mod tests {
     use crate::{
         data::{DataSource, SampleBlock},
         live::{
-            protocol::DecodedSampleBatch,
             scope_source::ScopeRecordingDataSource,
             simulator::{SimulatorConfig, SimulatorHandle},
         },
@@ -642,7 +690,6 @@ mod tests {
     #[test]
     fn trigger_capture_reports_a_history_change() {
         let mut state = LiveScopeState::default();
-        state.buffer = Some(LiveBuffer::new(vec![0], 8, 1_000).unwrap());
         state
             .set_trigger_config(TriggerConfig {
                 mode: TriggerMode::Auto,
@@ -655,15 +702,17 @@ mod tests {
             .unwrap();
 
         let changed = state
-            .handle_event(SessionEvent::Batch(DecodedSampleBatch {
-                revision: 1,
-                first_sample_index: 0,
-                sample_period_ticks: 1,
-                timestamp_ticks: 0,
-                channel_ids: vec![0],
-                channels: vec![vec![0.0]],
-                raw_frame: Vec::new(),
-            }))
+            .handle_event(SessionEvent::TriggerCapture(
+                TriggerCapture {
+                    channel_ids: vec![0],
+                    sample_indices: vec![0],
+                    timestamps: vec![0],
+                    channels: vec![vec![0.0]],
+                    trigger_position: 0,
+                    auto_timeout: true,
+                },
+                state.trigger.config().clone(),
+            ))
             .unwrap();
 
         assert!(changed);
@@ -708,9 +757,16 @@ mod tests {
         state.start().unwrap();
         wait_until(&mut state, |state| {
             state
-                .buffer
+                .latest_display_snapshot
                 .as_ref()
-                .is_some_and(|buffer| buffer.len() >= 30)
+                .is_some_and(|snapshot| {
+                    snapshot
+                        .segments
+                        .iter()
+                        .map(|segment| segment.times.len())
+                        .sum::<usize>()
+                        >= 30
+                })
         });
         wait_until(&mut state, |state| {
             state.recording_stats().sample_frames >= 3
@@ -789,9 +845,16 @@ mod tests {
         wait_until(&mut state, |state| {
             state.capture_history.entries().len() >= 3
                 && state
-                    .buffer
+                    .latest_display_snapshot
                     .as_ref()
-                    .is_some_and(|buffer| buffer.len() >= 1_000)
+                    .is_some_and(|snapshot| {
+                        snapshot
+                            .segments
+                            .iter()
+                            .map(|segment| segment.times.len())
+                            .sum::<usize>()
+                            >= 1_000
+                    })
         });
 
         let snapshot = state.snapshot(20_000).unwrap();
@@ -969,9 +1032,15 @@ mod tests {
         });
         state.stop_recording().unwrap();
         let displayed_samples = state
-            .buffer
+            .latest_display_snapshot
             .as_ref()
-            .map(|buffer| buffer.len())
+            .map(|snapshot| {
+                snapshot
+                    .segments
+                    .iter()
+                    .map(|segment| segment.times.len())
+                    .sum::<usize>()
+            })
             .unwrap_or(0);
         state.disconnect().unwrap();
 
