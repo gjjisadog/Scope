@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
@@ -19,8 +20,16 @@ use super::protocol::{
 };
 use super::protocol_v2::{
     capture_integrity_summary, ArmCapture, CaptureBegin, CaptureData, CaptureEnd, CapturePhase,
-    CaptureState, CaptureStatus, ConfigureStream, MessageV2, SampleDomain, StreamChannelBinding,
-    StreamDescriptor, StreamSampleBatch, StreamTable, CAPABILITY_V2_STREAMS,
+    CaptureState, CaptureStatus, CausalRelation, ConfigureStream, MessageV2, SampleDomain,
+    StreamChannelBinding, StreamDescriptor, StreamSampleBatch, StreamTable,
+    CAPABILITY_V2_STREAMS_R1,
+};
+use super::protocol_v2_r2::{
+    capture_integrity_summary_r2, validate_configure_streams_r2_for_device, CaptureDataR2,
+    CausalGroupDescriptorR2, ConfigureStreamsR2, MessageV2R2, MetadataEncodingR2,
+    StreamDescriptorR2, StreamSampleBatchR2, StreamSubscriptionR2, StreamTableR2,
+    CAPABILITY_V2_COMPRESSED_METADATA, CAPABILITY_V2_HARDWARE_CAPTURE_R2,
+    CAPABILITY_V2_MULTI_STREAM, CAPABILITY_V2_STREAMS_R2, MSG_CONFIGURE_STREAMS_R2,
 };
 use super::snapshot::{
     SnapshotMeta, ADC_SAMPLE_VALID, APPLIED_SEQUENCE_VALID, CLA_RESULT_VALID, FROZEN_ROW,
@@ -39,7 +48,8 @@ const SIMULATOR_SESSION_ID: u32 = 1;
 pub enum SimulatorProtocol {
     #[default]
     V1,
-    V2,
+    V2R1,
+    V2R2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +69,14 @@ pub enum V2Preset {
     CaptureChunkLoss30k,
     CaptureChunkReorder30k,
     DeviceReset30k,
+    CausalInOrder30k,
+    CausalResultFirst30k,
+    CausalApplicationFirst30k,
+    CausalSourceTimeout30k,
+    CausalNonzeroOffset30k,
+    CausalNegativeOffset30k,
+    CausalDuplicateCycle30k,
+    CausalWatermarkEviction30k,
 }
 
 impl V2Preset {
@@ -79,6 +97,14 @@ impl V2Preset {
             "30k-capture-chunk-loss" => Some(Self::CaptureChunkLoss30k),
             "30k-capture-chunk-reorder" => Some(Self::CaptureChunkReorder30k),
             "30k-device-reset" => Some(Self::DeviceReset30k),
+            "30k-causal-in-order" => Some(Self::CausalInOrder30k),
+            "30k-causal-result-first" => Some(Self::CausalResultFirst30k),
+            "30k-causal-application-first" => Some(Self::CausalApplicationFirst30k),
+            "30k-causal-source-timeout" => Some(Self::CausalSourceTimeout30k),
+            "30k-causal-nonzero-offset" => Some(Self::CausalNonzeroOffset30k),
+            "30k-causal-negative-offset" => Some(Self::CausalNegativeOffset30k),
+            "30k-causal-duplicate-cycle" => Some(Self::CausalDuplicateCycle30k),
+            "30k-causal-watermark-eviction" => Some(Self::CausalWatermarkEviction30k),
             _ => None,
         }
     }
@@ -100,6 +126,14 @@ impl V2Preset {
             Self::CaptureChunkLoss30k => "30k-capture-chunk-loss",
             Self::CaptureChunkReorder30k => "30k-capture-chunk-reorder",
             Self::DeviceReset30k => "30k-device-reset",
+            Self::CausalInOrder30k => "30k-causal-in-order",
+            Self::CausalResultFirst30k => "30k-causal-result-first",
+            Self::CausalApplicationFirst30k => "30k-causal-application-first",
+            Self::CausalSourceTimeout30k => "30k-causal-source-timeout",
+            Self::CausalNonzeroOffset30k => "30k-causal-nonzero-offset",
+            Self::CausalNegativeOffset30k => "30k-causal-negative-offset",
+            Self::CausalDuplicateCycle30k => "30k-causal-duplicate-cycle",
+            Self::CausalWatermarkEviction30k => "30k-causal-watermark-eviction",
         }
     }
 }
@@ -116,6 +150,7 @@ pub struct SimulatorConfig {
     pub disconnect_after: Option<u64>,
     pub protocol: SimulatorProtocol,
     pub preset: Option<V2Preset>,
+    pub streams: Vec<u16>,
 }
 
 impl Default for SimulatorConfig {
@@ -131,6 +166,7 @@ impl Default for SimulatorConfig {
             disconnect_after: None,
             protocol: SimulatorProtocol::V1,
             preset: None,
+            streams: vec![1, 2, 3],
         }
     }
 }
@@ -139,7 +175,7 @@ impl SimulatorConfig {
     pub fn validate(&self) -> Result<(), SimulatorError> {
         let tick_hz = match self.protocol {
             SimulatorProtocol::V1 => V1_SIMULATOR_TICK_HZ,
-            SimulatorProtocol::V2 => V2_SIMULATOR_TICK_HZ,
+            SimulatorProtocol::V2R1 | SimulatorProtocol::V2R2 => V2_SIMULATOR_TICK_HZ,
         };
         if self.sample_rate_hz == 0 || self.sample_rate_hz as u64 > tick_hz {
             return Err(SimulatorError::InvalidConfig(format!(
@@ -164,8 +200,25 @@ impl SimulatorConfig {
         }
         if self.protocol == SimulatorProtocol::V1 && self.preset.is_some() {
             return Err(SimulatorError::InvalidConfig(
-                "V2 preset requires --protocol v2".to_owned(),
+                "V2 preset requires --protocol v2-r1 or v2-r2".to_owned(),
             ));
+        }
+        if self.protocol != SimulatorProtocol::V1 {
+            if self.streams.is_empty() || self.streams.len() > 8 {
+                return Err(SimulatorError::InvalidConfig(
+                    "V2 streams must contain 1..=8 entries".to_owned(),
+                ));
+            }
+            let mut unique = self.streams.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            if unique.len() != self.streams.len()
+                || unique.iter().any(|stream_id| !matches!(stream_id, 1..=3))
+            {
+                return Err(SimulatorError::InvalidConfig(
+                    "V2 streams must be unique fast32k, ctrl8k, or slow1k ids".to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -266,7 +319,8 @@ fn run_listener(
                 });
                 let _ = match config.protocol {
                     SimulatorProtocol::V1 => serve_client(stream, &config, &stop, &stats),
-                    SimulatorProtocol::V2 => serve_v2_client(stream, &config, &stop, &stats),
+                    SimulatorProtocol::V2R1 => serve_v2_client(stream, &config, &stop, &stats),
+                    SimulatorProtocol::V2R2 => serve_v2_r2_client(stream, &config, &stop, &stats),
                 };
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -497,7 +551,7 @@ fn serve_v2_client(
                             else {
                                 continue;
                             };
-                            if hello.client_capabilities & CAPABILITY_V2_STREAMS == 0 {
+                            if hello.client_capabilities & CAPABILITY_V2_STREAMS_R1 == 0 {
                                 continue;
                             }
                             update_stats(stats, |value| {
@@ -808,6 +862,371 @@ fn serve_v2_client(
     Ok(())
 }
 
+fn serve_v2_r2_client(
+    mut stream: TcpStream,
+    config: &SimulatorConfig,
+    stop: &AtomicBool,
+    stats: &Mutex<SimulatorStats>,
+) -> Result<(), SimulatorError> {
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(Duration::from_millis(5)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(500)))?;
+    let mut decoder = FrameDecoder::default();
+    let mut read_buffer = [0_u8; 16 * 1024];
+    let mut out_sequence = 1_u32;
+    let mut session_id = SIMULATOR_SESSION_ID;
+    let mut configured: Option<ConfigureStreamsR2> = None;
+    let mut streaming = false;
+    let mut emitted_rounds = 0_u64;
+    let mut row_sequences = BTreeMap::<u16, u64>::new();
+    let mut last_ping = Instant::now();
+    let mut ping_nonce = 1_u64;
+    let mut capture_attempts = 0_u32;
+    let channels = v2_channel_table();
+    let preset = config.preset.unwrap_or(V2Preset::CausalInOrder30k);
+    let streams = v2_r2_stream_table(preset, &config.streams);
+
+    while !stop.load(Ordering::Relaxed) {
+        match stream.read(&mut read_buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                decoder.push(&read_buffer[..count]);
+                for frame in decoder.drain_frames() {
+                    if frame.version != super::protocol::PROTOCOL_VERSION_V2 {
+                        continue;
+                    }
+                    if frame.message_type != MSG_HELLO && frame.session_id != session_id {
+                        continue;
+                    }
+                    match frame.message_type {
+                        MSG_HELLO => {
+                            let Ok(Message::Hello(hello)) =
+                                Message::decode(frame.message_type, &frame.payload)
+                            else {
+                                continue;
+                            };
+                            let required = CAPABILITY_V2_STREAMS_R2
+                                | CAPABILITY_V2_MULTI_STREAM
+                                | CAPABILITY_V2_COMPRESSED_METADATA;
+                            if hello.client_capabilities & required != required {
+                                continue;
+                            }
+                            update_stats(stats, |value| {
+                                value.hello_requests = value.hello_requests.saturating_add(1);
+                                value.v2_stream_table_requests =
+                                    value.v2_stream_table_requests.saturating_add(1);
+                            });
+                            send_v2_common_session(
+                                &mut stream,
+                                &mut out_sequence,
+                                session_id,
+                                Message::HelloAck(v2_r2_hello_ack(&channels)),
+                            )?;
+                            send_v2_common_session(
+                                &mut stream,
+                                &mut out_sequence,
+                                session_id,
+                                Message::ChannelTable(channels.clone()),
+                            )?;
+                            send_v2_r2_message(
+                                &mut stream,
+                                &mut out_sequence,
+                                session_id,
+                                MessageV2R2::StreamTable(streams.clone()),
+                                0,
+                            )?;
+                            send_v2_common_session(
+                                &mut stream,
+                                &mut out_sequence,
+                                session_id,
+                                status_message(DeviceState::Idle, emitted_rounds),
+                            )?;
+                        }
+                        MSG_CONFIGURE_STREAMS_R2 => {
+                            let Ok(MessageV2R2::ConfigureStreams(request)) =
+                                MessageV2R2::decode(frame.message_type, &frame.payload)
+                            else {
+                                continue;
+                            };
+                            update_stats(stats, |value| {
+                                value.configure_requests =
+                                    value.configure_requests.saturating_add(1)
+                            });
+                            match validate_configure_streams_r2_for_device(
+                                &request,
+                                &streams,
+                                &channels,
+                                4096,
+                                MAX_PAYLOAD_LEN as u32,
+                            ) {
+                                Ok(()) => {
+                                    let detail = accepted_subscriptions_detail(&request);
+                                    configured = Some(request);
+                                    row_sequences.clear();
+                                    send_v2_common_session(
+                                        &mut stream,
+                                        &mut out_sequence,
+                                        session_id,
+                                        Message::CommandResult(CommandResult {
+                                            request_sequence: frame.sequence,
+                                            result_code: ResultCode::Ok,
+                                            detail,
+                                        }),
+                                    )?;
+                                }
+                                Err(error) => send_v2_common_session(
+                                    &mut stream,
+                                    &mut out_sequence,
+                                    session_id,
+                                    Message::CommandResult(CommandResult {
+                                        request_sequence: frame.sequence,
+                                        result_code: ResultCode::InvalidArgument,
+                                        detail: error.to_string(),
+                                    }),
+                                )?,
+                            }
+                        }
+                        MSG_START => {
+                            update_stats(stats, |value| {
+                                value.start_requests = value.start_requests.saturating_add(1)
+                            });
+                            streaming = configured.is_some();
+                            send_v2_common_session(
+                                &mut stream,
+                                &mut out_sequence,
+                                session_id,
+                                Message::CommandResult(CommandResult {
+                                    request_sequence: frame.sequence,
+                                    result_code: if streaming {
+                                        ResultCode::Ok
+                                    } else {
+                                        ResultCode::InvalidState
+                                    },
+                                    detail: if streaming { "ok" } else { "not configured" }
+                                        .to_owned(),
+                                }),
+                            )?;
+                        }
+                        MSG_STOP => {
+                            streaming = false;
+                            update_stats(stats, |value| {
+                                value.stop_requests = value.stop_requests.saturating_add(1)
+                            });
+                            send_v2_common_session(
+                                &mut stream,
+                                &mut out_sequence,
+                                session_id,
+                                Message::CommandResult(CommandResult {
+                                    request_sequence: frame.sequence,
+                                    result_code: ResultCode::Ok,
+                                    detail: "ok".to_owned(),
+                                }),
+                            )?;
+                        }
+                        MSG_PING => {
+                            if let Ok(Message::Ping(nonce)) =
+                                Message::decode(frame.message_type, &frame.payload)
+                            {
+                                send_v2_common_session(
+                                    &mut stream,
+                                    &mut out_sequence,
+                                    session_id,
+                                    Message::Pong(nonce),
+                                )?;
+                            }
+                        }
+                        super::protocol::MSG_PONG => {
+                            if Message::decode(frame.message_type, &frame.payload).is_ok() {
+                                update_stats(stats, |value| {
+                                    value.pongs_received = value.pongs_received.saturating_add(1)
+                                });
+                            }
+                        }
+                        super::protocol_v2::MSG_ARM_CAPTURE => {
+                            let Ok(MessageV2::ArmCapture(capture)) =
+                                MessageV2::decode(frame.message_type, &frame.payload)
+                            else {
+                                continue;
+                            };
+                            update_stats(stats, |value| {
+                                value.capture_requests = value.capture_requests.saturating_add(1)
+                            });
+                            capture_attempts = capture_attempts.saturating_add(1);
+                            if preset == V2Preset::DeviceReset30k {
+                                send_v2_message_session(
+                                    &mut stream,
+                                    &mut out_sequence,
+                                    session_id,
+                                    MessageV2::CaptureStatus(CaptureStatus {
+                                        capture_id: capture.capture_id,
+                                        state: CaptureState::DeviceReset,
+                                        captured_rows: 0,
+                                        dropped_rows: 0,
+                                    }),
+                                )?;
+                                let reset_stream = streams.stream(1).ok_or_else(|| {
+                                    SimulatorError::InvalidConfig(
+                                        "DeviceReset preset requires FAST32K".to_owned(),
+                                    )
+                                })?;
+                                let stale = v2_r2_sample_batch(
+                                    &streams,
+                                    &channels,
+                                    &StreamSubscriptionR2 {
+                                        stream_id: 1,
+                                        batch_samples: 1,
+                                        channel_mask: reset_stream
+                                            .channel_ids
+                                            .iter()
+                                            .fold(0_u64, |mask, id| mask | (1_u64 << id)),
+                                    },
+                                    1,
+                                    V2Preset::CausalInOrder30k,
+                                    0,
+                                )?;
+                                send_v2_r2_message(
+                                    &mut stream,
+                                    &mut out_sequence,
+                                    session_id,
+                                    MessageV2R2::StreamSampleBatch(stale),
+                                    0,
+                                )?;
+                                configured = None;
+                                streaming = false;
+                                row_sequences.clear();
+                                session_id = session_id.saturating_add(1);
+                                send_r2_handshake(
+                                    &mut stream,
+                                    &mut out_sequence,
+                                    session_id,
+                                    &channels,
+                                    &streams,
+                                    emitted_rounds,
+                                )?;
+                            } else {
+                                let capture_preset = if preset == V2Preset::CaptureChunkLoss30k
+                                    && capture_attempts > 1
+                                {
+                                    V2Preset::CausalInOrder30k
+                                } else {
+                                    preset
+                                };
+                                upload_simulated_capture_r2(
+                                    &mut stream,
+                                    &mut out_sequence,
+                                    session_id,
+                                    &streams,
+                                    &channels,
+                                    &capture,
+                                    capture_preset,
+                                )?;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        if streaming {
+            let configure = configured
+                .as_ref()
+                .expect("R2 streaming requires an atomic configuration");
+            let mut batches = Vec::with_capacity(configure.subscriptions.len());
+            for subscription in &configure.subscriptions {
+                let default_first_row =
+                    if preset == V2Preset::CausalSourceTimeout30k && subscription.stream_id == 1 {
+                        100
+                    } else {
+                        1
+                    };
+                let first_row = if preset == V2Preset::CausalWatermarkEviction30k
+                    && subscription.stream_id == 1
+                    && emitted_rounds == 1
+                {
+                    row_sequences.insert(1, 100);
+                    100
+                } else {
+                    *row_sequences
+                        .entry(subscription.stream_id)
+                        .or_insert(default_first_row)
+                };
+                let mut batch = v2_r2_sample_batch(
+                    &streams,
+                    &channels,
+                    subscription,
+                    first_row,
+                    preset,
+                    emitted_rounds,
+                )?;
+                if preset == V2Preset::CausalDuplicateCycle30k
+                    && emitted_rounds == 1
+                    && subscription.stream_id == 2
+                {
+                    if let Some(first) = batch.row_metadata.first_mut() {
+                        first.logical_cycle_sequence =
+                            first.logical_cycle_sequence.saturating_sub(4);
+                        first.source_sequence = first.logical_cycle_sequence;
+                    }
+                }
+                let next = first_row
+                    .checked_add(u64::from(subscription.batch_samples))
+                    .ok_or_else(|| {
+                        SimulatorError::InvalidConfig("R2 row sequence overflow".to_owned())
+                    })?;
+                row_sequences.insert(subscription.stream_id, next);
+                batches.push(batch);
+            }
+            order_r2_batches(&mut batches, preset);
+            for batch in batches {
+                let timestamp_ticks = batch
+                    .first_row_sequence
+                    .saturating_sub(1)
+                    .checked_mul(u64::from(batch.sample_period_ticks))
+                    .ok_or_else(|| {
+                        SimulatorError::InvalidConfig("R2 timestamp overflow".to_owned())
+                    })?;
+                send_v2_r2_message(
+                    &mut stream,
+                    &mut out_sequence,
+                    session_id,
+                    MessageV2R2::StreamSampleBatch(batch),
+                    timestamp_ticks,
+                )?;
+                update_stats(stats, |value| {
+                    value.emitted_batches = value.emitted_batches.saturating_add(1)
+                });
+            }
+            emitted_rounds = emitted_rounds.saturating_add(1);
+            if !config.accelerated {
+                thread::sleep(Duration::from_millis(1));
+            } else {
+                thread::yield_now();
+            }
+        }
+        if last_ping.elapsed() >= Duration::from_secs(1) {
+            send_v2_common_session(
+                &mut stream,
+                &mut out_sequence,
+                session_id,
+                Message::Ping(ping_nonce),
+            )?;
+            update_stats(stats, |value| {
+                value.pings_sent = value.pings_sent.saturating_add(1)
+            });
+            ping_nonce = ping_nonce.wrapping_add(1);
+            last_ping = Instant::now();
+        }
+    }
+    Ok(())
+}
+
 fn simulator_channel_table() -> ChannelTable {
     ChannelTable {
         revision: 1,
@@ -948,9 +1367,219 @@ fn v2_stream_table() -> StreamTable {
     }
 }
 
+fn v2_r2_stream_table(preset: V2Preset, selected_streams: &[u16]) -> StreamTableR2 {
+    let result_input_offset = match preset {
+        V2Preset::CausalNonzeroOffset30k => 1,
+        V2Preset::CausalNegativeOffset30k => -1,
+        _ => 0,
+    };
+    let r1 = v2_stream_table();
+    let streams = r1
+        .streams
+        .into_iter()
+        .filter(|stream| selected_streams.contains(&stream.stream_id))
+        .map(|stream| StreamDescriptorR2 {
+            stream_id: stream.stream_id,
+            domain: stream.domain,
+            capture_phase: stream.capture_phase,
+            sample_rate_hz: stream.sample_rate_hz,
+            consistency_group: stream.consistency_group,
+            logical_cycle_step: 32_000 / stream.sample_rate_hz,
+            channel_ids: stream.channel_ids,
+        })
+        .collect::<Vec<_>>();
+    let bindings = r1
+        .bindings
+        .into_iter()
+        .filter(|binding| selected_streams.contains(&binding.stream_id))
+        .collect::<Vec<_>>();
+    let causal_relations = if [1, 2, 3]
+        .iter()
+        .all(|stream_id| selected_streams.contains(stream_id))
+    {
+        vec![CausalRelation {
+            input_stream_id: 1,
+            result_stream_id: 2,
+            application_stream_id: 3,
+            result_input_offset,
+            application_result_offset: 32,
+        }]
+    } else {
+        Vec::new()
+    };
+    StreamTableR2 {
+        revision: 3,
+        causal_groups: vec![CausalGroupDescriptorR2 {
+            consistency_group: 1,
+            logical_cycle_rate_hz: 32_000,
+            max_reorder_cycles: 64,
+        }],
+        streams,
+        bindings,
+        causal_relations,
+    }
+}
+
+fn v2_r2_hello_ack(table: &ChannelTable) -> HelloAck {
+    HelloAck {
+        device_capabilities: CAPABILITY_V2_STREAMS_R2
+            | CAPABILITY_V2_MULTI_STREAM
+            | CAPABILITY_V2_COMPRESSED_METADATA
+            | CAPABILITY_V2_HARDWARE_CAPTURE_R2,
+        max_payload: MAX_PAYLOAD_LEN as u32,
+        tick_hz: V2_SIMULATOR_TICK_HZ,
+        channel_count: table.channels.len() as u16,
+        max_batch_samples: 4096,
+        device_id: *b"SCOPE-SIM-V2-R2-",
+        firmware_name: "scope-dsp-simulator-v2-r2".to_owned(),
+    }
+}
+
+fn accepted_subscriptions_detail(configure: &ConfigureStreamsR2) -> String {
+    let subscriptions = configure
+        .subscriptions
+        .iter()
+        .map(|value| {
+            format!(
+                "{}:{}:{:#x}",
+                value.stream_id, value.batch_samples, value.channel_mask
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "transaction={};subscriptions={subscriptions}",
+        configure.transaction_id
+    )
+}
+
+fn checked_add_signed(value: u64, offset: i16) -> Result<u64, SimulatorError> {
+    if offset >= 0 {
+        value
+            .checked_add(offset as u64)
+            .ok_or_else(|| SimulatorError::InvalidConfig("causal offset overflow".to_owned()))
+    } else {
+        value
+            .checked_sub(u64::from(offset.unsigned_abs()))
+            .ok_or_else(|| SimulatorError::InvalidConfig("causal offset underflow".to_owned()))
+    }
+}
+
+fn v2_r2_sample_batch(
+    streams: &StreamTableR2,
+    channels: &ChannelTable,
+    subscription: &StreamSubscriptionR2,
+    first_row_sequence: u64,
+    preset: V2Preset,
+    _emitted_rounds: u64,
+) -> Result<StreamSampleBatchR2, SimulatorError> {
+    let descriptor = streams
+        .stream(subscription.stream_id)
+        .ok_or_else(|| SimulatorError::InvalidConfig("unknown R2 stream".to_owned()))?;
+    let channel_ids = descriptor
+        .channel_ids
+        .iter()
+        .copied()
+        .filter(|channel_id| subscription.channel_mask & (1_u64 << channel_id) != 0)
+        .collect::<Vec<_>>();
+    let relation = streams.causal_relations.first();
+    let mut sample_data = Vec::new();
+    let mut row_metadata = Vec::with_capacity(usize::from(subscription.batch_samples));
+    for offset in 0..subscription.batch_samples {
+        let row = first_row_sequence
+            .checked_add(u64::from(offset))
+            .ok_or_else(|| SimulatorError::InvalidConfig("R2 row overflow".to_owned()))?;
+        let logical_cycle_sequence = row
+            .checked_mul(u64::from(descriptor.logical_cycle_step))
+            .ok_or_else(|| SimulatorError::InvalidConfig("R2 cycle overflow".to_owned()))?;
+        for channel_id in &channel_ids {
+            let channel = channels.channel(*channel_id).ok_or_else(|| {
+                SimulatorError::InvalidConfig("missing R2 channel descriptor".to_owned())
+            })?;
+            let value =
+                i32::try_from(row.saturating_add(u64::from(*channel_id))).unwrap_or(i32::MAX);
+            match channel.wire_format {
+                WireFormat::I16 => sample_data.extend_from_slice(&(value as i16).to_le_bytes()),
+                WireFormat::I32 => sample_data.extend_from_slice(&value.to_le_bytes()),
+                WireFormat::F32 => sample_data.extend_from_slice(&(value as f32).to_le_bytes()),
+                WireFormat::U8 => sample_data.push((value & 1) as u8),
+            }
+        }
+        let source_sequence = match relation {
+            Some(relation) if descriptor.stream_id == relation.result_stream_id => {
+                checked_add_signed(logical_cycle_sequence, relation.result_input_offset)?
+            }
+            _ => logical_cycle_sequence,
+        };
+        let applied_sequence = match relation {
+            Some(relation) if descriptor.stream_id == relation.application_stream_id => {
+                checked_add_signed(logical_cycle_sequence, relation.application_result_offset)?
+            }
+            _ => logical_cycle_sequence,
+        };
+        let mut valid_flags = SNAPSHOT_VALID
+            | SOURCE_SEQUENCE_VALID
+            | APPLIED_SEQUENCE_VALID
+            | ADC_SAMPLE_VALID
+            | FROZEN_ROW;
+        if descriptor.domain == SampleDomain::Fast32k {
+            valid_flags |= CLA_RESULT_VALID;
+        }
+        if preset == V2Preset::ClaStale30k && descriptor.domain == SampleDomain::Fast32k {
+            valid_flags &= !CLA_RESULT_VALID;
+        }
+        if preset == V2Preset::UnfrozenRow30k {
+            valid_flags &= !FROZEN_ROW;
+        }
+        row_metadata.push(SnapshotMeta {
+            row_sequence: row,
+            logical_cycle_sequence,
+            source_sequence,
+            applied_sequence,
+            valid_flags,
+        });
+    }
+    Ok(StreamSampleBatchR2 {
+        stream_id: descriptor.stream_id,
+        stream_revision: streams.revision,
+        domain: descriptor.domain,
+        capture_phase: descriptor.capture_phase,
+        consistency_group: descriptor.consistency_group,
+        first_row_sequence,
+        row_sequence_step: 1,
+        logical_cycle_step: descriptor.logical_cycle_step,
+        sample_period_ticks: u32::try_from(
+            V2_SIMULATOR_TICK_HZ / u64::from(descriptor.sample_rate_hz),
+        )
+        .map_err(|_| SimulatorError::InvalidConfig("R2 sample period overflow".to_owned()))?,
+        row_count: subscription.batch_samples,
+        channel_ids,
+        sample_data,
+        metadata_encoding: MetadataEncodingR2::AffineWithOverrides,
+        row_metadata,
+    })
+}
+
+fn order_r2_batches(batches: &mut [StreamSampleBatchR2], preset: V2Preset) {
+    let rank = |stream_id| match preset {
+        V2Preset::CausalResultFirst30k => match stream_id {
+            2 => 0,
+            3 => 1,
+            _ => 2,
+        },
+        V2Preset::CausalApplicationFirst30k => match stream_id {
+            3 => 0,
+            2 => 1,
+            _ => 2,
+        },
+        _ => stream_id,
+    };
+    batches.sort_by_key(|batch| rank(batch.stream_id));
+}
+
 fn v2_hello_ack(table: &ChannelTable) -> HelloAck {
     HelloAck {
-        device_capabilities: CAPABILITY_V2_STREAMS,
+        device_capabilities: CAPABILITY_V2_STREAMS_R1,
         max_payload: MAX_PAYLOAD_LEN as u32,
         tick_hz: V2_SIMULATOR_TICK_HZ,
         channel_count: table.channels.len() as u16,
@@ -1162,6 +1791,146 @@ fn upload_simulated_capture(
     )
 }
 
+fn upload_simulated_capture_r2(
+    stream: &mut TcpStream,
+    out_sequence: &mut u32,
+    session_id: u32,
+    streams: &StreamTableR2,
+    channels: &ChannelTable,
+    capture: &ArmCapture,
+    preset: V2Preset,
+) -> Result<(), SimulatorError> {
+    if preset == V2Preset::CaptureTimeout30k {
+        return send_v2_message_session(
+            stream,
+            out_sequence,
+            session_id,
+            MessageV2::CaptureStatus(CaptureStatus {
+                capture_id: capture.capture_id,
+                state: CaptureState::Timeout,
+                captured_rows: 0,
+                dropped_rows: 0,
+            }),
+        );
+    }
+    let source = streams
+        .stream(capture.stream_id)
+        .ok_or_else(|| SimulatorError::InvalidConfig("capture stream is unknown".to_owned()))?;
+    let subscription = StreamSubscriptionR2 {
+        stream_id: capture.stream_id,
+        batch_samples: 1,
+        channel_mask: source
+            .channel_ids
+            .iter()
+            .fold(0_u64, |mask, id| mask | (1_u64 << id)),
+    };
+    let first = CaptureDataR2 {
+        capture_id: capture.capture_id,
+        block_index: 0,
+        batch: v2_r2_sample_batch(
+            streams,
+            channels,
+            &subscription,
+            1,
+            V2Preset::CausalInOrder30k,
+            0,
+        )?,
+    };
+    let second = CaptureDataR2 {
+        capture_id: capture.capture_id,
+        block_index: 1,
+        batch: v2_r2_sample_batch(
+            streams,
+            channels,
+            &subscription,
+            2,
+            V2Preset::CausalInOrder30k,
+            0,
+        )?,
+    };
+    let integrity_summary = capture_integrity_summary_r2(capture.capture_id, [&first, &second])
+        .map_err(|error| SimulatorError::InvalidConfig(error.to_string()))?;
+    send_v2_message_session(
+        stream,
+        out_sequence,
+        session_id,
+        MessageV2::CaptureStatus(CaptureStatus {
+            capture_id: capture.capture_id,
+            state: CaptureState::Uploading,
+            captured_rows: 2,
+            dropped_rows: 0,
+        }),
+    )?;
+    send_v2_message_session(
+        stream,
+        out_sequence,
+        session_id,
+        MessageV2::CaptureBegin(CaptureBegin {
+            capture_id: capture.capture_id,
+            stream_id: capture.stream_id,
+            row_count: 2,
+            trigger_row_seq: 1,
+        }),
+    )?;
+    match preset {
+        V2Preset::CaptureChunkLoss30k => {
+            send_v2_r2_message(
+                stream,
+                out_sequence,
+                session_id,
+                MessageV2R2::CaptureData(second.clone()),
+                0,
+            )?;
+        }
+        V2Preset::CaptureChunkReorder30k => {
+            send_v2_r2_message(
+                stream,
+                out_sequence,
+                session_id,
+                MessageV2R2::CaptureData(second.clone()),
+                0,
+            )?;
+            send_v2_r2_message(
+                stream,
+                out_sequence,
+                session_id,
+                MessageV2R2::CaptureData(first.clone()),
+                0,
+            )?;
+        }
+        _ => {
+            send_v2_r2_message(
+                stream,
+                out_sequence,
+                session_id,
+                MessageV2R2::CaptureData(first.clone()),
+                0,
+            )?;
+            send_v2_r2_message(
+                stream,
+                out_sequence,
+                session_id,
+                MessageV2R2::CaptureData(second.clone()),
+                0,
+            )?;
+        }
+    }
+    send_v2_message_session(
+        stream,
+        out_sequence,
+        session_id,
+        MessageV2::CaptureEnd(CaptureEnd {
+            capture_id: capture.capture_id,
+            state: CaptureState::Complete,
+            uploaded_rows: 2,
+            dropped_rows: 0,
+            total_blocks: 2,
+            total_samples: 2,
+            integrity_summary,
+        }),
+    )
+}
+
 fn simulator_hello_ack(table: &ChannelTable) -> HelloAck {
     HelloAck {
         device_capabilities: 0,
@@ -1337,6 +2106,103 @@ fn send_v2_common(
             .map_err(|error| SimulatorError::InvalidConfig(error.to_string()))?,
     )?;
     Ok(())
+}
+
+fn send_v2_common_session(
+    stream: &mut TcpStream,
+    sequence: &mut u32,
+    session_id: u32,
+    message: Message,
+) -> Result<(), SimulatorError> {
+    let frame = Frame::new_v2(
+        message.message_type(),
+        0,
+        *sequence,
+        session_id,
+        0,
+        message
+            .encode_payload()
+            .map_err(|error| SimulatorError::InvalidConfig(error.to_string()))?,
+    );
+    *sequence = sequence.wrapping_add(1);
+    stream.write_all(
+        &frame
+            .encode()
+            .map_err(|error| SimulatorError::InvalidConfig(error.to_string()))?,
+    )?;
+    Ok(())
+}
+
+fn send_v2_message_session(
+    stream: &mut TcpStream,
+    sequence: &mut u32,
+    session_id: u32,
+    message: MessageV2,
+) -> Result<(), SimulatorError> {
+    let frame = message
+        .into_frame(0, *sequence, session_id, 0)
+        .map_err(|error| SimulatorError::InvalidConfig(error.to_string()))?;
+    *sequence = sequence.wrapping_add(1);
+    stream.write_all(
+        &frame
+            .encode()
+            .map_err(|error| SimulatorError::InvalidConfig(error.to_string()))?,
+    )?;
+    Ok(())
+}
+
+fn send_v2_r2_message(
+    stream: &mut TcpStream,
+    sequence: &mut u32,
+    session_id: u32,
+    message: MessageV2R2,
+    timestamp_ticks: u64,
+) -> Result<(), SimulatorError> {
+    let frame = message
+        .into_frame(0, *sequence, session_id, timestamp_ticks)
+        .map_err(|error| SimulatorError::InvalidConfig(error.to_string()))?;
+    *sequence = sequence.wrapping_add(1);
+    stream.write_all(
+        &frame
+            .encode()
+            .map_err(|error| SimulatorError::InvalidConfig(error.to_string()))?,
+    )?;
+    Ok(())
+}
+
+fn send_r2_handshake(
+    stream: &mut TcpStream,
+    sequence: &mut u32,
+    session_id: u32,
+    channels: &ChannelTable,
+    streams: &StreamTableR2,
+    emitted_batches: u64,
+) -> Result<(), SimulatorError> {
+    send_v2_common_session(
+        stream,
+        sequence,
+        session_id,
+        Message::HelloAck(v2_r2_hello_ack(channels)),
+    )?;
+    send_v2_common_session(
+        stream,
+        sequence,
+        session_id,
+        Message::ChannelTable(channels.clone()),
+    )?;
+    send_v2_r2_message(
+        stream,
+        sequence,
+        session_id,
+        MessageV2R2::StreamTable(streams.clone()),
+        0,
+    )?;
+    send_v2_common_session(
+        stream,
+        sequence,
+        session_id,
+        status_message(DeviceState::Idle, emitted_batches),
+    )
 }
 
 fn send_v2_message(

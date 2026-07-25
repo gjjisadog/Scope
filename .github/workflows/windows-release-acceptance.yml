@@ -132,7 +132,7 @@ jobs:
               $release.sourceDirty -eq $true) {
             throw "Release evidence sourceCommit does not match the checked-out source."
           }
-          $provenance = Get-Content -Raw "dist\ScopeAnalyzer-0.12.0-win-x64\build-provenance.json" | ConvertFrom-Json
+          $provenance = Get-Content -Raw "dist\ScopeAnalyzer-0.15.3-win-x64\build-provenance.json" | ConvertFrom-Json
           $lockHash = (Get-FileHash -Path "Cargo.lock" -Algorithm SHA256).Hash.ToLowerInvariant()
           $toolchainHash = (Get-FileHash -Path "rust-toolchain.toml" -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($provenance.sourceCommit -ne $head -or $provenance.sourceDirty -eq $true -or
@@ -144,8 +144,8 @@ jobs:
       - name: Run elevated lifecycle and renderer acceptance
         run: |
           $params = @{
-            MsiPath = "dist\ScopeAnalyzer-0.12.0-win-x64.msi"
-            ZipPath = "dist\ScopeAnalyzer-0.12.0-win-x64.zip"
+            MsiPath = "dist\ScopeAnalyzer-0.15.3-win-x64.msi"
+            ZipPath = "dist\ScopeAnalyzer-0.15.3-win-x64.zip"
             ReleaseEvidencePath = "dist\release-evidence.json"
             OutputPath = "dist\windows-acceptance.json"
             RequireSignature = $true
@@ -167,8 +167,8 @@ jobs:
           non-administrator RDP session and archive the second evidence file:
 
           powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-acceptance.ps1 `
-            -MsiPath dist\ScopeAnalyzer-0.12.0-win-x64.msi `
-            -ZipPath dist\ScopeAnalyzer-0.12.0-win-x64.zip `
+            -MsiPath dist\ScopeAnalyzer-0.15.3-win-x64.msi `
+            -ZipPath dist\ScopeAnalyzer-0.15.3-win-x64.zip `
             -ReleaseEvidencePath dist\release-evidence.json `
             -SkipMsiLifecycle -RequireStandardUser -RequireSignature `
             -RequireMesaRuntime -RequireAngleRuntime -RequireRdpSession `
@@ -181,8 +181,8 @@ jobs:
           name: scope-windows-release-evidence
           if-no-files-found: error
           path: |
-            dist/ScopeAnalyzer-0.12.0-win-x64.zip
-            dist/ScopeAnalyzer-0.12.0-win-x64.msi
+            dist/ScopeAnalyzer-0.15.3-win-x64.zip
+            dist/ScopeAnalyzer-0.15.3-win-x64.msi
             dist/release-evidence.json
             dist/windows-acceptance.json
-            dist/ScopeAnalyzer-0.12.0-win-x64/build-provenance.json
+            dist/ScopeAnalyzer-0.15.3-win-x64/build-provenance.json

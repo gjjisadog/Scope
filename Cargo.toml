@@ -1,6 +1,6 @@
 [package]
 name = "scope_analyzer"
-version = "0.15.2"
+version = "0.15.3"
 edition = "2021"
 description = "Windows DSP oscilloscope and engineering waveform analysis workbench"
 license = "Proprietary"

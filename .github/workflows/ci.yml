@@ -3,7 +3,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, "feature/**"]
   workflow_dispatch:
 
 permissions:
@@ -37,6 +37,10 @@ jobs:
         run: cargo check --locked --all-targets
       - name: Run tests
         run: cargo test --locked --all-targets
+      - name: Run live protocol freeze tests
+        run: cargo test --locked --lib live::
+      - name: Run DSP simulator tests
+        run: cargo test --locked --bin scope_dsp_simulator
       - name: Strict project Clippy
         run: cargo clippy --locked --all-targets --no-deps -- -D warnings
       - name: CLI fixture smoke
@@ -115,6 +119,26 @@ jobs:
         run: cargo test --locked --lib project_parser_survives_one_million_deterministic_inputs -- --ignored --test-threads=1
       - name: VS Code bridge parser one-million-input fuzz gate
         run: cargo test --locked --bin scope_analyzer bridge_option_parsers_survive_one_million_inputs -- --ignored --test-threads=1
+
+  scp1-v2-causal-stability:
+    name: SCP1 V2 one-million-row causal stability
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-causal-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: ubuntu-causal-
+      - name: Verify bounded watermark matcher over one million rows
+        run: cargo test --locked --lib one_million_rows_keep_causal_state_bounded -- --ignored --test-threads=1
 
   coverage:
     name: Route A core coverage gates

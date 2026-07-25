@@ -1194,15 +1194,41 @@ pub enum ProtocolError {
 }
 
 pub fn crc32c(bytes: &[u8]) -> u32 {
-    let mut crc = !0_u32;
-    for &byte in bytes {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            let mask = 0_u32.wrapping_sub(crc & 1);
-            crc = (crc >> 1) ^ (0x82f6_3b78 & mask);
+    let mut crc = Crc32c::new();
+    crc.update(bytes);
+    crc.finalize()
+}
+
+/// Incremental Castagnoli CRC used by bounded capture uploads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Crc32c {
+    state: u32,
+}
+
+impl Default for Crc32c {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Crc32c {
+    pub const fn new() -> Self {
+        Self { state: !0_u32 }
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.state ^= u32::from(byte);
+            for _ in 0..8 {
+                let mask = 0_u32.wrapping_sub(self.state & 1);
+                self.state = (self.state >> 1) ^ (0x82f6_3b78 & mask);
+            }
         }
     }
-    !crc
+
+    pub const fn finalize(self) -> u32 {
+        !self.state
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

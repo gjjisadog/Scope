@@ -1,125 +1,187 @@
-# SCP1 Live Scope V2
+# SCP1 Live Scope V2 R1/R2 frozen protocol
 
-状态：已实现客户端、协议和确定性 TCP 模拟器；真实 Hybrid30K DSP 固件尚未实现或验证。
+Status: frozen by Scope Analyzer 0.15.3 and validated with the deterministic TCP simulator. The real Hybrid30K DSP firmware has not implemented or validated this protocol yet. SCP1 V1 framing, message numbers, golden frames, the `.scope V1` format, and the default desktop path are unchanged.
 
-V2 是独立协议版本（帧头 `version=2`）。SCP1 V1 的帧头、V1 消息 payload、CRC32C、`.scope V1` 和默认 GUI 行为均冻结不变。V2 peer 必须通过既有 HELLO capability bit 3 (`CAPABILITY_V2_STREAMS`) 明确协商；V1 peer 不会把 V2 帧或 V2 message type 当作 V1 消息解析。
+All integers and `f32` values are little-endian. Implementations encode fields explicitly and use checked arithmetic for every size, offset, and affine reconstruction.
 
-所有整数和 `f32` 字段均为 little-endian；实现不得直接序列化 Rust struct。长度、乘法、索引和偏移均以 checked arithmetic 校验。
+## Revision selection
 
-## 固定采样域与截面
+R1 and R2 are selected only by capability bits and distinct message identifiers. Payload length is never used to guess a revision.
 
-| Domain | 固定采样率 | 唯一 CapturePhase | 冻结截面 |
-| --- | ---: | --- | --- |
-| `Fast32k` (0) | 32,000 Hz | `AfterClaComplete` (0) | CPU1/CLA 完成快速链路后的同一行 |
-| `Control8k` (1) | 8,000 Hz | `ControlCycleEnd` (1) | CPU1 控制周期结束后的同一行 |
-| `Slow1k` (2) | 1,000 Hz | `LogicTaskEnd` (2) | CPU2 逻辑任务结束后的同一行 |
+| Capability | Frozen value |
+| --- | ---: |
+| `CAPABILITY_V2_STREAMS_R1` | `1 << 3` (`0x00000008`) |
+| `CAPABILITY_V2_STREAMS_R2` | `1 << 4` (`0x00000010`) |
+| `CAPABILITY_V2_MULTI_STREAM` | `1 << 5` (`0x00000020`) |
+| `CAPABILITY_V2_COMPRESSED_METADATA` | `1 << 6` (`0x00000040`) |
+| `CAPABILITY_V2_HARDWARE_CAPTURE_R2` | `1 << 7` (`0x00000080`) |
 
-一个 `StreamDescriptor` 包含 `stream_id`、domain、capture phase、固定频率、非零 consistency group 和非空且去重的 `channel_ids`。`stream_id` 必须非零且唯一。`STREAM_TABLE` 的每个 channel binding 还传输 owner (`CPU1`、`CPU1_CLA1`、`CPU2`) 和 role (`PhysicalSample`、`ControlInput`、`ControlOutput`、`Command`、`AppliedCommand`、`State`、`Fault`、`Diagnostic`、`Metadata`)；结合 V1 `CHANNEL_TABLE` 基础 descriptor 即构成 `ChannelDescriptorV2`。
+| Message | R1 | R2 |
+| --- | ---: | ---: |
+| Stream table | `0x30 STREAM_TABLE_R1` | `0x35 STREAM_TABLE_R2` |
+| Configure | `0x31 CONFIGURE_STREAM_R1` | `0x34 CONFIGURE_STREAMS_R2` |
+| Sample batch | `0x32 SAMPLE_BATCH_V2_R1` | `0x33 SAMPLE_BATCH_V2_R2` |
+| Capture data | `0x45 CAPTURE_DATA_R1` | `0x47 CAPTURE_DATA_R2` |
 
-客户端不从不同域的零散变量拼接一行，也不会把跨 CPU 的因果序号称为物理同时。
+Common Capture control remains `0x40..0x44` and `0x46`. R1 peers reject R2 messages and R2 peers reject R1 stream messages. `LiveSession::connect_v2_r1` is the explicit compatibility entry point; `connect_v2_r2` is the frozen R2 entry point and `connect_v2` is its alias.
 
-## V2 message allocation
-
-| 值 | 名称 | 方向 |
-| ---: | --- | --- |
-| `0x30` | `STREAM_TABLE` | DSP → Client |
-| `0x31` | `CONFIGURE_STREAM` | Client → DSP |
-| `0x32` | `SAMPLE_BATCH_V2` | DSP → Client |
-| `0x40` | `ARM_CAPTURE` | Client → DSP |
-| `0x41` | `MANUAL_TRIGGER` | Client → DSP |
-| `0x42` | `CANCEL_CAPTURE` | Client → DSP |
-| `0x43` | `CAPTURE_STATUS` | DSP → Client |
-| `0x44` | `CAPTURE_BEGIN` | DSP → Client |
-| `0x45` | `CAPTURE_DATA` | DSP → Client |
-| `0x46` | `CAPTURE_END` | DSP → Client |
-
-`CONFIGURE_STREAM` chooses one stream and a nonempty subset of its channels; it carries no rate because the rate is fixed by the descriptor. A mixed-domain mask is rejected.
-
-## SAMPLE_BATCH_V2
-
-The payload is:
-
-```text
-u16 stream_id
-u32 stream_revision
-u8 domain
-u8 capture_phase
-u16 consistency_group
-u64 first_row_sequence
-u16 row_count
-u32 sample_period_ticks
-u16 selected_channel_count
-u16 channel_ids[selected_channel_count]
-u8 interleaved_sample_data[]
-SnapshotMeta[row_count]
-```
-
-`SnapshotMeta` is encoded once for every row:
+R1 retains its 28-byte per-row metadata exactly:
 
 ```text
 u64 row_sequence
-u64 logical_cycle_sequence
 u64 source_sequence
 u64 applied_sequence
 u32 valid_flags
 ```
 
-Known validity bits are `SNAPSHOT_VALID` (0), `SOURCE_SEQUENCE_VALID` (1), `APPLIED_SEQUENCE_VALID` (2), `CLA_RESULT_VALID` (3), `ADC_SAMPLE_VALID` (4), and `FROZEN_ROW` (5). Unknown bits are rejected. `row_sequence` is only the local stream row number and must be continuous inside a batch；`logical_cycle_sequence` is the independent cross-stream causal key. Across batches an explicit row gap is legal and is recorded；overlap or reversal is recorded as a reorder. Frame domain, phase, group, revision, selected channels, metadata count and exact data length must match `STREAM_TABLE`/`CHANNEL_TABLE`.
+The 0.15.2 prototype placed a 36-byte row containing `logical_cycle_sequence` behind message `0x32`. It was never frozen. A receiver detecting that layout returns exactly `unsupported pre-release SCP1 V2 layout`; it does not reinterpret the payload as R1 or R2.
 
-`CausalRelation` is evaluated in its declared consistency group using the protocol's logical control-cycle sequence, not a physical-time comparison of local row counters. For every relation, the client checks:
+## R2 stream table and logical time
 
-```text
-result.source_sequence == input.logical_sequence + result_input_offset
-application.applied_sequence == result.logical_sequence + application_result_offset
-```
-
-The client records `missing_causal_source`, `causal_source_mismatch`, `causal_application_mismatch`, `causal_sequence_reorder`, `causal_group_mismatch`, and `causal_cache_evictions` separately. Result/application rows may arrive before their causal source；matching is delayed instead of immediately reporting a missing source. Both cached rows and pending matches are bounded to 4,096 entries, with deterministic eviction and an observable missing-source/eviction diagnostic. A legal `(0, 1)` relation therefore means “result uses input N, application occurs at N+1”; it does not imply that CPU1, CPU2 and CLA were physically simultaneous. FAST32K requires `SNAPSHOT_VALID|FROZEN_ROW|SOURCE_SEQUENCE_VALID|ADC_SAMPLE_VALID|CLA_RESULT_VALID`; CTRL8K additionally requires source validity, and `APPLIED_SEQUENCE_VALID` is required when an `AppliedCommand` role or causal application needs it. SLOW1K always requires a frozen valid row and requires source/applied validity only when its role or a causal contract uses that sequence.
-
-For all domains `sample_period_ticks == tick_hz / sample_rate_hz` is exact. `tick_hz` must be divisible by the fixed stream rate; V2 does not round. Across batches of the same stream, `current_timestamp == previous_last_timestamp + (current_first_row_sequence - previous_last_row_sequence) * sample_period_ticks` must hold exactly. Zero, a non-integral timer, a mismatched period, an in-session period change, row reversal/overlap, timestamp drift, or overflow is rejected.
-
-The `MANUAL_TRIGGER` golden frame is regression-tested as fixed bytes (including CRC):
+Each consistency group carries:
 
 ```text
-53 43 50 31 02 41 00 00 44 33 22 11 04 00 00 00
-88 77 66 55 08 07 06 05 04 03 02 01 d4 c3 b2 a1
-30 c8 de cb
+u16 consistency_group
+u16 max_reorder_cycles
+u32 logical_cycle_rate_hz
 ```
 
-## DSP hardware Capture
-
-`ARM_CAPTURE` carries a nonzero `capture_id`, `stream_id`, trigger type (`Manual`, `Edge`, `FaultFlag`), trigger channel/level/edge, pre/post rows and `timeout_samples`. The state model is:
+Each R2 stream carries its fixed domain, phase, sample rate, consistency group, `logical_cycle_step`, and channel ids. The following identity must hold using exact integer division:
 
 ```text
-Idle → Armed → Triggered → PostCapture → Complete → Uploading → Idle
+logical_cycle_step = logical_cycle_rate_hz / sample_rate_hz
 ```
 
-Terminal/exception states are `Cancelled`, `Timeout`, `BufferOverrun`, `InvalidConfig`, and `DeviceReset`.
+The 30K contract uses group 1 at 32,000 logical cycles/s:
 
-`CAPTURE_BEGIN` binds upload to a capture id, stream and expected row total. `CAPTURE_DATA` contains indexed nested `SAMPLE_BATCH_V2` chunks. Every arriving block is checked before insertion: capture id, stream id/revision, domain, phase, consistency group, ordered channel ids, block index, per-block row count, cumulative rows and cumulative encoded payload bytes. Rows must be continuous inside and, after sorting by block index, between chunks; the trigger row must be within the captured range.
+| Stream | Rate | Phase | Step | Row-to-cycle mapping |
+| --- | ---: | --- | ---: | --- |
+| FAST32K (1) | 32,000 Hz | `AfterClaComplete` | 1 | row N → cycle N |
+| CTRL8K (2) | 8,000 Hz | `ControlCycleEnd` | 4 | row K → cycle 4K |
+| SLOW1K (3) | 1,000 Hz | `LogicTaskEnd` | 32 | row M → cycle 32M |
 
-`CAPTURE_END` succeeds only when state is `Complete`, `uploaded_rows == total_samples == received rows == CAPTURE_BEGIN.row_count`, `dropped_rows == 0`, and its actual block count equals `total_blocks`. Its frozen `integrity_summary` algorithm is:
+Adjacent rows advance by the step. A row gap of D advances logical time by `D * logical_cycle_step`. `row_sequence` remains stream-local and is never used as a cross-domain causal key. Different consistency groups have independent logical clocks.
+
+## Atomic multi-stream configuration
+
+`CONFIGURE_STREAMS_R2` contains a nonzero transaction id and 1..=8 subscriptions:
+
+```text
+u32 transaction_id
+u16 subscription_count
+u16 reserved = 0
+repeat subscription_count {
+    u16 stream_id
+    u16 batch_samples
+    u64 channel_mask
+}
+```
+
+Stream ids must be unique, masks may select only channels bound to that stream, and each batch must fit both device and negotiated payload limits. Validation completes before state mutation. Any invalid member rejects the whole transaction; the previous subscription set remains active. `CommandResult.detail` returns the accepted transaction and final subscription set. START starts the entire set, STOP stops the entire set but preserves the session, and a later transaction atomically replaces the set.
+
+## R2 compressed sample metadata
+
+`SAMPLE_BATCH_V2_R2` uses message `0x33`. Its 36-byte fixed sample header is:
+
+```text
+u16 stream_id
+u32 stream_revision
+u8  domain
+u8  capture_phase
+u16 consistency_group
+u64 first_row_sequence
+u16 row_count
+u32 sample_period_ticks
+u16 channel_count
+u8  metadata_encoding
+u8  reserved = 0
+u32 sample_data_len
+u32 metadata_len
+```
+
+It is followed by `channel_count * u16` channel ids, sample bytes, then exactly `metadata_len` bytes. Row and logical steps live in the affine metadata base below rather than being duplicated in the fixed header. Continuous traffic uses `AffineWithOverrides`.
+
+The 48-byte affine base is:
+
+```text
+u64 first_row_sequence
+u32 row_sequence_step
+u64 first_logical_cycle_sequence
+u32 logical_cycle_step
+i64 source_delta_from_logical
+i64 applied_delta_from_logical
+u32 common_valid_flags
+u16 override_count
+u16 reserved = 0
+```
+
+Rows reconstruct as:
+
+```text
+row = first_row + row_offset * row_step
+logical = first_logical + row_offset * logical_step
+source = logical + source_delta
+applied = logical + applied_delta
+```
+
+Each override begins with `u16 row_offset, u16 override_mask`, followed in bit order by optional row, logical, source, applied (`u64`) and flags (`u32`). Offsets are strictly increasing, unique, and in range; unknown bits and arithmetic overflow are rejected. `Explicit` encodes the five fields as 36 bytes per row and is supported for exceptional Capture data, but its full cost is included in link-budget decisions.
+
+For 16 I16 channels, 8 kHz, 128 rows/frame, UART 4,000,000 baud, 8N1, the automated calculation for affine metadata (including frame overhead) is at most 70%; sparse overrides remain at most 70%. Explicit metadata exceeds 70% and is reported unsafe. Eight I16 channels at 32 kHz also exceeds 70%, so FAST32K continuous UART streaming is not claimed; it is reserved for DSP-local Capture followed by upload.
+
+## Causal relations and watermarks
+
+The simulator freezes the real three-stream relation FAST32K Input → CTRL8K Result → SLOW1K Application. The normal relation uses `result_input_offset=0` and `application_result_offset=32`; dedicated presets validate positive and negative result offsets.
+
+Matching uses logical-cycle units and checked signed arithmetic:
+
+```text
+expected_input_cycle = result.source_sequence - result_input_offset
+expected_result_cycle = application.applied_sequence - application_result_offset
+
+result.source_sequence = input.logical_cycle_sequence + result_input_offset
+application.applied_sequence = result.logical_cycle_sequence + application_result_offset
+```
+
+Results and applications may arrive first and enter ordered pending maps. For a relation source, absence becomes final only when:
+
+```text
+source_watermark > expected_source_cycle + max_reorder_cycles
+```
+
+Normal lookup and insertion are O(log n). Cached rows and pending relations each have a hard 4,096-entry limit. A hard-limit breach returns `CausalWindowOverflow`; it never overwrites silently. Completed pending entries are removed immediately. Diagnostics expose cached rows, pending matches, match timeouts, evictions, overflows, and duplicate logical cycles. A table revision, session id change, or DeviceReset clears every causal window.
+
+## DeviceReset
+
+`CaptureStatus::DeviceReset` clears Capture blocks, validator/watermarks, timing, heartbeat nonces, pending commands, subscriptions, ChannelTable, StreamTable, configuration, streaming state, and the old statistics context. State becomes `DeviceResetHandshake`; neither streaming nor Capture nor subscriptions are restored automatically.
+
+The device then sends a new nonzero and different session id with `HELLO_ACK → CHANNEL_TABLE → STREAM_TABLE_R2`. Only after all three validate does the client enter Ready. Frames carrying an old session id are rejected. UI and CLI surface “设备已复位，等待重新握手”.
+
+## Hardware Capture R2
+
+R2 Capture data uses `0x47` and may use affine or explicit metadata. The assembler computes payload length without clone/encode, passes the already validated wire payload as `Arc<[u8]>`, checks only index-adjacent BTreeMap predecessor/successor blocks on insertion, and advances CRC32C whenever a contiguous prefix becomes available. Once a block enters that contiguous CRC prefix its wire-payload Arc is released; the decoded batch remains available for ordered delivery.
+
+The frozen integrity value is incremental and equivalent to:
 
 ```text
 CRC32C(little_endian(capture_id) +
-       CAPTURE_DATA encoded payloads sorted by block_index)
+       CAPTURE_DATA_R2 payloads in block_index order)
 ```
 
-The client recomputes this CRC32C and rejects a mismatch. Protocol allocation limits are `MAX_CAPTURE_ROWS=1,048,576`, `MAX_CAPTURE_BLOCKS=4,096`, `MAX_CAPTURE_BLOCK_ROWS=4,096`, and `MAX_CAPTURE_PAYLOAD_BYTES=64 MiB`; all are checked before allocation. Errors/diagnostics distinguish `CaptureTooLarge`, `CaptureTooManyBlocks`, `CaptureRowOverflow`, `CaptureIntegrityMismatch`, `CaptureRowDiscontinuity`, and `CaptureDescriptorMismatch`. Every `CAPTURE_END` and every terminal/exception `CAPTURE_STATUS` releases buffered blocks and payload accounting. A Capture-specific decode, descriptor, integrity, timeout, loss, or reset failure emits `CaptureFailure`/`CaptureStatus` but does not tear down the negotiated V2 connection, so a later Capture or heartbeat can continue. Capture remains in memory in this stage and is never written to `.scope V1`.
+No combined 64 MiB buffer is created. Push is O(log n), CRC work is linear in the current block, and finish moves ordered batches. Completion, failure, timeout, cancellation, invalid configuration, buffer overrun, and reset release all blocks and accounting. A Capture failure emits `CaptureFailure` while keeping the V2 connection usable for heartbeat and a later ARM.
 
-## V2 connection health and host backpressure
+## Heartbeat and diagnostics
 
-After HELLO, client and simulator send `PING` once per second and reply immediately with the same `PONG` nonce. The client retains an eight-entry outstanding nonce window, accepts valid PONGs out of order, expires each nonce after three seconds, and never lets a newer PING overwrite an older outstanding one. Any valid V2 frame refreshes the three-second liveness deadline; CRC-invalid frames do not. The session records `last_pong_nonce`, round trips and actual expirations. `STATUS` updates device state, DSP dropped rows and TX overruns; `ERROR` is delivered as `SessionEvent::Error`.
+Both peers retain up to eight `(nonce, sent_at)` entries. PONG may arrive out of order. RTT is measured per match; timeouts occur only at three seconds. Unknown PONG, duplicate PONG, timeout, and window overflow are independent counters; overflow is not a timeout and timeout is not a protocol error. DeviceReset clears the window. Statistics include pending count, round-trip count, timeout, unknown, duplicate, overflow, last RTT, and max RTT.
 
-Control events (`State`, `Error`, `CommandResult`, stream table and Capture status/result) use the bounded control path and fail explicitly on sustained backpressure. Continuous snapshots may be dropped only at the host UI queue, where `host_dropped_v2_batches`, `host_dropped_v2_rows`, queue overruns and the affected stream/row range are recorded. These host drops never increment DSP row-gap diagnostics. Capture data is assembled in the worker and is never routed through the UI snapshot queue.
-
-## First-stage clients
-
-The desktop app still uses SCP1 V1 by default. Tests and CLI explicitly select V2:
+CLI examples:
 
 ```text
-scope_dsp_simulator --protocol v2 --preset 30k-normal --accelerated
-scope-cli live-inspect --address 127.0.0.1:19090 --stream-id 1 --rows 16
-scope-cli capture-inspect --address 127.0.0.1:19090 --stream-id 1 --rows 16
+scope_dsp_simulator --protocol v2-r2 --streams fast32k,ctrl8k,slow1k --preset 30k-causal-in-order --accelerated
+scope-cli live-inspect --protocol v2-r2 --address 127.0.0.1:19090 --rows 32
+scope-cli live-inspect --protocol v2-r1 --address 127.0.0.1:19090 --stream-id 1
+scope-cli capture-inspect --protocol v2-r2 --address 127.0.0.1:19090 --stream-id 1
 ```
 
-The CLI JSON includes protocol version, stream/domain/phase/group, row and causal diagnostics, and capture-complete/missing/duplicate/reordered chunk fields.
+The JSON contains the protocol revision/session, active streams, metadata mode, estimated 4 Mbaud utilization, causal gauges/timeouts/overflows, heartbeat RTT gauges, capture completion, and reset count. A diagnostic contract failure returns `ok=false`, a stable error category, and a nonzero exit code.
+
+GitHub CI runs format, check, Clippy, all targets, focused live tests, simulator tests, and an isolated ignored one-million-row bounded-causal job on hosted runners. These are simulator/software results, not Hybrid30K hardware acceptance. Physical DSP UART and Capture validation remains a separate self-hosted hardware workflow.

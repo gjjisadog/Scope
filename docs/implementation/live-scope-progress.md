@@ -1,14 +1,14 @@
 # DSP 实时软件示波器 V1 + V2 实施进度
 
-最后更新：2026-07-24（Scope Analyzer 0.15.2）
+最后更新：2026-07-25（Scope Analyzer 0.15.3）
 
 ## 当前里程碑
 
-里程碑 12：SCP1 V2 多采样域、冻结截面和 DSP hardware Capture 协议基础。
+里程碑 13：SCP1 V2 R1/R2 二进制冻结与三 Stream 实时闭环。
 
 ## V2 本阶段状态
 
-- V1 帧、golden frame、默认 GUI、LiveBuffer 与 `.scope V1` 不变；V2 只能由 `LiveSession::connect_v2`、CLI 或模拟器显式选择。
+- V1 帧、golden frame、默认 GUI、LiveBuffer 与 `.scope V1` 不变；V2 只能由显式 Session/CLI/模拟器入口选择。
 - 已实现 FAST32K/CTRL8K/SLOW1K fixed stream、owner/role 通道 metadata、domain/phase/group 校验、`row/source/applied` 元数据与客户端诊断计数。
 - 已实现 V2 hardware Capture 配置、状态、内存组装和完整性验证；本阶段不写入 `.scope V1`。
 - TCP simulator 提供可重复的 `30k-*` V2 预设；这是 simulator/client 验证，不是 DSP 硬件验证。
@@ -16,6 +16,10 @@
 - 异步 V1 录波 writer 的实际有界队列容量为 **1024** 项；V2 Capture 不进入该队列。
 - 0.15.1 完成 V2 加固：CausalRelation 跨 stream 逻辑序号、Capture CRC32C/边界、精确 stream/binding 集合、固定 period、双向心跳、STATUS/ERROR 和主机背压诊断均已由单元及 15 preset 会话矩阵覆盖。
 - 0.15.2 将 `logical_cycle_sequence` 与 stream-local `row_sequence` 分离，加入有界乱序因果匹配、Capture 失败后会话恢复与终态缓存释放、严格 row/timestamp 映射、多 nonce 心跳窗口，并把 15 preset 会话断言细化为逐项语义检查。
+- 0.15.3 将 R1 固定为 28-byte/0x32，并以 0x33/34/35/47 建立 R2；实现 1..8 Stream 原子订阅、32 kHz logical time（step 1/4/32）、正负 offset 和 watermark deadline。
+- R2 Snapshot 默认使用 48-byte affine base + sparse override；自动带宽门禁覆盖 4 Mbaud 70% 阈值。Capture R2 使用纯长度、相邻块检查、Arc block 与增量 CRC，失败后连接可复用。
+- DeviceReset 清空全部 session-local 状态并拒绝旧 id，等新 HELLO_ACK/ChannelTable/StreamTableR2 后回到 Ready，不自动恢复订阅或 Streaming。heartbeat 分离统计 RTT/timeout/unknown/duplicate/overflow。
+- CI 增加 focused live、simulator 和独立 100 万行 causal bounded job；这些仍是软件模拟证据，不是真实 Hybrid30K 硬件验证。
 
 ## 已完成内容
 
@@ -59,7 +63,7 @@
 - 完成性复审发现初版 CHANNEL_TABLE 字符串长度排列与冻结设计不一致、协议文档缺少固件 golden frame、配置未对设备协商上限做统一校验；已以新测试先复现并修正。
 - CHANNEL_TABLE descriptor 已冻结为“固定字段、unit/name 两个长度、unit/name 两段字节”的布局；PING 完整 golden frame 和 CRC 已写入固件协议文档。
 - 已新增设备约束校验和 CONFIGURE 成功 detail 的规范编码/解码，覆盖 tick_hz、最大批量、通道 mask 和协商 payload 上限。
-- 已将录波从 UI `poll` 同步文件写入改为独立 128 项有界 writer 线程；队列满、worker 写入失败和 worker panic 均有显式错误，录波立即停止且只保留可恢复前缀。
+- 历史初版曾使用 128 项 writer 队列；当前有效 V1 录波 writer 容量为 **1024** 项。队列满、worker 写入失败和 worker panic 均有显式错误，录波立即停止且只保留可恢复前缀。
 - Trigger 记录升级为固定 48 字节完整记录，包含 mode、edge、源通道、level、hysteresis、pre/post、Auto timeout、触发样点和超时标志。
 - 干净文件打开时会逐项核对 Index 与实际 SampleFrame 索引/时间戳/文件偏移；有效 CRC 但内容不一致的 Index 也会拒绝。
 - `LiveScopeState` 已接入异步录波统计、pending 数量和 worker 故障轮询；显式结束录波仍等待 Index/SessionEnd 与 `sync_all` 完成，应用异常退出则不无限等待并由恢复扫描处理。

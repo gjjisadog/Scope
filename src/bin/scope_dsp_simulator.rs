@@ -41,9 +41,17 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Simulator
             "--protocol" => {
                 config.protocol = match parse_value::<String>(&mut args, "--protocol")?.as_str() {
                     "v1" => SimulatorProtocol::V1,
-                    "v2" => SimulatorProtocol::V2,
-                    value => return Err(format!("invalid --protocol {value}; expected v1 or v2")),
+                    "v2-r1" => SimulatorProtocol::V2R1,
+                    "v2" | "v2-r2" => SimulatorProtocol::V2R2,
+                    value => {
+                        return Err(format!(
+                            "invalid --protocol {value}; expected v1, v2-r1, or v2-r2"
+                        ))
+                    }
                 }
+            }
+            "--streams" => {
+                config.streams = parse_streams(&parse_value::<String>(&mut args, "--streams")?)?
             }
             "--preset" => {
                 let value = parse_value::<String>(&mut args, "--preset")?;
@@ -69,6 +77,18 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Simulator
     Ok(Some(config))
 }
 
+fn parse_streams(value: &str) -> Result<Vec<u16>, String> {
+    value
+        .split(',')
+        .map(|name| match name.trim() {
+            "fast32k" => Ok(1),
+            "ctrl8k" => Ok(2),
+            "slow1k" => Ok(3),
+            other => Err(format!("unknown stream {other}")),
+        })
+        .collect()
+}
+
 fn parse_value<T: std::str::FromStr>(
     args: &mut impl Iterator<Item = String>,
     flag: &str,
@@ -86,7 +106,8 @@ fn print_help() {
          --listen <host:port>       Listen address (default 127.0.0.1:19090)\n\
          --sample-rate <hz>         Default sample rate (default 10000)\n\
          --batch-samples <count>    Samples per frame (default 100)\n\
-         --protocol <v1|v2>          SCP1 protocol mode (default v1)\n\
+         --protocol <v1|v2-r1|v2-r2> SCP1 protocol mode (v2 alias selects R2)\n\
+         --streams <names>            V2 streams: fast32k,ctrl8k,slow1k\n\
          --preset <name>             Deterministic V2 preset, e.g. 30k-normal\n\
          --accelerated              Run faster than wall clock\n\
          --seed <integer>           Deterministic signal seed\n\
@@ -127,14 +148,17 @@ mod tests {
     fn parses_v2_protocol_and_preset() {
         let config = parse_args([
             "--protocol".to_owned(),
-            "v2".to_owned(),
+            "v2-r2".to_owned(),
+            "--streams".to_owned(),
+            "fast32k,ctrl8k,slow1k".to_owned(),
             "--preset".to_owned(),
             "30k-normal".to_owned(),
         ])
         .unwrap()
         .unwrap();
 
-        assert_eq!(config.protocol, SimulatorProtocol::V2);
+        assert_eq!(config.protocol, SimulatorProtocol::V2R2);
         assert_eq!(config.preset, Some(V2Preset::Normal30k));
+        assert_eq!(config.streams, vec![1, 2, 3]);
     }
 }

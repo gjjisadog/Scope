@@ -1,13 +1,38 @@
-# 多采样域 Snapshot 合约
+# 多采样域 Snapshot 合约（SCP1 V2 R2）
 
-Hybrid30K 的 FAST32K、CTRL8K 和 SLOW1K 是三个不同的执行域，不得被客户端重采样或合并为一张“同时”采样表。一个 SCP1 V2 stream 只属于一个 domain、一个固定采样率、一个固定 capture phase 和一个非零 consistency group。
+Hybrid30K 的 FAST32K、CTRL8K、SLOW1K 是独立执行域。客户端不得把不同 CPU/CLA 时刻的变量拼成“物理同时”行。DSP 在每个固定 CapturePhase 一次性冻结信号和 SnapshotMeta，再发布整行。
 
-DSP 必须在所属 phase 一次性冻结每个行的普通信号和 `SnapshotMeta`，然后发布整个行。客户端的职责是验证 descriptor 与行 metadata；它不会读取、缓存后拼接多个 CPU/CLA 变量来构造截面。
+## 两类序号
 
-`row_sequence` 只表示本 stream 的单调采样行号。batch 内必须连续；batch 之间 gap 可报告，倒退与重叠是故障。`logical_cycle_sequence` 是独立的跨 stream 因果控制周期键，不得从 32 kHz、8 kHz 或 1 kHz 的本地行号推导相等关系。`source_sequence` 表示计算采用的冻结输入，`applied_sequence` 表示已实际应用的命令/结果。它们表达因果而非跨 CPU 的物理同时性。
+`row_sequence` 仅表示本 Stream 行号；`logical_cycle_sequence` 是 consistency group 内的统一因果时基。R2 group 1 的时基为 32 kHz，FAST/CTRL/SLOW 的 step 分别为 1/4/32，因此 row N、K、M 对应 cycle N、4K、32M。精确条件是 `logical_cycle_step = logical_cycle_rate_hz / sample_rate_hz`，必须整除。行间隔 D 对应 logical 增量 `D * step`。
 
-对于 STREAM_TABLE 中每个 `CausalRelation`，客户端只在同一 consistency group 内使用 `logical_cycle_sequence` 校验：`result.source_sequence = input.logical_cycle_sequence + result_input_offset`，以及 `application.applied_sequence = result.logical_cycle_sequence + application_result_offset`。例如 `(0, 1)` 合法表示 input N → result(N) → application(N+1)。因果行允许乱序到达并在有界窗口内延迟匹配；32 kHz、8 kHz 和 1 kHz 的本地 row number 不会被当成同一个物理时钟。
+`source_sequence` 表示 Result 实际采用的 Input cycle；`applied_sequence` 表示 Application 实际采用的 Result cycle。它们不是 row number，也不要求等于当前 Application logical cycle。
 
-有效位必须清楚表明行是否有效、冻结、ADC 有效、source/applied 有效和（FAST32K）CLA 已完成。FAST32K 最低要求 valid/frozen/source/ADC/CLA；CTRL8K 最低要求 valid/frozen/source；SLOW1K 最低要求 valid/frozen。AppliedCommand role 或 CausalRelation 决定额外 source/applied 要求。无效行会保留在诊断计数中，绝不由客户端静默修复。
+## 因果公式
 
-计时规则冻结为 `sample_period_ticks = tick_hz / fixed_sample_rate_hz` 且必须整除；不允许浮点近似。周期在一个 stream 或一个 Capture 内不得变化，时间戳必须随行序单调且 checked arithmetic 不溢出。
+同一 consistency group 内：
+
+```text
+expected_input = result.source_sequence - result_input_offset
+expected_result = application.applied_sequence - application_result_offset
+
+result.source_sequence = input.logical_cycle_sequence + result_input_offset
+application.applied_sequence = result.logical_cycle_sequence + application_result_offset
+```
+
+所有有符号运算检查上下溢。Result/Application 可以先到并进入 pending。只有 `source_watermark > expected_source + max_reorder_cycles` 才确认缺失。不同 group 的缓存、水位和 deadline 完全隔离。
+
+正常查找/插入使用按 `(stream, logical cycle)` 和 deadline 排序的 BTree 索引，接近 O(log n)。cached row 与 pending relation 各有 4,096 硬上限；超限返回 `CausalWindowOverflow`，不静默覆盖。匹配完成立即释放 pending；表 revision、session id 或 DeviceReset 改变时清空窗口。诊断分别记录 cached、pending、timeout、eviction、overflow 与 duplicate logical cycle。
+
+## 行与时间戳
+
+每个 Stream 的 `sample_period_ticks = tick_hz / sample_rate_hz` 必须精确整除。跨批次：
+
+```text
+current_timestamp = previous_last_timestamp
+                  + (current_first_row - previous_last_row) * sample_period_ticks
+```
+
+周期改变、row overlap/reorder、timestamp drift 与 arithmetic overflow 都被拒绝。有效位缺失只增加明确诊断，不由客户端修补。
+
+这是 Scope Analyzer 和 TCP 模拟器冻结的固件接口；真实 Hybrid30K DSP 尚未验证。

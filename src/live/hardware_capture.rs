@@ -1,13 +1,20 @@
 //! In-memory SCP1 V2 hardware-capture assembly.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use serde::Serialize;
 
 use super::protocol_v2::{
-    capture_integrity_summary, CaptureBegin, CaptureData, CaptureEnd, CaptureState, MessageV2,
-    StreamDescriptor, StreamSampleBatch, MAX_CAPTURE_BLOCKS, MAX_CAPTURE_BLOCK_ROWS,
+    capture_integrity_summary, CaptureBegin, CaptureData, CaptureEnd, CapturePhase, CaptureState,
+    MessageV2, StreamDescriptor, StreamSampleBatch, MAX_CAPTURE_BLOCKS, MAX_CAPTURE_BLOCK_ROWS,
     MAX_CAPTURE_PAYLOAD_BYTES, MAX_CAPTURE_ROWS,
+};
+use super::{
+    protocol::Crc32c,
+    protocol_v2_r2::{
+        capture_data_r2_payload_len, encode_capture_data_r2_payload, CaptureDataR2,
+        StreamDescriptorR2, StreamSampleBatchR2,
+    },
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -28,6 +35,54 @@ pub struct AssembledCapture {
     pub begin: CaptureBegin,
     pub blocks: Vec<StreamSampleBatch>,
     pub diagnostics: CaptureDiagnostics,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssembledCaptureR2 {
+    pub begin: CaptureBegin,
+    pub blocks: Vec<StreamSampleBatchR2>,
+    pub diagnostics: CaptureDiagnostics,
+}
+
+#[derive(Clone, Debug)]
+struct CaptureBlockR2 {
+    data: CaptureDataR2,
+    encoded_payload: Option<Arc<[u8]>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CaptureAssemblerR2 {
+    begin: Option<CaptureBegin>,
+    blocks: BTreeMap<u32, CaptureBlockR2>,
+    expected_stream: Option<(
+        u16,
+        u32,
+        super::protocol_v2::SampleDomain,
+        CapturePhase,
+        u16,
+    )>,
+    expected_next_block: u32,
+    next_crc_block: u32,
+    crc: Crc32c,
+    total_rows: u32,
+    total_payload_bytes: usize,
+    diagnostics: CaptureDiagnostics,
+}
+
+impl Default for CaptureAssemblerR2 {
+    fn default() -> Self {
+        Self {
+            begin: None,
+            blocks: BTreeMap::new(),
+            expected_stream: None,
+            expected_next_block: 0,
+            next_crc_block: 0,
+            crc: Crc32c::new(),
+            total_rows: 0,
+            total_payload_bytes: 0,
+            diagnostics: CaptureDiagnostics::default(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -90,6 +145,310 @@ impl CaptureDescriptor {
             && (self.sample_period_ticks == 0
                 || self.sample_period_ticks == batch.sample_period_ticks)
     }
+}
+
+impl CaptureAssemblerR2 {
+    pub fn begin_with_descriptor(
+        &mut self,
+        begin: CaptureBegin,
+        stream: &StreamDescriptorR2,
+        stream_revision: u32,
+    ) -> Result<(), String> {
+        if begin.capture_id == 0
+            || begin.row_count == 0
+            || begin.row_count > MAX_CAPTURE_ROWS
+            || begin.stream_id != stream.stream_id
+        {
+            return Err("CaptureDescriptorMismatch: invalid R2 CAPTURE_BEGIN or stream".to_owned());
+        }
+        self.release_buffers();
+        self.crc = Crc32c::new();
+        self.crc.update(&begin.capture_id.to_le_bytes());
+        self.expected_stream = Some((
+            stream.stream_id,
+            stream_revision,
+            stream.domain,
+            stream.capture_phase,
+            stream.consistency_group,
+        ));
+        self.begin = Some(begin);
+        self.diagnostics = CaptureDiagnostics::default();
+        Ok(())
+    }
+
+    pub fn push(&mut self, data: CaptureDataR2) -> Result<(), String> {
+        let encoded_payload = Arc::<[u8]>::from(
+            encode_capture_data_r2_payload(&data)
+                .map_err(|error| format!("CaptureDescriptorMismatch: {error}"))?,
+        );
+        self.push_encoded_payload(data, encoded_payload)
+    }
+
+    pub(crate) fn push_encoded_payload(
+        &mut self,
+        data: CaptureDataR2,
+        encoded_payload: Arc<[u8]>,
+    ) -> Result<(), String> {
+        let begin = self
+            .begin
+            .as_ref()
+            .ok_or_else(|| "R2 capture data arrived before CAPTURE_BEGIN".to_owned())?;
+        if data.capture_id != begin.capture_id || data.batch.stream_id != begin.stream_id {
+            self.diagnostics.capture_descriptor_mismatches = self
+                .diagnostics
+                .capture_descriptor_mismatches
+                .saturating_add(1);
+            return Err("CaptureDescriptorMismatch: R2 capture id or stream changed".to_owned());
+        }
+        if data.block_index >= MAX_CAPTURE_BLOCKS {
+            self.diagnostics.capture_too_many_blocks =
+                self.diagnostics.capture_too_many_blocks.saturating_add(1);
+            return Err("CaptureTooManyBlocks: R2 block index exceeds protocol limit".to_owned());
+        }
+        if data.batch.row_count == 0 || data.batch.row_count > MAX_CAPTURE_BLOCK_ROWS {
+            self.diagnostics.capture_row_overflows =
+                self.diagnostics.capture_row_overflows.saturating_add(1);
+            return Err("CaptureTooLarge: R2 block row count exceeds protocol limit".to_owned());
+        }
+        if self.blocks.contains_key(&data.block_index) {
+            self.diagnostics.capture_duplicate_chunks =
+                self.diagnostics.capture_duplicate_chunks.saturating_add(1);
+            return Ok(());
+        }
+        let Some((stream_id, revision, domain, phase, group)) = self.expected_stream else {
+            return Err("CaptureDescriptorMismatch: missing R2 stream descriptor".to_owned());
+        };
+        if data.batch.stream_id != stream_id
+            || data.batch.stream_revision != revision
+            || data.batch.domain != domain
+            || data.batch.capture_phase != phase
+            || data.batch.consistency_group != group
+        {
+            self.diagnostics.capture_descriptor_mismatches = self
+                .diagnostics
+                .capture_descriptor_mismatches
+                .saturating_add(1);
+            return Err(
+                "CaptureDescriptorMismatch: R2 block disagrees with STREAM_TABLE_R2".to_owned(),
+            );
+        }
+        let payload_len = capture_data_r2_payload_len(&data)
+            .map_err(|error| format!("CaptureDescriptorMismatch: {error}"))?;
+        if encoded_payload.len() != payload_len {
+            return Err(
+                "CaptureDescriptorMismatch: R2 raw payload length disagrees with decoded block"
+                    .to_owned(),
+            );
+        }
+        let next_rows = self
+            .total_rows
+            .checked_add(u32::from(data.batch.row_count))
+            .ok_or_else(|| "CaptureRowOverflow: R2 row total overflow".to_owned())?;
+        if next_rows > begin.row_count || next_rows > MAX_CAPTURE_ROWS {
+            self.diagnostics.capture_row_overflows =
+                self.diagnostics.capture_row_overflows.saturating_add(1);
+            return Err("CaptureRowOverflow: R2 rows exceed CAPTURE_BEGIN".to_owned());
+        }
+        let next_payload = checked_r2_capture_payload_total(self.total_payload_bytes, payload_len)?;
+        self.validate_neighbors(&data)?;
+        if data.block_index != self.expected_next_block {
+            self.diagnostics.capture_reordered_chunks =
+                self.diagnostics.capture_reordered_chunks.saturating_add(1);
+        }
+        self.expected_next_block = self
+            .expected_next_block
+            .max(data.block_index.saturating_add(1));
+        self.total_rows = next_rows;
+        self.total_payload_bytes = next_payload;
+        self.blocks.insert(
+            data.block_index,
+            CaptureBlockR2 {
+                data,
+                encoded_payload: Some(encoded_payload),
+            },
+        );
+        self.advance_crc();
+        Ok(())
+    }
+
+    pub fn finish(&mut self, end: CaptureEnd) -> Result<AssembledCaptureR2, String> {
+        let result = self.finish_inner(end);
+        self.release_buffers();
+        result
+    }
+
+    fn finish_inner(&mut self, end: CaptureEnd) -> Result<AssembledCaptureR2, String> {
+        let begin = self
+            .begin
+            .take()
+            .ok_or_else(|| "R2 CAPTURE_END arrived before CAPTURE_BEGIN".to_owned())?;
+        if end.capture_id != begin.capture_id || end.state != CaptureState::Complete {
+            return Err("R2 capture ended with an invalid id or non-success state".to_owned());
+        }
+        let actual_blocks =
+            u32::try_from(self.blocks.len()).map_err(|_| "too many R2 capture blocks")?;
+        if end.total_blocks != actual_blocks
+            || end.total_blocks > MAX_CAPTURE_BLOCKS
+            || end.uploaded_rows != self.total_rows
+            || end.total_samples != self.total_rows
+            || end.dropped_rows != 0
+            || self.total_rows != begin.row_count
+        {
+            return Err("R2 CAPTURE_END totals do not match uploaded blocks".to_owned());
+        }
+        if self.next_crc_block != end.total_blocks {
+            self.diagnostics.capture_missing_chunks =
+                self.diagnostics.capture_missing_chunks.saturating_add(1);
+            return Err("R2 capture upload is missing one or more chunks".to_owned());
+        }
+        if self.crc.finalize() != end.integrity_summary {
+            self.diagnostics.capture_integrity_mismatches = self
+                .diagnostics
+                .capture_integrity_mismatches
+                .saturating_add(1);
+            return Err(
+                "CaptureIntegrityMismatch: R2 incremental CRC32C does not match".to_owned(),
+            );
+        }
+        let first = self
+            .blocks
+            .first_key_value()
+            .and_then(|(_, block)| block.data.batch.row_metadata.first())
+            .map(|row| row.row_sequence)
+            .ok_or_else(|| "CaptureRowDiscontinuity: R2 capture has no rows".to_owned())?;
+        let last = self
+            .blocks
+            .last_key_value()
+            .and_then(|(_, block)| block.data.batch.row_metadata.last())
+            .map(|row| row.row_sequence)
+            .ok_or_else(|| "CaptureRowDiscontinuity: R2 capture has no rows".to_owned())?;
+        if begin.trigger_row_seq < first || begin.trigger_row_seq > last {
+            return Err("CaptureRowDiscontinuity: R2 trigger row is outside capture".to_owned());
+        }
+        self.diagnostics.capture_complete = true;
+        let blocks = std::mem::take(&mut self.blocks)
+            .into_values()
+            .map(|block| block.data.batch)
+            .collect();
+        Ok(AssembledCaptureR2 {
+            begin,
+            blocks,
+            diagnostics: self.diagnostics.clone(),
+        })
+    }
+
+    fn validate_neighbors(&mut self, data: &CaptureDataR2) -> Result<(), String> {
+        let first = data
+            .batch
+            .row_metadata
+            .first()
+            .ok_or_else(|| "CaptureRowDiscontinuity: R2 block has no rows".to_owned())?
+            .row_sequence;
+        let last = data
+            .batch
+            .row_metadata
+            .last()
+            .ok_or_else(|| "CaptureRowDiscontinuity: R2 block has no rows".to_owned())?
+            .row_sequence;
+        if let Some((predecessor_index, predecessor)) =
+            self.blocks.range(..data.block_index).next_back()
+        {
+            let previous_last = predecessor
+                .data
+                .batch
+                .row_metadata
+                .last()
+                .expect("validated R2 capture block")
+                .row_sequence;
+            if predecessor_index.checked_add(1) == Some(data.block_index)
+                && previous_last.checked_add(1) != Some(first)
+            {
+                self.diagnostics.capture_row_discontinuities = self
+                    .diagnostics
+                    .capture_row_discontinuities
+                    .saturating_add(1);
+                return Err("CaptureRowDiscontinuity: R2 predecessor is not adjacent".to_owned());
+            }
+        }
+        if let Some((successor_index, successor)) = self
+            .blocks
+            .range(data.block_index.saturating_add(1)..)
+            .next()
+        {
+            let next_first = successor
+                .data
+                .batch
+                .row_metadata
+                .first()
+                .expect("validated R2 capture block")
+                .row_sequence;
+            if data.block_index.checked_add(1) == Some(*successor_index)
+                && last.checked_add(1) != Some(next_first)
+            {
+                self.diagnostics.capture_row_discontinuities = self
+                    .diagnostics
+                    .capture_row_discontinuities
+                    .saturating_add(1);
+                return Err("CaptureRowDiscontinuity: R2 successor is not adjacent".to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    fn advance_crc(&mut self) {
+        while let Some(block) = self.blocks.get_mut(&self.next_crc_block) {
+            let Some(encoded_payload) = block.encoded_payload.take() else {
+                break;
+            };
+            self.crc.update(&encoded_payload);
+            self.next_crc_block = self.next_crc_block.saturating_add(1);
+        }
+    }
+
+    pub fn device_reset(&mut self) {
+        self.release_buffers();
+        self.diagnostics.capture_complete = false;
+    }
+
+    pub fn diagnostics(&self) -> &CaptureDiagnostics {
+        &self.diagnostics
+    }
+
+    pub fn buffered_block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub fn buffered_rows(&self) -> u32 {
+        self.total_rows
+    }
+
+    pub fn buffered_payload_bytes(&self) -> usize {
+        self.total_payload_bytes
+    }
+
+    fn release_buffers(&mut self) {
+        self.begin = None;
+        self.blocks.clear();
+        self.expected_stream = None;
+        self.expected_next_block = 0;
+        self.next_crc_block = 0;
+        self.crc = Crc32c::new();
+        self.total_rows = 0;
+        self.total_payload_bytes = 0;
+    }
+}
+
+fn checked_r2_capture_payload_total(current: usize, block: usize) -> Result<usize, String> {
+    let buffered = current
+        .checked_add(block)
+        .ok_or_else(|| "CaptureTooLarge: R2 payload length overflow".to_owned())?;
+    let integrity_input = std::mem::size_of::<u32>()
+        .checked_add(buffered)
+        .ok_or_else(|| "CaptureTooLarge: R2 payload length overflow".to_owned())?;
+    if integrity_input > MAX_CAPTURE_PAYLOAD_BYTES {
+        return Err("CaptureTooLarge: R2 capture exceeds the 64 MiB limit".to_owned());
+    }
+    Ok(buffered)
 }
 
 impl CaptureAssembler {
@@ -395,6 +754,7 @@ mod tests {
     use super::*;
     use crate::live::{
         protocol_v2::{CapturePhase, SampleDomain},
+        protocol_v2_r2::{capture_integrity_summary_r2, MetadataEncodingR2, StreamDescriptorR2},
         snapshot::{SnapshotMeta, APPLIED_SEQUENCE_VALID, FROZEN_ROW, SNAPSHOT_VALID},
     };
 
@@ -418,6 +778,152 @@ mod tests {
                 valid_flags: SNAPSHOT_VALID | FROZEN_ROW | APPLIED_SEQUENCE_VALID,
             }],
         }
+    }
+
+    fn r2_descriptor() -> StreamDescriptorR2 {
+        StreamDescriptorR2 {
+            stream_id: 1,
+            domain: SampleDomain::Fast32k,
+            capture_phase: CapturePhase::AfterClaComplete,
+            sample_rate_hz: 32_000,
+            consistency_group: 1,
+            logical_cycle_step: 1,
+            channel_ids: vec![0],
+        }
+    }
+
+    fn r2_block(capture_id: u32, block_index: u32, row: u64) -> CaptureDataR2 {
+        CaptureDataR2 {
+            capture_id,
+            block_index,
+            batch: StreamSampleBatchR2 {
+                stream_id: 1,
+                stream_revision: 3,
+                domain: SampleDomain::Fast32k,
+                capture_phase: CapturePhase::AfterClaComplete,
+                consistency_group: 1,
+                first_row_sequence: row,
+                row_sequence_step: 1,
+                logical_cycle_step: 1,
+                sample_period_ticks: 1_000,
+                row_count: 1,
+                channel_ids: vec![0],
+                sample_data: 0_i16.to_le_bytes().to_vec(),
+                metadata_encoding: MetadataEncodingR2::AffineWithOverrides,
+                row_metadata: vec![SnapshotMeta {
+                    row_sequence: row,
+                    logical_cycle_sequence: row,
+                    source_sequence: row,
+                    applied_sequence: row,
+                    valid_flags: SNAPSHOT_VALID | FROZEN_ROW | APPLIED_SEQUENCE_VALID,
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn r2_out_of_order_blocks_use_incremental_crc_and_release_buffers() {
+        let mut assembler = CaptureAssemblerR2::default();
+        assembler
+            .begin_with_descriptor(
+                CaptureBegin {
+                    capture_id: 7,
+                    stream_id: 1,
+                    row_count: 3,
+                    trigger_row_seq: 1,
+                },
+                &r2_descriptor(),
+                3,
+            )
+            .unwrap();
+        let first = r2_block(7, 0, 1);
+        let second = r2_block(7, 1, 2);
+        let third = r2_block(7, 2, 3);
+        assembler.push(third.clone()).unwrap();
+        assembler.push(first.clone()).unwrap();
+        assembler.push(second.clone()).unwrap();
+        assert_eq!(assembler.buffered_block_count(), 3);
+        assert_eq!(assembler.buffered_rows(), 3);
+        let integrity = capture_integrity_summary_r2(7, [&first, &second, &third]).unwrap();
+        let capture = assembler
+            .finish(CaptureEnd {
+                capture_id: 7,
+                state: CaptureState::Complete,
+                uploaded_rows: 3,
+                dropped_rows: 0,
+                total_blocks: 3,
+                total_samples: 3,
+                integrity_summary: integrity,
+            })
+            .unwrap();
+        assert!(capture.diagnostics.capture_complete);
+        assert_eq!(capture.blocks.len(), 3);
+        assert_eq!(assembler.buffered_block_count(), 0);
+        assert_eq!(assembler.buffered_rows(), 0);
+        assert_eq!(assembler.buffered_payload_bytes(), 0);
+    }
+
+    #[test]
+    fn r2_capture_failure_releases_memory_and_next_capture_succeeds() {
+        let mut assembler = CaptureAssemblerR2::default();
+        let begin = CaptureBegin {
+            capture_id: 8,
+            stream_id: 1,
+            row_count: 2,
+            trigger_row_seq: 1,
+        };
+        assembler
+            .begin_with_descriptor(begin.clone(), &r2_descriptor(), 3)
+            .unwrap();
+        assembler.push(r2_block(8, 1, 2)).unwrap();
+        assert!(assembler
+            .finish(CaptureEnd {
+                capture_id: 8,
+                state: CaptureState::Complete,
+                uploaded_rows: 1,
+                dropped_rows: 0,
+                total_blocks: 2,
+                total_samples: 1,
+                integrity_summary: 0,
+            })
+            .is_err());
+        assert_eq!(assembler.buffered_block_count(), 0);
+
+        assembler
+            .begin_with_descriptor(begin, &r2_descriptor(), 3)
+            .unwrap();
+        let first = r2_block(8, 0, 1);
+        let second = r2_block(8, 1, 2);
+        assembler.push(first.clone()).unwrap();
+        assembler.push(second.clone()).unwrap();
+        let integrity = capture_integrity_summary_r2(8, [&first, &second]).unwrap();
+        assert!(assembler
+            .finish(CaptureEnd {
+                capture_id: 8,
+                state: CaptureState::Complete,
+                uploaded_rows: 2,
+                dropped_rows: 0,
+                total_blocks: 2,
+                total_samples: 2,
+                integrity_summary: integrity,
+            })
+            .is_ok());
+    }
+
+    #[test]
+    fn r2_capture_limit_is_checked_before_allocating_a_block() {
+        assert_eq!(
+            checked_r2_capture_payload_total(MAX_CAPTURE_PAYLOAD_BYTES - 5, 1).unwrap(),
+            MAX_CAPTURE_PAYLOAD_BYTES - 4
+        );
+        assert!(
+            checked_r2_capture_payload_total(MAX_CAPTURE_PAYLOAD_BYTES - 5, 2)
+                .unwrap_err()
+                .contains("64 MiB")
+        );
+        assert!(checked_r2_capture_payload_total(usize::MAX, 1)
+            .unwrap_err()
+            .contains("overflow"));
     }
 
     fn begin() -> CaptureBegin {

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     io::{Read, Write},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -14,7 +14,9 @@ use thiserror::Error;
 
 use super::{
     buffer::{GapReason, LiveBuffer, LiveGap, LiveSnapshot},
-    hardware_capture::{AssembledCapture, CaptureAssembler},
+    hardware_capture::{
+        AssembledCapture, AssembledCaptureR2, CaptureAssembler, CaptureAssemblerR2,
+    },
     protocol::{
         decode_configure_result_detail, decode_sample_frame, validate_configure_for_device,
         ChannelTable, CommandResult, Configure, DecodedSampleBatch, Frame, FrameDecoder, Hello,
@@ -23,8 +25,14 @@ use super::{
     protocol_v2::{
         decode_stream_sample_frame, ArmCapture, CancelCapture, CaptureState, CaptureStatus,
         ConfigureStream, DecodedStreamSampleBatch, ManualTrigger, MessageV2, StreamTable,
-        CAPABILITY_V2_STREAMS, MSG_CAPTURE_BEGIN, MSG_CAPTURE_DATA, MSG_CAPTURE_END,
-        MSG_STREAM_SAMPLE_BATCH,
+        CAPABILITY_V2_STREAMS_R1, MSG_CAPTURE_BEGIN, MSG_CAPTURE_DATA_R1, MSG_CAPTURE_END,
+        MSG_SAMPLE_BATCH_V2_R1, MSG_STREAM_TABLE_R1,
+    },
+    protocol_v2_r2::{
+        decode_stream_sample_frame_r2, ConfigureStreamsR2, DecodedStreamSampleBatchR2, MessageV2R2,
+        StreamTableR2, CAPABILITY_V2_COMPRESSED_METADATA, CAPABILITY_V2_HARDWARE_CAPTURE_R2,
+        CAPABILITY_V2_MULTI_STREAM, CAPABILITY_V2_STREAMS_R2, MSG_CAPTURE_DATA_R2,
+        MSG_SAMPLE_BATCH_V2_R2, MSG_STREAM_TABLE_R2,
     },
     recording::{RecordingError, RecordingIngress},
     snapshot::{SnapshotDiagnostics, SnapshotValidator},
@@ -45,32 +53,58 @@ const HEARTBEAT_REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Debug)]
 struct HeartbeatWindow {
     sent_at: HashMap<u64, Instant>,
+    acknowledged: HashSet<u64>,
+    acknowledged_order: VecDeque<u64>,
     capacity: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeartbeatAck {
+    Matched(Duration),
+    Duplicate,
+    Unknown,
 }
 
 impl HeartbeatWindow {
     fn new(capacity: usize) -> Self {
         Self {
             sent_at: HashMap::new(),
+            acknowledged: HashSet::new(),
+            acknowledged_order: VecDeque::new(),
             capacity: capacity.max(1),
         }
     }
 
-    fn record(&mut self, nonce: u64, now: Instant) -> u64 {
+    fn record(&mut self, nonce: u64, now: Instant) -> bool {
+        self.acknowledged.remove(&nonce);
+        self.acknowledged_order.retain(|value| *value != nonce);
         self.sent_at.insert(nonce, now);
         if self.sent_at.len() <= self.capacity {
-            return 0;
+            return false;
         }
         let oldest = self
             .sent_at
             .iter()
             .min_by_key(|(_, sent_at)| *sent_at)
             .map(|(nonce, _)| *nonce);
-        oldest.map_or(0, |nonce| u64::from(self.sent_at.remove(&nonce).is_some()))
+        oldest.is_some_and(|nonce| self.sent_at.remove(&nonce).is_some())
     }
 
-    fn acknowledge(&mut self, nonce: u64) -> bool {
-        self.sent_at.remove(&nonce).is_some()
+    fn acknowledge(&mut self, nonce: u64, now: Instant) -> HeartbeatAck {
+        if let Some(sent_at) = self.sent_at.remove(&nonce) {
+            self.acknowledged.insert(nonce);
+            self.acknowledged_order.push_back(nonce);
+            while self.acknowledged_order.len() > self.capacity {
+                if let Some(oldest) = self.acknowledged_order.pop_front() {
+                    self.acknowledged.remove(&oldest);
+                }
+            }
+            HeartbeatAck::Matched(now.saturating_duration_since(sent_at))
+        } else if self.acknowledged.contains(&nonce) {
+            HeartbeatAck::Duplicate
+        } else {
+            HeartbeatAck::Unknown
+        }
     }
 
     fn expire(&mut self, now: Instant) -> u64 {
@@ -86,6 +120,16 @@ impl HeartbeatWindow {
             self.sent_at.remove(nonce);
         }
         expired.len() as u64
+    }
+
+    fn pending_count(&self) -> usize {
+        self.sent_at.len()
+    }
+
+    fn clear(&mut self) {
+        self.sent_at.clear();
+        self.acknowledged.clear();
+        self.acknowledged_order.clear();
     }
 }
 
@@ -109,6 +153,7 @@ pub enum ConnectionState {
     Disconnected,
     Connecting,
     Handshaking,
+    DeviceResetHandshake,
     Configuring,
     Ready,
     Streaming,
@@ -118,11 +163,25 @@ pub enum ConnectionState {
 pub enum LiveProtocol {
     #[default]
     V1,
-    V2,
+    V2R1,
+    V2R2,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StreamSessionStats {
+    pub stream_id: u16,
+    pub received_batches: u64,
+    pub received_rows: u64,
+    pub host_dropped_batches: u64,
+    pub host_dropped_rows: u64,
+    pub row_sequence_gaps: u64,
+    pub row_sequence_reorders: u64,
+    pub logical_cycle_faults: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SessionStats {
+    pub session_id: u32,
     pub received_frames: u64,
     pub received_batches: u64,
     pub received_samples: u64,
@@ -145,7 +204,12 @@ pub struct SessionStats {
     pub causal_application_mismatch: u64,
     pub causal_sequence_reorder: u64,
     pub causal_group_mismatch: u64,
+    pub causal_cached_rows: usize,
+    pub causal_pending_matches: usize,
+    pub causal_match_timeouts: u64,
     pub causal_cache_evictions: u64,
+    pub causal_window_overflows: u64,
+    pub causal_duplicate_cycles: u64,
     pub host_dropped_v2_batches: u64,
     pub host_dropped_v2_rows: u64,
     pub v2_snapshot_queue_overruns: u64,
@@ -154,9 +218,17 @@ pub struct SessionStats {
     pub last_dropped_v2_first_row: Option<u64>,
     pub last_dropped_v2_last_row: Option<u64>,
     pub last_pong_nonce: Option<u64>,
+    pub heartbeat_pending_count: usize,
     pub heartbeat_round_trip_count: u64,
     pub heartbeat_timeout_count: u64,
+    pub heartbeat_unexpected_pong_count: u64,
+    pub heartbeat_duplicate_pong_count: u64,
+    pub heartbeat_window_overflow_count: u64,
+    pub heartbeat_last_rtt_ms: u64,
+    pub heartbeat_max_rtt_ms: u64,
+    pub device_reset_count: u64,
     pub device_state: Option<super::protocol::DeviceState>,
+    pub stream_stats: [StreamSessionStats; 8],
 }
 
 #[derive(Clone, Debug)]
@@ -165,15 +237,19 @@ pub enum SessionEvent {
     HelloAck(HelloAck),
     ChannelTable(ChannelTable),
     StreamTable(StreamTable),
+    StreamTableR2(StreamTableR2),
     Configured(Configure),
     ConfiguredV2(ConfigureStream),
+    ConfiguredV2R2(ConfigureStreamsR2),
     CommandResult(CommandResult),
     /// Retained for source compatibility; acquisition workers no longer emit
     /// a batch to the UI event queue.
     Batch(DecodedSampleBatch),
     SnapshotV2(DecodedStreamSampleBatch, SnapshotDiagnostics),
+    SnapshotV2R2(DecodedStreamSampleBatchR2, SnapshotDiagnostics),
     CaptureStatus(CaptureStatus),
     CaptureComplete(AssembledCapture),
+    CaptureCompleteR2(AssembledCaptureR2),
     CaptureFailure(String),
     Gap(LiveGap),
     DisplaySnapshot(Arc<LiveSnapshot>),
@@ -187,6 +263,7 @@ pub enum SessionEvent {
 enum SessionCommand {
     Configure(Configure, AcquisitionConfig),
     ConfigureStream(ConfigureStream),
+    ConfigureStreamsR2(ConfigureStreamsR2),
     SetTriggerConfig(TriggerConfig),
     ArmTrigger,
     Start,
@@ -203,6 +280,7 @@ enum SessionCommand {
 enum PendingCommand {
     Configure(Configure, AcquisitionConfig),
     ConfigureStream(ConfigureStream),
+    ConfigureStreamsR2(ConfigureStreamsR2),
     Start,
     Stop,
 }
@@ -242,10 +320,18 @@ impl LiveSession {
         Self::connect_with_protocol(config, LiveProtocol::V1)
     }
 
-    /// Explicit V2 entry point. The desktop GUI keeps calling `connect()` and
-    /// therefore remains on SCP1 V1 by default.
+    /// Compatibility alias for the frozen R2 entry point. The desktop GUI
+    /// keeps calling `connect()` and therefore remains on SCP1 V1 by default.
     pub fn connect_v2(config: TransportConfig) -> Result<Self, SessionError> {
-        Self::connect_with_protocol(config, LiveProtocol::V2)
+        Self::connect_v2_r2(config)
+    }
+
+    pub fn connect_v2_r1(config: TransportConfig) -> Result<Self, SessionError> {
+        Self::connect_with_protocol(config, LiveProtocol::V2R1)
+    }
+
+    pub fn connect_v2_r2(config: TransportConfig) -> Result<Self, SessionError> {
+        Self::connect_with_protocol(config, LiveProtocol::V2R2)
     }
 
     fn connect_with_protocol(
@@ -293,6 +379,10 @@ impl LiveSession {
 
     pub fn configure_stream(&self, configure: ConfigureStream) -> Result<(), SessionError> {
         self.send(SessionCommand::ConfigureStream(configure))
+    }
+
+    pub fn configure_streams_r2(&self, configure: ConfigureStreamsR2) -> Result<(), SessionError> {
+        self.send(SessionCommand::ConfigureStreamsR2(configure))
     }
 
     pub fn set_trigger_config(&self, config: TriggerConfig) -> Result<(), SessionError> {
@@ -502,7 +592,14 @@ fn run_worker(
             &data_tx,
             &disconnect_requested,
         ),
-        LiveProtocol::V2 => worker_loop_v2(
+        LiveProtocol::V2R1 => worker_loop_v2_r1(
+            config,
+            &command_rx,
+            &control_tx,
+            &data_tx,
+            &disconnect_requested,
+        ),
+        LiveProtocol::V2R2 => worker_loop_v2_r2(
             config,
             &command_rx,
             &control_tx,
@@ -578,6 +675,7 @@ fn worker_loop(
                     )?;
                 }
                 SessionCommand::ConfigureStream(_)
+                | SessionCommand::ConfigureStreamsR2(_)
                 | SessionCommand::ArmCapture(_)
                 | SessionCommand::ManualTrigger(_)
                 | SessionCommand::CancelCapture(_) => {
@@ -817,7 +915,8 @@ fn worker_loop(
                                     send_control(control_tx, SessionEvent::Configured(actual))?;
                                     ConnectionState::Ready
                                 }
-                                PendingCommand::ConfigureStream(_) => ConnectionState::Ready,
+                                PendingCommand::ConfigureStream(_)
+                                | PendingCommand::ConfigureStreamsR2(_) => ConnectionState::Ready,
                                 PendingCommand::Stop => {
                                     streaming = false;
                                     disconnect_complete = disconnecting;
@@ -960,7 +1059,7 @@ fn stop_recording_after_write_error(
     SessionEvent::RecordingError(error.to_string())
 }
 
-fn worker_loop_v2(
+fn worker_loop_v2_r1(
     config: TransportConfig,
     command_rx: &Receiver<SessionCommand>,
     control_tx: &Sender<SessionEvent>,
@@ -978,7 +1077,7 @@ fn worker_loop_v2(
         &mut out_sequence,
         0,
         Message::Hello(Hello {
-            client_capabilities: 0b111 | CAPABILITY_V2_STREAMS,
+            client_capabilities: 0b111 | CAPABILITY_V2_STREAMS_R1,
             max_payload: MAX_PAYLOAD_LEN as u32,
             client_name: "ScopeAnalyzer V2".to_owned(),
         }),
@@ -1017,6 +1116,11 @@ fn worker_loop_v2(
                         SessionEvent::State(ConnectionState::Configuring),
                     )?;
                 }
+                SessionCommand::ConfigureStreamsR2(_) => {
+                    return Err(SessionError::Acquisition(
+                        "SCP1 V2 R2 command sent to an R1 session".to_owned(),
+                    ));
+                }
                 SessionCommand::Start => {
                     let sequence = write_common_v2(
                         &mut transport,
@@ -1042,9 +1146,11 @@ fn worker_loop_v2(
                         session_id,
                         Message::Ping(nonce),
                     )?;
-                    stats.heartbeat_timeout_count = stats
-                        .heartbeat_timeout_count
-                        .saturating_add(heartbeat_window.record(nonce, Instant::now()));
+                    if heartbeat_window.record(nonce, Instant::now()) {
+                        stats.heartbeat_window_overflow_count =
+                            stats.heartbeat_window_overflow_count.saturating_add(1);
+                    }
+                    stats.heartbeat_pending_count = heartbeat_window.pending_count();
                 }
                 SessionCommand::ArmCapture(value) => {
                     write_v2_message(
@@ -1110,6 +1216,7 @@ fn worker_loop_v2(
             stats.heartbeat_timeout_count = stats
                 .heartbeat_timeout_count
                 .saturating_add(expired_heartbeats);
+            stats.heartbeat_pending_count = heartbeat_window.pending_count();
             let _ = data_tx.try_send(SessionEvent::Stats(stats));
         }
         if session_id != 0 && last_ping.elapsed() >= Duration::from_secs(1) {
@@ -1119,9 +1226,11 @@ fn worker_loop_v2(
                 session_id,
                 Message::Ping(ping_nonce),
             )?;
-            stats.heartbeat_timeout_count = stats
-                .heartbeat_timeout_count
-                .saturating_add(heartbeat_window.record(ping_nonce, Instant::now()));
+            if heartbeat_window.record(ping_nonce, Instant::now()) {
+                stats.heartbeat_window_overflow_count =
+                    stats.heartbeat_window_overflow_count.saturating_add(1);
+            }
+            stats.heartbeat_pending_count = heartbeat_window.pending_count();
             ping_nonce = ping_nonce.wrapping_add(1);
             last_ping = Instant::now();
         }
@@ -1168,15 +1277,17 @@ fn worker_loop_v2(
                         unreachable!()
                     };
                     if frame.session_id == 0
-                        || hello.device_capabilities & CAPABILITY_V2_STREAMS == 0
+                        || hello.device_capabilities & CAPABILITY_V2_STREAMS_R1 == 0
                     {
                         return Err(SessionError::Acquisition(
                             "peer did not negotiate SCP1 V2 streams".to_owned(),
                         ));
                     }
                     session_id = frame.session_id;
+                    stats.session_id = session_id;
                     hello_ack = Some(hello.clone());
                     send_control(control_tx, SessionEvent::HelloAck(hello))?;
+                    send_control(control_tx, SessionEvent::Stats(stats))?;
                 }
                 super::protocol::MSG_CHANNEL_TABLE => {
                     let Message::ChannelTable(table) =
@@ -1230,13 +1341,14 @@ fn worker_loop_v2(
                                         SessionEvent::State(ConnectionState::Ready),
                                     )?;
                                 }
-                                PendingCommand::Configure(_, _) => {}
+                                PendingCommand::Configure(_, _)
+                                | PendingCommand::ConfigureStreamsR2(_) => {}
                             }
                         }
                     }
                     send_control(control_tx, SessionEvent::CommandResult(result))?;
                 }
-                MSG_STREAM_SAMPLE_BATCH => {
+                MSG_SAMPLE_BATCH_V2_R1 => {
                     let table = channels.as_ref().ok_or_else(|| {
                         SessionError::Acquisition(
                             "V2 sample arrived before CHANNEL_TABLE".to_owned(),
@@ -1263,7 +1375,7 @@ fn worker_loop_v2(
                     )?;
                     validate_v2_stream_timing(&mut stream_timing, &decoded)?;
                     for row in &decoded.row_metadata {
-                        validator.observe_with_table(stream_table, descriptor, *row);
+                        validator.observe_r1(descriptor, *row);
                     }
                     let diagnostics = validator.diagnostics().clone();
                     stats.row_sequence_gaps = diagnostics.row_sequence_gaps;
@@ -1276,7 +1388,12 @@ fn worker_loop_v2(
                     stats.causal_application_mismatch = diagnostics.causal_application_mismatch;
                     stats.causal_sequence_reorder = diagnostics.causal_sequence_reorder;
                     stats.causal_group_mismatch = diagnostics.causal_group_mismatch;
+                    stats.causal_cached_rows = diagnostics.causal_cached_rows;
+                    stats.causal_pending_matches = diagnostics.causal_pending_matches;
+                    stats.causal_match_timeouts = diagnostics.causal_match_timeouts;
                     stats.causal_cache_evictions = diagnostics.causal_cache_evictions;
+                    stats.causal_window_overflows = diagnostics.causal_window_overflows;
+                    stats.causal_duplicate_cycles = diagnostics.causal_duplicate_cycles;
                     stats.received_batches = stats.received_batches.saturating_add(1);
                     stats.received_samples = stats
                         .received_samples
@@ -1361,7 +1478,7 @@ fn worker_loop_v2(
                         }
                     }
                 }
-                MSG_CAPTURE_DATA => {
+                MSG_CAPTURE_DATA_R1 => {
                     let result: Result<(), SessionError> =
                         (|| {
                             let MessageV2::CaptureData(data) =
@@ -1461,7 +1578,7 @@ fn worker_loop_v2(
                     }
                     send_control(control_tx, SessionEvent::CaptureStatus(status))?;
                 }
-                super::protocol_v2::MSG_STREAM_TABLE => {
+                MSG_STREAM_TABLE_R1 => {
                     let MessageV2::StreamTable(table) =
                         MessageV2::decode(frame.message_type, &frame.payload)?
                     else {
@@ -1494,16 +1611,24 @@ fn worker_loop_v2(
                         unreachable!()
                     };
                     stats.last_pong_nonce = Some(nonce);
-                    if heartbeat_window.acknowledge(nonce) {
-                        stats.heartbeat_round_trip_count =
-                            stats.heartbeat_round_trip_count.saturating_add(1);
-                    } else {
-                        stats.protocol_errors = stats.protocol_errors.saturating_add(1);
-                        send_control(
-                            control_tx,
-                            SessionEvent::Error(format!("unexpected SCP1 V2 PONG nonce {nonce}")),
-                        )?;
+                    match heartbeat_window.acknowledge(nonce, Instant::now()) {
+                        HeartbeatAck::Matched(rtt) => {
+                            let rtt_ms = u64::try_from(rtt.as_millis()).unwrap_or(u64::MAX);
+                            stats.heartbeat_round_trip_count =
+                                stats.heartbeat_round_trip_count.saturating_add(1);
+                            stats.heartbeat_last_rtt_ms = rtt_ms;
+                            stats.heartbeat_max_rtt_ms = stats.heartbeat_max_rtt_ms.max(rtt_ms);
+                        }
+                        HeartbeatAck::Duplicate => {
+                            stats.heartbeat_duplicate_pong_count =
+                                stats.heartbeat_duplicate_pong_count.saturating_add(1);
+                        }
+                        HeartbeatAck::Unknown => {
+                            stats.heartbeat_unexpected_pong_count =
+                                stats.heartbeat_unexpected_pong_count.saturating_add(1);
+                        }
                     }
+                    stats.heartbeat_pending_count = heartbeat_window.pending_count();
                     let _ = data_tx.try_send(SessionEvent::Stats(stats));
                 }
                 super::protocol::MSG_ERROR => {
@@ -1520,6 +1645,722 @@ fn worker_loop_v2(
             }
         }
     }
+}
+
+fn worker_loop_v2_r2(
+    config: TransportConfig,
+    command_rx: &Receiver<SessionCommand>,
+    control_tx: &Sender<SessionEvent>,
+    data_tx: &Sender<SessionEvent>,
+    disconnect_requested: &AtomicBool,
+) -> Result<(), SessionError> {
+    let mut transport = config.connect()?;
+    send_control(
+        control_tx,
+        SessionEvent::State(ConnectionState::Handshaking),
+    )?;
+    let mut out_sequence = 1_u32;
+    write_common_v2(
+        &mut transport,
+        &mut out_sequence,
+        0,
+        Message::Hello(Hello {
+            client_capabilities: 0b111
+                | CAPABILITY_V2_STREAMS_R2
+                | CAPABILITY_V2_MULTI_STREAM
+                | CAPABILITY_V2_COMPRESSED_METADATA
+                | CAPABILITY_V2_HARDWARE_CAPTURE_R2,
+            max_payload: MAX_PAYLOAD_LEN as u32,
+            client_name: "ScopeAnalyzer V2 R2".to_owned(),
+        }),
+    )?;
+
+    let mut decoder = FrameDecoder::default();
+    let mut read_buffer = [0_u8; 16 * 1024];
+    let mut session_id = 0_u32;
+    let mut rejected_session_ids = HashSet::new();
+    let mut hello_ack: Option<HelloAck> = None;
+    let mut channels: Option<ChannelTable> = None;
+    let mut streams: Option<StreamTableR2> = None;
+    let mut subscriptions: Option<ConfigureStreamsR2> = None;
+    let mut pending = HashMap::new();
+    let mut validator = SnapshotValidator::default();
+    let mut capture: Option<CaptureAssemblerR2> = None;
+    let mut stats = SessionStats::default();
+    let mut streaming = false;
+    let mut resetting = false;
+    let mut last_received = Instant::now();
+    let mut last_ping = Instant::now();
+    let mut ping_nonce = 1_u64;
+    let mut heartbeat_window = HeartbeatWindow::new(HEARTBEAT_NONCE_WINDOW);
+    let mut stream_timing: HashMap<u16, StreamTiming> = HashMap::new();
+
+    loop {
+        while let Ok(command) = command_rx.try_recv() {
+            match command {
+                SessionCommand::ConfigureStreamsR2(configure) => {
+                    if resetting || session_id == 0 {
+                        return Err(SessionError::Acquisition(
+                            "R2 subscriptions cannot be configured before handshake".to_owned(),
+                        ));
+                    }
+                    let sequence = write_v2_r2_message(
+                        &mut transport,
+                        &mut out_sequence,
+                        session_id,
+                        MessageV2R2::ConfigureStreams(configure.clone()),
+                    )?;
+                    pending.insert(sequence, PendingCommand::ConfigureStreamsR2(configure));
+                    send_control(
+                        control_tx,
+                        SessionEvent::State(ConnectionState::Configuring),
+                    )?;
+                }
+                SessionCommand::ConfigureStream(_) => {
+                    return Err(SessionError::Acquisition(
+                        "SCP1 V2 R1 CONFIGURE_STREAM sent to an R2 session".to_owned(),
+                    ));
+                }
+                SessionCommand::Start => {
+                    if subscriptions.is_none() {
+                        return Err(SessionError::Acquisition(
+                            "R2 START requires an accepted atomic subscription set".to_owned(),
+                        ));
+                    }
+                    let sequence = write_common_v2(
+                        &mut transport,
+                        &mut out_sequence,
+                        session_id,
+                        Message::Start,
+                    )?;
+                    pending.insert(sequence, PendingCommand::Start);
+                }
+                SessionCommand::Stop => {
+                    let sequence = write_common_v2(
+                        &mut transport,
+                        &mut out_sequence,
+                        session_id,
+                        Message::Stop,
+                    )?;
+                    pending.insert(sequence, PendingCommand::Stop);
+                }
+                SessionCommand::Ping(nonce) => {
+                    write_common_v2(
+                        &mut transport,
+                        &mut out_sequence,
+                        session_id,
+                        Message::Ping(nonce),
+                    )?;
+                    record_heartbeat(&mut heartbeat_window, &mut stats, nonce);
+                }
+                SessionCommand::ArmCapture(value) => {
+                    write_v2_message(
+                        &mut transport,
+                        &mut out_sequence,
+                        session_id,
+                        MessageV2::ArmCapture(value),
+                    )?;
+                }
+                SessionCommand::ManualTrigger(value) => {
+                    write_v2_message(
+                        &mut transport,
+                        &mut out_sequence,
+                        session_id,
+                        MessageV2::ManualTrigger(value),
+                    )?;
+                }
+                SessionCommand::CancelCapture(value) => {
+                    write_v2_message(
+                        &mut transport,
+                        &mut out_sequence,
+                        session_id,
+                        MessageV2::CancelCapture(value),
+                    )?;
+                }
+                SessionCommand::Configure(_, _)
+                | SessionCommand::SetTriggerConfig(_)
+                | SessionCommand::ArmTrigger
+                | SessionCommand::SetRecording(_, _) => {
+                    return Err(SessionError::Acquisition(
+                        "SCP1 V1 command sent to a V2 R2 session".to_owned(),
+                    ));
+                }
+                SessionCommand::Disconnect => {
+                    if streaming {
+                        let _ = write_common_v2(
+                            &mut transport,
+                            &mut out_sequence,
+                            session_id,
+                            Message::Stop,
+                        );
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        if disconnect_requested.load(Ordering::Acquire) {
+            if streaming {
+                let _ =
+                    write_common_v2(&mut transport, &mut out_sequence, session_id, Message::Stop);
+            }
+            return Ok(());
+        }
+        if session_id != 0 && last_received.elapsed() >= Duration::from_secs(3) {
+            return Err(SessionError::Acquisition(
+                "no valid SCP1 V2 R2 frame received for 3 seconds".to_owned(),
+            ));
+        }
+        let expired = heartbeat_window.expire(Instant::now());
+        if expired != 0 {
+            stats.heartbeat_timeout_count = stats.heartbeat_timeout_count.saturating_add(expired);
+            stats.heartbeat_pending_count = heartbeat_window.pending_count();
+            let _ = data_tx.try_send(SessionEvent::Stats(stats));
+        }
+        if session_id != 0 && !resetting && last_ping.elapsed() >= Duration::from_secs(1) {
+            write_common_v2(
+                &mut transport,
+                &mut out_sequence,
+                session_id,
+                Message::Ping(ping_nonce),
+            )?;
+            record_heartbeat(&mut heartbeat_window, &mut stats, ping_nonce);
+            ping_nonce = ping_nonce.wrapping_add(1);
+            last_ping = Instant::now();
+        }
+
+        match transport.read(&mut read_buffer) {
+            Ok(0) => return Ok(()),
+            Ok(count) => decoder.push(&read_buffer[..count]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let decoder_stats = decoder.stats();
+        stats.crc_errors = decoder_stats.crc_errors;
+        stats.malformed_headers = decoder_stats.malformed_headers;
+        stats.discarded_bytes = decoder_stats.discarded_bytes;
+
+        for frame in decoder.drain_frames() {
+            if frame.version != PROTOCOL_VERSION_V2 {
+                stats.protocol_errors = stats.protocol_errors.saturating_add(1);
+                continue;
+            }
+            if rejected_session_ids.contains(&frame.session_id) {
+                stats.protocol_errors = stats.protocol_errors.saturating_add(1);
+                continue;
+            }
+            if session_id != 0 && frame.session_id != session_id {
+                stats.protocol_errors = stats.protocol_errors.saturating_add(1);
+                continue;
+            }
+            last_received = Instant::now();
+            stats.received_frames = stats.received_frames.saturating_add(1);
+
+            match frame.message_type {
+                super::protocol::MSG_HELLO_ACK => {
+                    let Message::HelloAck(hello) =
+                        Message::decode(frame.message_type, &frame.payload)?
+                    else {
+                        unreachable!()
+                    };
+                    let required = CAPABILITY_V2_STREAMS_R2
+                        | CAPABILITY_V2_MULTI_STREAM
+                        | CAPABILITY_V2_COMPRESSED_METADATA;
+                    if frame.session_id == 0
+                        || hello.device_capabilities & required != required
+                        || rejected_session_ids.contains(&frame.session_id)
+                    {
+                        return Err(SessionError::Acquisition(
+                            "peer did not negotiate the frozen SCP1 V2 R2 capabilities".to_owned(),
+                        ));
+                    }
+                    if resetting && frame.session_id == session_id {
+                        return Err(SessionError::Acquisition(
+                            "DeviceReset HELLO_ACK did not allocate a new session id".to_owned(),
+                        ));
+                    }
+                    session_id = frame.session_id;
+                    stats.session_id = session_id;
+                    hello_ack = Some(hello.clone());
+                    resetting = false;
+                    send_control(control_tx, SessionEvent::HelloAck(hello))?;
+                    send_control(control_tx, SessionEvent::Stats(stats))?;
+                }
+                super::protocol::MSG_CHANNEL_TABLE => {
+                    let Message::ChannelTable(table) =
+                        Message::decode(frame.message_type, &frame.payload)?
+                    else {
+                        unreachable!()
+                    };
+                    let hello = hello_ack.as_ref().ok_or_else(|| {
+                        SessionError::Acquisition(
+                            "R2 CHANNEL_TABLE arrived before HELLO_ACK".to_owned(),
+                        )
+                    })?;
+                    if usize::from(hello.channel_count) != table.channels.len() {
+                        return Err(SessionError::Acquisition(
+                            "R2 CHANNEL_TABLE count disagrees with HELLO_ACK".to_owned(),
+                        ));
+                    }
+                    channels = Some(table.clone());
+                    send_control(control_tx, SessionEvent::ChannelTable(table))?;
+                }
+                MSG_STREAM_TABLE_R2 => {
+                    let MessageV2R2::StreamTable(table) =
+                        MessageV2R2::decode(frame.message_type, &frame.payload)?
+                    else {
+                        unreachable!()
+                    };
+                    let channel_table = channels.as_ref().ok_or_else(|| {
+                        SessionError::Acquisition(
+                            "STREAM_TABLE_R2 arrived before CHANNEL_TABLE".to_owned(),
+                        )
+                    })?;
+                    table.validate_against_channels(channel_table)?;
+                    if streams
+                        .as_ref()
+                        .is_some_and(|previous| previous.revision != table.revision)
+                    {
+                        validator.reset();
+                        stream_timing.clear();
+                    }
+                    streams = Some(table.clone());
+                    send_control(control_tx, SessionEvent::StreamTableR2(table))?;
+                    send_control(control_tx, SessionEvent::State(ConnectionState::Ready))?;
+                }
+                super::protocol::MSG_COMMAND_RESULT => {
+                    let Message::CommandResult(result) =
+                        Message::decode(frame.message_type, &frame.payload)?
+                    else {
+                        unreachable!()
+                    };
+                    if let Some(command) = pending.remove(&result.request_sequence) {
+                        if result.result_code == ResultCode::Ok {
+                            match command {
+                                PendingCommand::ConfigureStreamsR2(configure) => {
+                                    subscriptions = Some(configure.clone());
+                                    send_control(
+                                        control_tx,
+                                        SessionEvent::ConfiguredV2R2(configure),
+                                    )?;
+                                    send_control(
+                                        control_tx,
+                                        SessionEvent::State(ConnectionState::Ready),
+                                    )?;
+                                }
+                                PendingCommand::Start => {
+                                    streaming = true;
+                                    send_control(
+                                        control_tx,
+                                        SessionEvent::State(ConnectionState::Streaming),
+                                    )?;
+                                }
+                                PendingCommand::Stop => {
+                                    streaming = false;
+                                    send_control(
+                                        control_tx,
+                                        SessionEvent::State(ConnectionState::Ready),
+                                    )?;
+                                }
+                                PendingCommand::Configure(_, _)
+                                | PendingCommand::ConfigureStream(_) => {}
+                            }
+                        } else if matches!(command, PendingCommand::ConfigureStreamsR2(_)) {
+                            send_control(control_tx, SessionEvent::State(ConnectionState::Ready))?;
+                        }
+                    }
+                    send_control(control_tx, SessionEvent::CommandResult(result))?;
+                }
+                MSG_SAMPLE_BATCH_V2_R2 => {
+                    let channel_table = channels.as_ref().ok_or_else(|| {
+                        SessionError::Acquisition(
+                            "R2 sample arrived before CHANNEL_TABLE".to_owned(),
+                        )
+                    })?;
+                    let stream_table = streams.as_ref().ok_or_else(|| {
+                        SessionError::Acquisition(
+                            "R2 sample arrived before STREAM_TABLE_R2".to_owned(),
+                        )
+                    })?;
+                    let decoded =
+                        decode_stream_sample_frame_r2(&frame, channel_table, stream_table)?;
+                    let descriptor = stream_table.stream(decoded.stream_id).ok_or_else(|| {
+                        SessionError::Acquisition(
+                            "decoded R2 stream disappeared from STREAM_TABLE_R2".to_owned(),
+                        )
+                    })?;
+                    let hello = hello_ack.as_ref().ok_or_else(|| {
+                        SessionError::Acquisition("R2 sample arrived before HELLO_ACK".to_owned())
+                    })?;
+                    validate_stream_sample_period_r2(
+                        hello.tick_hz,
+                        descriptor,
+                        decoded.sample_period_ticks,
+                    )?;
+                    validate_v2_r2_stream_timing(&mut stream_timing, &decoded)?;
+                    for row in &decoded.row_metadata {
+                        validator
+                            .observe_with_table(stream_table, descriptor, *row)
+                            .map_err(SessionError::Acquisition)?;
+                    }
+                    let diagnostics = validator.diagnostics().clone();
+                    apply_snapshot_diagnostics(&mut stats, &diagnostics);
+                    stats.received_batches = stats.received_batches.saturating_add(1);
+                    stats.received_samples = stats
+                        .received_samples
+                        .saturating_add(decoded.row_metadata.len() as u64);
+                    let dropped_stream_id = decoded.stream_id;
+                    let dropped_first = decoded.first_row_sequence;
+                    let dropped_last = decoded
+                        .row_metadata
+                        .last()
+                        .map_or(dropped_first, |row| row.row_sequence);
+                    let dropped_rows = decoded.row_metadata.len() as u64;
+                    let snapshot_dropped =
+                        match data_tx.try_send(SessionEvent::SnapshotV2R2(decoded, diagnostics)) {
+                            Ok(()) => false,
+                            Err(TrySendError::Full(_)) => {
+                                stats.host_dropped_v2_batches =
+                                    stats.host_dropped_v2_batches.saturating_add(1);
+                                stats.host_dropped_v2_rows =
+                                    stats.host_dropped_v2_rows.saturating_add(dropped_rows);
+                                stats.v2_snapshot_queue_overruns =
+                                    stats.v2_snapshot_queue_overruns.saturating_add(1);
+                                stats.last_dropped_v2_stream_id = Some(dropped_stream_id);
+                                stats.last_dropped_v2_first_row = Some(dropped_first);
+                                stats.last_dropped_v2_last_row = Some(dropped_last);
+                                true
+                            }
+                            Err(TrySendError::Disconnected(_)) => return Ok(()),
+                        };
+                    update_stream_stats(
+                        &mut stats,
+                        dropped_stream_id,
+                        dropped_rows,
+                        snapshot_dropped,
+                        validator.diagnostics(),
+                    );
+                    if snapshot_dropped {
+                        send_control(control_tx, SessionEvent::Stats(stats))?;
+                    }
+                }
+                MSG_CAPTURE_BEGIN => {
+                    let result: Result<CaptureAssemblerR2, SessionError> = (|| {
+                        let MessageV2::CaptureBegin(begin) =
+                            MessageV2::decode(frame.message_type, &frame.payload)?
+                        else {
+                            unreachable!()
+                        };
+                        let stream_table = streams.as_ref().ok_or_else(|| {
+                            SessionError::Acquisition(
+                                "R2 CAPTURE_BEGIN arrived before STREAM_TABLE_R2".to_owned(),
+                            )
+                        })?;
+                        let descriptor = stream_table.stream(begin.stream_id).ok_or_else(|| {
+                            SessionError::Acquisition(
+                                "R2 CAPTURE_BEGIN references unknown stream".to_owned(),
+                            )
+                        })?;
+                        let mut assembler = CaptureAssemblerR2::default();
+                        assembler
+                            .begin_with_descriptor(begin, descriptor, stream_table.revision)
+                            .map_err(SessionError::Acquisition)?;
+                        Ok(assembler)
+                    })();
+                    match result {
+                        Ok(assembler) => capture = Some(assembler),
+                        Err(error) => {
+                            capture = None;
+                            report_capture_failure(
+                                control_tx,
+                                data_tx,
+                                &mut stats,
+                                error.to_string(),
+                            )?;
+                        }
+                    }
+                }
+                MSG_CAPTURE_DATA_R2 => {
+                    let result: Result<(), SessionError> = (|| {
+                        let MessageV2R2::CaptureData(data) =
+                            MessageV2R2::decode(frame.message_type, &frame.payload)?
+                        else {
+                            unreachable!()
+                        };
+                        let channel_table = channels.as_ref().ok_or_else(|| {
+                            SessionError::Acquisition(
+                                "R2 CAPTURE_DATA arrived before CHANNEL_TABLE".to_owned(),
+                            )
+                        })?;
+                        let stream_table = streams.as_ref().ok_or_else(|| {
+                            SessionError::Acquisition(
+                                "R2 CAPTURE_DATA arrived before STREAM_TABLE_R2".to_owned(),
+                            )
+                        })?;
+                        let nested = MessageV2R2::StreamSampleBatch(data.batch.clone())
+                            .into_frame(0, frame.sequence, session_id, frame.timestamp_ticks)?;
+                        let _ =
+                            decode_stream_sample_frame_r2(&nested, channel_table, stream_table)?;
+                        let encoded_payload: Arc<[u8]> = frame.payload.into();
+                        capture
+                            .as_mut()
+                            .ok_or_else(|| {
+                                SessionError::Acquisition(
+                                    "R2 CAPTURE_DATA arrived before CAPTURE_BEGIN".to_owned(),
+                                )
+                            })?
+                            .push_encoded_payload(data, encoded_payload)
+                            .map_err(SessionError::Acquisition)
+                    })();
+                    if let Err(error) = result {
+                        capture = None;
+                        report_capture_failure(control_tx, data_tx, &mut stats, error.to_string())?;
+                    }
+                }
+                MSG_CAPTURE_END => {
+                    let result: Result<AssembledCaptureR2, SessionError> = (|| {
+                        let MessageV2::CaptureEnd(end) =
+                            MessageV2::decode(frame.message_type, &frame.payload)?
+                        else {
+                            unreachable!()
+                        };
+                        let mut assembler = capture.take().ok_or_else(|| {
+                            SessionError::Acquisition(
+                                "R2 CAPTURE_END arrived before CAPTURE_BEGIN".to_owned(),
+                            )
+                        })?;
+                        assembler.finish(end).map_err(SessionError::Acquisition)
+                    })();
+                    capture = None;
+                    match result {
+                        Ok(assembled) => {
+                            send_control(control_tx, SessionEvent::CaptureCompleteR2(assembled))?
+                        }
+                        Err(error) => {
+                            report_capture_failure(
+                                control_tx,
+                                data_tx,
+                                &mut stats,
+                                error.to_string(),
+                            )?;
+                        }
+                    }
+                }
+                super::protocol_v2::MSG_CAPTURE_STATUS => {
+                    let MessageV2::CaptureStatus(status) =
+                        MessageV2::decode(frame.message_type, &frame.payload)?
+                    else {
+                        unreachable!()
+                    };
+                    if status.state == CaptureState::DeviceReset {
+                        let old_session_id = session_id;
+                        rejected_session_ids.insert(old_session_id);
+                        capture = None;
+                        validator.reset();
+                        stream_timing.clear();
+                        heartbeat_window.clear();
+                        pending.clear();
+                        subscriptions = None;
+                        channels = None;
+                        streams = None;
+                        hello_ack = None;
+                        streaming = false;
+                        resetting = true;
+                        session_id = 0;
+                        ping_nonce = 1;
+                        let reset_count = stats.device_reset_count.saturating_add(1);
+                        stats = SessionStats::default();
+                        stats.device_reset_count = reset_count;
+                        send_control(
+                            control_tx,
+                            SessionEvent::State(ConnectionState::DeviceResetHandshake),
+                        )?;
+                        send_control(
+                            control_tx,
+                            SessionEvent::Error("设备已复位，等待重新握手".to_owned()),
+                        )?;
+                    } else if matches!(
+                        status.state,
+                        CaptureState::Idle
+                            | CaptureState::Cancelled
+                            | CaptureState::Timeout
+                            | CaptureState::BufferOverrun
+                            | CaptureState::InvalidConfig
+                    ) {
+                        capture = None;
+                    }
+                    send_control(control_tx, SessionEvent::CaptureStatus(status))?;
+                }
+                super::protocol::MSG_PING => {
+                    let Message::Ping(nonce) = Message::decode(frame.message_type, &frame.payload)?
+                    else {
+                        unreachable!()
+                    };
+                    write_common_v2(
+                        &mut transport,
+                        &mut out_sequence,
+                        session_id,
+                        Message::Pong(nonce),
+                    )?;
+                }
+                super::protocol::MSG_PONG => {
+                    let Message::Pong(nonce) = Message::decode(frame.message_type, &frame.payload)?
+                    else {
+                        unreachable!()
+                    };
+                    apply_heartbeat_ack(&mut heartbeat_window, &mut stats, nonce, Instant::now());
+                    let _ = data_tx.try_send(SessionEvent::Stats(stats));
+                }
+                super::protocol::MSG_STATUS => {
+                    let Message::Status(status) =
+                        Message::decode(frame.message_type, &frame.payload)?
+                    else {
+                        unreachable!()
+                    };
+                    stats.device_dropped_samples = status.dropped_samples;
+                    stats.device_tx_overruns = u64::from(status.tx_overruns);
+                    stats.device_state = Some(status.state);
+                    let _ = data_tx.try_send(SessionEvent::Stats(stats));
+                }
+                super::protocol::MSG_ERROR => {
+                    let Message::Error(error) =
+                        Message::decode(frame.message_type, &frame.payload)?
+                    else {
+                        unreachable!()
+                    };
+                    send_control(control_tx, SessionEvent::Error(error.detail))?;
+                }
+                MSG_SAMPLE_BATCH_V2_R1
+                | MSG_STREAM_TABLE_R1
+                | super::protocol_v2::MSG_CONFIGURE_STREAM_R1
+                | MSG_CAPTURE_DATA_R1 => {
+                    stats.protocol_errors = stats.protocol_errors.saturating_add(1);
+                    send_control(
+                        control_tx,
+                        SessionEvent::Error(
+                            "SCP1 V2 R1 message received in an R2 session".to_owned(),
+                        ),
+                    )?;
+                }
+                _ => {
+                    stats.unknown_messages = stats.unknown_messages.saturating_add(1);
+                }
+            }
+        }
+    }
+}
+
+fn record_heartbeat(window: &mut HeartbeatWindow, stats: &mut SessionStats, nonce: u64) {
+    if window.record(nonce, Instant::now()) {
+        stats.heartbeat_window_overflow_count =
+            stats.heartbeat_window_overflow_count.saturating_add(1);
+    }
+    stats.heartbeat_pending_count = window.pending_count();
+}
+
+fn apply_heartbeat_ack(
+    window: &mut HeartbeatWindow,
+    stats: &mut SessionStats,
+    nonce: u64,
+    now: Instant,
+) {
+    stats.last_pong_nonce = Some(nonce);
+    match window.acknowledge(nonce, now) {
+        HeartbeatAck::Matched(rtt) => {
+            let rtt_ms = u64::try_from(rtt.as_millis()).unwrap_or(u64::MAX);
+            stats.heartbeat_round_trip_count = stats.heartbeat_round_trip_count.saturating_add(1);
+            stats.heartbeat_last_rtt_ms = rtt_ms;
+            stats.heartbeat_max_rtt_ms = stats.heartbeat_max_rtt_ms.max(rtt_ms);
+        }
+        HeartbeatAck::Duplicate => {
+            stats.heartbeat_duplicate_pong_count =
+                stats.heartbeat_duplicate_pong_count.saturating_add(1);
+        }
+        HeartbeatAck::Unknown => {
+            stats.heartbeat_unexpected_pong_count =
+                stats.heartbeat_unexpected_pong_count.saturating_add(1);
+        }
+    }
+    stats.heartbeat_pending_count = window.pending_count();
+}
+
+fn apply_snapshot_diagnostics(stats: &mut SessionStats, diagnostics: &SnapshotDiagnostics) {
+    stats.row_sequence_gaps = diagnostics.row_sequence_gaps;
+    stats.row_sequence_reorders = diagnostics.row_sequence_reorders;
+    stats.source_sequence_faults = diagnostics.source_sequence_faults;
+    stats.applied_sequence_faults = diagnostics.applied_sequence_faults;
+    stats.invalid_snapshot_rows = diagnostics.invalid_snapshot_rows;
+    stats.missing_causal_source = diagnostics.missing_causal_source;
+    stats.causal_source_mismatch = diagnostics.causal_source_mismatch;
+    stats.causal_application_mismatch = diagnostics.causal_application_mismatch;
+    stats.causal_sequence_reorder = diagnostics.causal_sequence_reorder;
+    stats.causal_group_mismatch = diagnostics.causal_group_mismatch;
+    stats.causal_cached_rows = diagnostics.causal_cached_rows;
+    stats.causal_pending_matches = diagnostics.causal_pending_matches;
+    stats.causal_match_timeouts = diagnostics.causal_match_timeouts;
+    stats.causal_cache_evictions = diagnostics.causal_cache_evictions;
+    stats.causal_window_overflows = diagnostics.causal_window_overflows;
+    stats.causal_duplicate_cycles = diagnostics.causal_duplicate_cycles;
+}
+
+fn update_stream_stats(
+    stats: &mut SessionStats,
+    stream_id: u16,
+    rows: u64,
+    dropped: bool,
+    diagnostics: &SnapshotDiagnostics,
+) {
+    let slot = stats
+        .stream_stats
+        .iter()
+        .position(|stream| stream.stream_id == stream_id)
+        .or_else(|| {
+            stats
+                .stream_stats
+                .iter()
+                .position(|stream| stream.stream_id == 0)
+        });
+    let Some(slot) = slot else {
+        return;
+    };
+    let stream = &mut stats.stream_stats[slot];
+    stream.stream_id = stream_id;
+    stream.received_batches = stream.received_batches.saturating_add(1);
+    stream.received_rows = stream.received_rows.saturating_add(rows);
+    if dropped {
+        stream.host_dropped_batches = stream.host_dropped_batches.saturating_add(1);
+        stream.host_dropped_rows = stream.host_dropped_rows.saturating_add(rows);
+    }
+    stream.row_sequence_gaps = diagnostics.row_sequence_gaps;
+    stream.row_sequence_reorders = diagnostics.row_sequence_reorders;
+    stream.logical_cycle_faults = diagnostics.logical_cycle_faults;
+}
+
+fn validate_stream_sample_period_r2(
+    tick_hz: u64,
+    descriptor: &super::protocol_v2_r2::StreamDescriptorR2,
+    sample_period_ticks: u32,
+) -> Result<(), SessionError> {
+    let rate = u64::from(descriptor.sample_rate_hz);
+    if tick_hz == 0 || !tick_hz.is_multiple_of(rate) {
+        return Err(SessionError::Acquisition(
+            "R2 tick_hz is not exactly divisible by the stream rate".to_owned(),
+        ));
+    }
+    let expected = tick_hz / rate;
+    if expected == 0 || expected > u64::from(u32::MAX) || u64::from(sample_period_ticks) != expected
+    {
+        return Err(SessionError::Acquisition(
+            "R2 sample period does not match the frozen stream rate".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1590,6 +2431,64 @@ fn validate_v2_stream_timing(
     Ok(())
 }
 
+fn validate_v2_r2_stream_timing(
+    timing: &mut HashMap<u16, StreamTiming>,
+    batch: &DecodedStreamSampleBatchR2,
+) -> Result<(), SessionError> {
+    let row_count = u64::try_from(batch.row_metadata.len()).map_err(|_| {
+        SessionError::Acquisition("R2 stream row count does not fit u64".to_owned())
+    })?;
+    let last_offset = u64::from(batch.sample_period_ticks)
+        .checked_mul(row_count.saturating_sub(1))
+        .ok_or_else(|| SessionError::Acquisition("R2 sample timestamp overflow".to_owned()))?;
+    let last_timestamp = batch
+        .timestamp_ticks
+        .checked_add(last_offset)
+        .ok_or_else(|| SessionError::Acquisition("R2 sample timestamp overflow".to_owned()))?;
+    let last_row_sequence = batch
+        .row_metadata
+        .last()
+        .map(|row| row.row_sequence)
+        .ok_or_else(|| SessionError::Acquisition("R2 stream batch has no rows".to_owned()))?;
+    if let Some(previous) = timing.get(&batch.stream_id) {
+        if previous.sample_period_ticks != batch.sample_period_ticks {
+            return Err(SessionError::Acquisition(format!(
+                "R2 stream {} changed sample_period_ticks",
+                batch.stream_id
+            )));
+        }
+        let row_delta = batch
+            .first_row_sequence
+            .checked_sub(previous.last_row_sequence)
+            .filter(|delta| *delta != 0)
+            .ok_or_else(|| {
+                SessionError::Acquisition(format!(
+                    "R2 stream {} row_sequence is not strictly increasing",
+                    batch.stream_id
+                ))
+            })?;
+        let expected_timestamp = u64::from(batch.sample_period_ticks)
+            .checked_mul(row_delta)
+            .and_then(|delta| previous.last_timestamp_ticks.checked_add(delta))
+            .ok_or_else(|| SessionError::Acquisition("R2 sample timestamp overflow".to_owned()))?;
+        if batch.timestamp_ticks != expected_timestamp {
+            return Err(SessionError::Acquisition(format!(
+                "R2 stream {} timestamp does not correspond to row_sequence",
+                batch.stream_id
+            )));
+        }
+    }
+    timing.insert(
+        batch.stream_id,
+        StreamTiming {
+            sample_period_ticks: batch.sample_period_ticks,
+            last_row_sequence,
+            last_timestamp_ticks: last_timestamp,
+        },
+    );
+    Ok(())
+}
+
 fn report_capture_failure(
     control_tx: &Sender<SessionEvent>,
     data_tx: &Sender<SessionEvent>,
@@ -1627,6 +2526,20 @@ fn write_v2_message(
     next_sequence: &mut u32,
     session_id: u32,
     message: MessageV2,
+) -> Result<u32, SessionError> {
+    let sequence = *next_sequence;
+    let frame = message.into_frame(0, sequence, session_id, 0)?;
+    transport.write_all(&frame.encode()?)?;
+    transport.flush()?;
+    *next_sequence = next_sequence.wrapping_add(1);
+    Ok(sequence)
+}
+
+fn write_v2_r2_message(
+    transport: &mut TransportStream,
+    next_sequence: &mut u32,
+    session_id: u32,
+    message: MessageV2R2,
 ) -> Result<u32, SessionError> {
     let sequence = *next_sequence;
     let frame = message.into_frame(0, sequence, session_id, 0)?;
@@ -1770,17 +2683,91 @@ mod tests {
     fn heartbeat_window_accepts_multiple_out_of_order_pongs_and_is_bounded() {
         let now = Instant::now();
         let mut window = HeartbeatWindow::new(2);
-        assert_eq!(window.record(10, now), 0);
-        assert_eq!(window.record(11, now + Duration::from_millis(1)), 0);
-        assert!(window.acknowledge(11));
-        assert!(window.acknowledge(10));
+        assert!(!window.record(10, now));
+        assert!(!window.record(11, now + Duration::from_millis(1)));
+        assert!(matches!(
+            window.acknowledge(11, now + Duration::from_millis(2)),
+            HeartbeatAck::Matched(_)
+        ));
+        assert!(matches!(
+            window.acknowledge(10, now + Duration::from_millis(3)),
+            HeartbeatAck::Matched(_)
+        ));
+        assert_eq!(
+            window.acknowledge(10, now + Duration::from_millis(4)),
+            HeartbeatAck::Duplicate
+        );
 
-        assert_eq!(window.record(20, now), 0);
-        assert_eq!(window.record(21, now + Duration::from_millis(1)), 0);
-        assert_eq!(window.record(22, now + Duration::from_millis(2)), 1);
-        assert!(!window.acknowledge(20));
-        assert!(window.acknowledge(21));
-        assert!(window.acknowledge(22));
+        assert!(!window.record(20, now));
+        assert!(!window.record(21, now + Duration::from_millis(1)));
+        assert!(window.record(22, now + Duration::from_millis(2)));
+        assert_eq!(
+            window.acknowledge(20, now + Duration::from_millis(3)),
+            HeartbeatAck::Unknown
+        );
+        assert!(matches!(
+            window.acknowledge(21, now + Duration::from_millis(3)),
+            HeartbeatAck::Matched(_)
+        ));
+        assert!(matches!(
+            window.acknowledge(22, now + Duration::from_millis(3)),
+            HeartbeatAck::Matched(_)
+        ));
+    }
+
+    #[test]
+    fn heartbeat_timeout_rtt_unknown_duplicate_and_reset_are_independent() {
+        let now = Instant::now();
+        let mut window = HeartbeatWindow::new(8);
+        let mut stats = SessionStats::default();
+        assert!(!window.record(1, now));
+        assert_eq!(window.expire(now + Duration::from_millis(2_999)), 0);
+        apply_heartbeat_ack(
+            &mut window,
+            &mut stats,
+            1,
+            now + Duration::from_millis(1_250),
+        );
+        assert_eq!(stats.heartbeat_round_trip_count, 1);
+        assert_eq!(stats.heartbeat_last_rtt_ms, 1_250);
+        assert_eq!(stats.heartbeat_max_rtt_ms, 1_250);
+        apply_heartbeat_ack(
+            &mut window,
+            &mut stats,
+            1,
+            now + Duration::from_millis(1_500),
+        );
+        apply_heartbeat_ack(
+            &mut window,
+            &mut stats,
+            99,
+            now + Duration::from_millis(1_500),
+        );
+        assert_eq!(stats.heartbeat_duplicate_pong_count, 1);
+        assert_eq!(stats.heartbeat_unexpected_pong_count, 1);
+
+        assert!(!window.record(2, now));
+        assert_eq!(window.expire(now + Duration::from_secs(3)), 1);
+        assert_eq!(window.pending_count(), 0);
+        window.record(3, now);
+        window.clear();
+        assert_eq!(window.pending_count(), 0);
+        assert_eq!(window.acknowledge(3, now), HeartbeatAck::Unknown);
+    }
+
+    #[test]
+    fn heartbeat_window_overflow_is_not_reported_as_timeout() {
+        let mut window = HeartbeatWindow::new(1);
+        let mut stats = SessionStats::default();
+        record_heartbeat(&mut window, &mut stats, 10);
+        record_heartbeat(&mut window, &mut stats, 11);
+        assert_eq!(stats.heartbeat_window_overflow_count, 1);
+        assert_eq!(stats.heartbeat_timeout_count, 0);
+        assert_eq!(stats.protocol_errors, 0);
+        assert_eq!(stats.heartbeat_pending_count, 1);
+        apply_heartbeat_ack(&mut window, &mut stats, 11, Instant::now());
+        assert_eq!(stats.heartbeat_round_trip_count, 1);
+        assert_eq!(stats.heartbeat_pending_count, 0);
     }
 
     #[test]
@@ -1847,12 +2834,12 @@ mod tests {
         let simulator = SimulatorHandle::spawn(SimulatorConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             accelerated: true,
-            protocol: SimulatorProtocol::V2,
+            protocol: SimulatorProtocol::V2R1,
             preset: Some(V2Preset::Normal30k),
             ..SimulatorConfig::default()
         })
         .unwrap();
-        let session = LiveSession::connect_v2(TransportConfig::Tcp {
+        let session = LiveSession::connect_v2_r1(TransportConfig::Tcp {
             address: simulator.address().to_string(),
         })
         .unwrap();
@@ -1885,16 +2872,326 @@ mod tests {
     }
 
     #[test]
+    fn v2_r2_simulator_atomically_runs_three_independent_streams() {
+        let simulator = SimulatorHandle::spawn(SimulatorConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            accelerated: false,
+            protocol: SimulatorProtocol::V2R2,
+            preset: Some(V2Preset::CausalInOrder30k),
+            ..SimulatorConfig::default()
+        })
+        .unwrap();
+        let session = LiveSession::connect_v2_r2(TransportConfig::Tcp {
+            address: simulator.address().to_string(),
+        })
+        .unwrap();
+        let table = wait_for(&session, Duration::from_secs(2), |event| {
+            matches!(event, SessionEvent::StreamTableR2(_))
+        });
+        let SessionEvent::StreamTableR2(table) = table else {
+            unreachable!()
+        };
+        assert_eq!(
+            table
+                .streams
+                .iter()
+                .map(|stream| (stream.stream_id, stream.logical_cycle_step))
+                .collect::<Vec<_>>(),
+            vec![(1, 1), (2, 4), (3, 32)]
+        );
+        let subscriptions = table
+            .streams
+            .iter()
+            .map(|stream| StreamSubscriptionR2 {
+                stream_id: stream.stream_id,
+                batch_samples: match stream.stream_id {
+                    1 => 32,
+                    2 => 8,
+                    _ => 1,
+                },
+                channel_mask: stream
+                    .channel_ids
+                    .iter()
+                    .fold(0_u64, |mask, id| mask | (1_u64 << id)),
+            })
+            .collect();
+        session
+            .configure_streams_r2(ConfigureStreamsR2 {
+                transaction_id: 1,
+                subscriptions,
+            })
+            .unwrap();
+        wait_for(&session, Duration::from_secs(2), |event| {
+            matches!(event, SessionEvent::ConfiguredV2R2(_))
+        });
+        session
+            .configure_streams_r2(ConfigureStreamsR2 {
+                transaction_id: 2,
+                subscriptions: vec![StreamSubscriptionR2 {
+                    stream_id: 2,
+                    batch_samples: 8,
+                    channel_mask: 1,
+                }],
+            })
+            .unwrap();
+        let rejected = wait_for(&session, Duration::from_secs(2), |event| {
+            matches!(
+                event,
+                SessionEvent::CommandResult(result)
+                    if result.result_code == crate::live::protocol::ResultCode::InvalidArgument
+            )
+        });
+        assert!(matches!(rejected, SessionEvent::CommandResult(_)));
+        session.start().unwrap();
+        let mut observed = HashSet::new();
+        while observed.len() != 3 {
+            let event = wait_for(&session, Duration::from_secs(2), |event| {
+                matches!(event, SessionEvent::SnapshotV2R2(_, _))
+            });
+            let SessionEvent::SnapshotV2R2(batch, diagnostics) = event else {
+                unreachable!()
+            };
+            let descriptor = table.stream(batch.stream_id).unwrap();
+            assert_eq!(
+                batch.row_metadata[0].logical_cycle_sequence,
+                batch.row_metadata[0].row_sequence * u64::from(descriptor.logical_cycle_step)
+            );
+            assert_eq!(diagnostics.causal_match_timeouts, 0);
+            assert_eq!(diagnostics.causal_window_overflows, 0);
+            observed.insert(batch.stream_id);
+        }
+        session.stop().unwrap();
+        session.disconnect().unwrap();
+    }
+
+    #[test]
+    fn v2_r2_device_reset_allocates_a_new_idle_session() {
+        let simulator = SimulatorHandle::spawn(SimulatorConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            accelerated: true,
+            protocol: SimulatorProtocol::V2R2,
+            preset: Some(V2Preset::DeviceReset30k),
+            ..SimulatorConfig::default()
+        })
+        .unwrap();
+        let session = LiveSession::connect_v2_r2(TransportConfig::Tcp {
+            address: simulator.address().to_string(),
+        })
+        .unwrap();
+        wait_for(&session, Duration::from_secs(2), |event| {
+            matches!(event, SessionEvent::StreamTableR2(_))
+        });
+        session
+            .arm_capture(ArmCapture {
+                capture_id: 99,
+                stream_id: 1,
+                pretrigger_rows: 1,
+                posttrigger_rows: 1,
+                timeout_samples: 64,
+                trigger: CaptureTrigger {
+                    kind: CaptureTriggerKind::Manual,
+                    channel_id: 0,
+                    level: 0.0,
+                    edge: CaptureEdge::Rising,
+                    hysteresis: 0.0,
+                    flag_mask: 0,
+                    flag_value: 0,
+                },
+            })
+            .unwrap();
+        wait_for(&session, Duration::from_secs(2), |event| {
+            matches!(
+                event,
+                SessionEvent::State(ConnectionState::DeviceResetHandshake)
+            )
+        });
+        wait_for(&session, Duration::from_secs(2), |event| {
+            matches!(event, SessionEvent::StreamTableR2(_))
+        });
+        let stats = wait_for(
+            &session,
+            Duration::from_secs(2),
+            |event| matches!(event, SessionEvent::Stats(stats) if stats.session_id == 2),
+        );
+        let SessionEvent::Stats(stats) = stats else {
+            unreachable!()
+        };
+        assert_eq!(stats.device_reset_count, 1);
+        assert!(
+            stats.protocol_errors >= 1,
+            "stale session frame was rejected"
+        );
+        assert_eq!(stats.heartbeat_pending_count, 0);
+        assert_eq!(simulator.stats().configure_requests, 0);
+        assert_eq!(simulator.stats().start_requests, 0);
+        session.disconnect().unwrap();
+    }
+
+    #[test]
+    fn v2_r2_capture_failure_keeps_session_and_second_arm_succeeds() {
+        let simulator = SimulatorHandle::spawn(SimulatorConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            accelerated: true,
+            protocol: SimulatorProtocol::V2R2,
+            preset: Some(V2Preset::CaptureChunkLoss30k),
+            ..SimulatorConfig::default()
+        })
+        .unwrap();
+        let session = LiveSession::connect_v2_r2(TransportConfig::Tcp {
+            address: simulator.address().to_string(),
+        })
+        .unwrap();
+        wait_for(&session, Duration::from_secs(2), |event| {
+            matches!(event, SessionEvent::StreamTableR2(_))
+        });
+        for capture_id in [1, 2] {
+            session
+                .arm_capture(ArmCapture {
+                    capture_id,
+                    stream_id: 1,
+                    pretrigger_rows: 1,
+                    posttrigger_rows: 1,
+                    timeout_samples: 64,
+                    trigger: CaptureTrigger {
+                        kind: CaptureTriggerKind::Manual,
+                        channel_id: 0,
+                        level: 0.0,
+                        edge: CaptureEdge::Rising,
+                        hysteresis: 0.0,
+                        flag_mask: 0,
+                        flag_value: 0,
+                    },
+                })
+                .unwrap();
+            if capture_id == 1 {
+                wait_for(&session, Duration::from_secs(2), |event| {
+                    matches!(event, SessionEvent::CaptureFailure(_))
+                });
+            } else {
+                let event = wait_for(&session, Duration::from_secs(2), |event| {
+                    matches!(event, SessionEvent::CaptureCompleteR2(_))
+                });
+                let SessionEvent::CaptureCompleteR2(capture) = event else {
+                    unreachable!()
+                };
+                assert!(capture.diagnostics.capture_complete);
+                assert_eq!(capture.blocks.len(), 2);
+            }
+        }
+        session.disconnect().unwrap();
+    }
+
+    #[test]
+    fn v2_r2_causal_presets_have_deterministic_end_to_end_diagnostics() {
+        let presets = [
+            (V2Preset::CausalInOrder30k, false, false),
+            (V2Preset::CausalResultFirst30k, false, false),
+            (V2Preset::CausalApplicationFirst30k, false, false),
+            (V2Preset::CausalNonzeroOffset30k, false, false),
+            (V2Preset::CausalNegativeOffset30k, false, false),
+            (V2Preset::CausalSourceTimeout30k, true, false),
+            (V2Preset::CausalDuplicateCycle30k, false, true),
+            (V2Preset::CausalWatermarkEviction30k, true, false),
+        ];
+        for (preset, expect_timeout, expect_duplicate) in presets {
+            let simulator = SimulatorHandle::spawn(SimulatorConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                accelerated: false,
+                protocol: SimulatorProtocol::V2R2,
+                preset: Some(preset),
+                ..SimulatorConfig::default()
+            })
+            .unwrap();
+            let session = LiveSession::connect_v2_r2(TransportConfig::Tcp {
+                address: simulator.address().to_string(),
+            })
+            .unwrap();
+            let event = wait_for(&session, Duration::from_secs(2), |event| {
+                matches!(event, SessionEvent::StreamTableR2(_))
+            });
+            let SessionEvent::StreamTableR2(table) = event else {
+                unreachable!()
+            };
+            let subscriptions = table
+                .streams
+                .iter()
+                .map(|stream| StreamSubscriptionR2 {
+                    stream_id: stream.stream_id,
+                    batch_samples: match stream.stream_id {
+                        1 => 32,
+                        2 => 8,
+                        _ => 1,
+                    },
+                    channel_mask: stream
+                        .channel_ids
+                        .iter()
+                        .fold(0_u64, |mask, id| mask | (1_u64 << id)),
+                })
+                .collect();
+            session
+                .configure_streams_r2(ConfigureStreamsR2 {
+                    transaction_id: 7,
+                    subscriptions,
+                })
+                .unwrap();
+            wait_for(&session, Duration::from_secs(2), |event| {
+                matches!(event, SessionEvent::ConfiguredV2R2(_))
+            });
+            session.start().unwrap();
+            let mut latest = SnapshotDiagnostics::default();
+            for _ in 0..36 {
+                let event = wait_for(&session, Duration::from_secs(2), |event| {
+                    matches!(event, SessionEvent::SnapshotV2R2(_, _))
+                });
+                let SessionEvent::SnapshotV2R2(_, diagnostics) = event else {
+                    unreachable!()
+                };
+                latest = diagnostics;
+                if (expect_timeout && latest.causal_match_timeouts > 0)
+                    || (expect_duplicate && latest.causal_duplicate_cycles > 0)
+                {
+                    break;
+                }
+            }
+            assert_eq!(
+                latest.causal_source_mismatch,
+                0,
+                "unexpected source mismatch for {}",
+                preset.name()
+            );
+            assert_eq!(
+                latest.causal_application_mismatch,
+                0,
+                "unexpected application mismatch for {}",
+                preset.name()
+            );
+            assert_eq!(
+                latest.causal_match_timeouts > 0,
+                expect_timeout,
+                "timeout result for {}",
+                preset.name()
+            );
+            assert_eq!(
+                latest.causal_duplicate_cycles > 0,
+                expect_duplicate,
+                "duplicate result for {}",
+                preset.name()
+            );
+            session.disconnect().unwrap();
+        }
+    }
+
+    #[test]
     fn v2_manual_capture_is_assembled_in_memory() {
         let simulator = SimulatorHandle::spawn(SimulatorConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             accelerated: true,
-            protocol: SimulatorProtocol::V2,
+            protocol: SimulatorProtocol::V2R1,
             preset: Some(V2Preset::CaptureManual30k),
             ..SimulatorConfig::default()
         })
         .unwrap();
-        let session = LiveSession::connect_v2(TransportConfig::Tcp {
+        let session = LiveSession::connect_v2_r1(TransportConfig::Tcp {
             address: simulator.address().to_string(),
         })
         .unwrap();
@@ -2281,12 +3578,12 @@ mod tests {
     fn v2_exchanges_heartbeats_and_applies_status_statistics() {
         let simulator = SimulatorHandle::spawn(SimulatorConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
-            protocol: SimulatorProtocol::V2,
+            protocol: SimulatorProtocol::V2R1,
             preset: Some(V2Preset::Normal30k),
             ..SimulatorConfig::default()
         })
         .unwrap();
-        let session = LiveSession::connect_v2(TransportConfig::Tcp {
+        let session = LiveSession::connect_v2_r1(TransportConfig::Tcp {
             address: simulator.address().to_string(),
         })
         .unwrap();
@@ -2318,12 +3615,12 @@ mod tests {
         let simulator = SimulatorHandle::spawn(SimulatorConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             accelerated: true,
-            protocol: SimulatorProtocol::V2,
+            protocol: SimulatorProtocol::V2R1,
             preset: Some(V2Preset::Normal30k),
             ..SimulatorConfig::default()
         })
         .unwrap();
-        let session = LiveSession::connect_v2(TransportConfig::Tcp {
+        let session = LiveSession::connect_v2_r1(TransportConfig::Tcp {
             address: simulator.address().to_string(),
         })
         .unwrap();
@@ -2385,12 +3682,12 @@ mod tests {
             let simulator = SimulatorHandle::spawn(SimulatorConfig {
                 listen: "127.0.0.1:0".parse().unwrap(),
                 accelerated: true,
-                protocol: SimulatorProtocol::V2,
+                protocol: SimulatorProtocol::V2R1,
                 preset: Some(preset),
                 ..SimulatorConfig::default()
             })
             .unwrap();
-            let session = LiveSession::connect_v2(TransportConfig::Tcp {
+            let session = LiveSession::connect_v2_r1(TransportConfig::Tcp {
                 address: simulator.address().to_string(),
             })
             .unwrap();

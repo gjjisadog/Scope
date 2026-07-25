@@ -66,8 +66,8 @@ jobs:
       - name: Locate release artifacts
         run: |
           $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
-          $msi = Get-ChildItem -Path $dist -Recurse -File -Filter "ScopeAnalyzer-0.12.0-win-x64.msi" | Select-Object -First 1
-          $zip = Get-ChildItem -Path $dist -Recurse -File -Filter "ScopeAnalyzer-0.12.0-win-x64.zip" | Select-Object -First 1
+          $msi = Get-ChildItem -Path $dist -Recurse -File -Filter "ScopeAnalyzer-0.15.3-win-x64.msi" | Select-Object -First 1
+          $zip = Get-ChildItem -Path $dist -Recurse -File -Filter "ScopeAnalyzer-0.15.3-win-x64.zip" | Select-Object -First 1
           $evidence = Get-ChildItem -Path $dist -Recurse -File -Filter "release-evidence.json" | Select-Object -First 1
           if (-not $msi -or -not $zip -or -not $evidence) {
             throw "The administrator artifact must contain the MSI, ZIP, and release-evidence.json."

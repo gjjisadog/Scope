@@ -5,6 +5,7 @@ pub mod hardware_capture;
 pub mod hardware_smoke;
 pub mod protocol;
 pub mod protocol_v2;
+pub mod protocol_v2_r2;
 pub mod recording;
 pub mod scope_source;
 pub mod session;

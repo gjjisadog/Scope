@@ -12,8 +12,8 @@ use scope_analyzer::{
     live::{
         protocol_v2::{
             ArmCapture, CaptureEdge, CaptureTrigger, CaptureTriggerKind, ConfigureStream,
-            ManualTrigger,
         },
+        protocol_v2_r2::{ConfigureStreamsR2, MetadataEncodingR2, StreamSubscriptionR2},
         session::{LiveSession, SessionEvent},
         transport::TransportConfig,
     },
@@ -282,6 +282,11 @@ fn print_error_envelope(command: &'static str, code: &'static str, error: CliErr
 #[derive(Serialize)]
 struct V2DiagnosticReport {
     protocol_version: u8,
+    protocol_revision: String,
+    session_id: u32,
+    active_streams: Vec<u16>,
+    metadata_encoding: String,
+    estimated_link_utilization: f64,
     stream_id: u16,
     domain: String,
     capture_phase: String,
@@ -298,20 +303,41 @@ struct V2DiagnosticReport {
     causal_sequence_reorder: u64,
     causal_group_mismatch: u64,
     causal_cache_evictions: u64,
+    causal_cached_rows: usize,
+    causal_pending_matches: usize,
+    causal_match_timeouts: u64,
+    causal_window_overflows: u64,
+    causal_duplicate_cycles: u64,
+    heartbeat_pending_count: usize,
+    heartbeat_last_rtt_ms: u64,
+    heartbeat_max_rtt_ms: u64,
+    device_reset_count: u64,
     capture_complete: bool,
     capture_missing_chunks: u32,
     capture_duplicate_chunks: u32,
     capture_reordered_chunks: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiagnosticProtocol {
+    V2R1,
+    V2R2,
+}
+
 fn run_v2_diagnostic_command(raw_args: Vec<String>) -> ExitCode {
     let command = raw_args.first().map(String::as_str).unwrap_or("unknown");
     let parsed = parse_v2_diagnostic_args(&raw_args[1..]);
-    let result = parsed.and_then(|(address, stream_id, rows)| {
+    let result = parsed.and_then(|(address, stream_id, rows, protocol)| {
         if command == "live-inspect" {
-            inspect_v2_live(&address, stream_id, rows)
+            inspect_v2_live(&address, stream_id, rows, protocol)
         } else {
-            inspect_v2_capture(&address, stream_id, rows)
+            if protocol != DiagnosticProtocol::V2R2 {
+                Err(CliError::Usage(
+                    "capture-inspect supports only --protocol v2-r2".to_owned(),
+                ))
+            } else {
+                inspect_v2_capture(&address, stream_id, rows)
+            }
         }
     });
     match result {
@@ -344,10 +370,13 @@ fn run_v2_diagnostic_command(raw_args: Vec<String>) -> ExitCode {
     }
 }
 
-fn parse_v2_diagnostic_args(args: &[String]) -> Result<(String, u16, u16), CliError> {
+fn parse_v2_diagnostic_args(
+    args: &[String],
+) -> Result<(String, u16, u16, DiagnosticProtocol), CliError> {
     let mut address = None;
     let mut stream_id = 1_u16;
     let mut rows = 16_u16;
+    let mut protocol = DiagnosticProtocol::V2R2;
     let mut values = args.iter();
     while let Some(argument) = values.next() {
         match argument.as_str() {
@@ -365,6 +394,17 @@ fn parse_v2_diagnostic_args(args: &[String]) -> Result<(String, u16, u16), CliEr
                     return Err(CliError::Usage("--rows must be non-zero".to_owned()));
                 }
             }
+            "--protocol" => {
+                protocol = match next_v2_argument(&mut values, "--protocol")?.as_str() {
+                    "v2-r1" => DiagnosticProtocol::V2R1,
+                    "v2-r2" | "v2" => DiagnosticProtocol::V2R2,
+                    value => {
+                        return Err(CliError::Usage(format!(
+                            "unknown diagnostic protocol {value}"
+                        )))
+                    }
+                }
+            }
             value => {
                 return Err(CliError::Usage(format!(
                     "unknown diagnostic argument {value}"
@@ -378,6 +418,7 @@ fn parse_v2_diagnostic_args(args: &[String]) -> Result<(String, u16, u16), CliEr
         })?,
         stream_id,
         rows,
+        protocol,
     ))
 }
 
@@ -395,14 +436,19 @@ fn inspect_v2_live(
     address: &str,
     stream_id: u16,
     rows: u16,
+    protocol: DiagnosticProtocol,
 ) -> Result<V2DiagnosticReport, CliError> {
-    let session = LiveSession::connect_v2(TransportConfig::Tcp {
+    if protocol == DiagnosticProtocol::V2R2 {
+        return inspect_v2_r2_live(address, stream_id, rows);
+    }
+    let session = LiveSession::connect_v2_r1(TransportConfig::Tcp {
         address: address.to_owned(),
     })
     .map_err(|error| CliError::Input(error.to_string()))?;
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut configured = false;
     let mut report = empty_v2_report(stream_id);
+    report.protocol_revision = "V2-R1".to_owned();
     while Instant::now() < deadline {
         let event = session
             .recv_timeout(Duration::from_millis(100))
@@ -415,6 +461,8 @@ fn inspect_v2_live(
                 report.domain = format!("{:?}", descriptor.domain);
                 report.capture_phase = format!("{:?}", descriptor.capture_phase);
                 report.consistency_group = descriptor.consistency_group;
+                report.active_streams = vec![stream_id];
+                report.metadata_encoding = "R1-28-byte-explicit".to_owned();
                 let mask = descriptor
                     .channel_ids
                     .iter()
@@ -450,6 +498,7 @@ fn inspect_v2_live(
                     return Ok(report);
                 }
             }
+            SessionEvent::Stats(stats) => copy_session_stats(&mut report, &stats),
             SessionEvent::Error(error) => return Err(CliError::Input(error)),
             _ => {}
         }
@@ -460,43 +509,139 @@ fn inspect_v2_live(
     ))
 }
 
-fn inspect_v2_capture(
+fn inspect_v2_r2_live(
     address: &str,
     stream_id: u16,
     rows: u16,
 ) -> Result<V2DiagnosticReport, CliError> {
-    let session = LiveSession::connect_v2(TransportConfig::Tcp {
+    let session = LiveSession::connect_v2_r2(TransportConfig::Tcp {
         address: address.to_owned(),
     })
     .map_err(|error| CliError::Input(error.to_string()))?;
     let deadline = Instant::now() + Duration::from_secs(5);
-    let mut armed = false;
+    let mut configured = false;
+    let mut rates = BTreeMap::<u16, u32>::new();
+    let mut observed = BTreeMap::<u16, bool>::new();
+    let mut utilization_seen = BTreeMap::<u16, bool>::new();
     let mut report = empty_v2_report(stream_id);
+    report.protocol_revision = "V2-R2".to_owned();
     while Instant::now() < deadline {
         let event = session
             .recv_timeout(Duration::from_millis(100))
             .map_err(|error| CliError::Input(error.to_string()))?;
         match event {
-            SessionEvent::StreamTable(table) => {
+            SessionEvent::StreamTableR2(table) => {
+                let descriptor = table.stream(stream_id).ok_or_else(|| {
+                    CliError::Input(format!("stream {stream_id} is absent from STREAM_TABLE_R2"))
+                })?;
+                report.domain = format!("{:?}", descriptor.domain);
+                report.capture_phase = format!("{:?}", descriptor.capture_phase);
+                report.consistency_group = descriptor.consistency_group;
+                report.active_streams = table.streams.iter().map(|value| value.stream_id).collect();
+                let subscriptions = table
+                    .streams
+                    .iter()
+                    .map(|value| {
+                        rates.insert(value.stream_id, value.sample_rate_hz);
+                        observed.insert(value.stream_id, false);
+                        StreamSubscriptionR2 {
+                            stream_id: value.stream_id,
+                            batch_samples: u16::try_from(
+                                32_u32.div_ceil(value.logical_cycle_step).max(1),
+                            )
+                            .unwrap_or(1),
+                            channel_mask: value
+                                .channel_ids
+                                .iter()
+                                .fold(0_u64, |mask, id| mask | (1_u64 << id)),
+                        }
+                    })
+                    .collect();
+                session
+                    .configure_streams_r2(ConfigureStreamsR2 {
+                        transaction_id: 1,
+                        subscriptions,
+                    })
+                    .map_err(|error| CliError::Input(error.to_string()))?;
+                configured = true;
+            }
+            SessionEvent::ConfiguredV2R2(_) if configured => session
+                .start()
+                .map_err(|error| CliError::Input(error.to_string()))?,
+            SessionEvent::SnapshotV2R2(batch, diagnostics) => {
+                observed.insert(batch.stream_id, true);
+                if batch.stream_id == stream_id {
+                    report.row_count = report
+                        .row_count
+                        .saturating_add(batch.row_metadata.len() as u64);
+                }
+                report.metadata_encoding = match batch.metadata_encoding {
+                    MetadataEncodingR2::AffineWithOverrides => "AffineWithOverrides",
+                    MetadataEncodingR2::Explicit => "Explicit",
+                }
+                .to_owned();
+                if utilization_seen.insert(batch.stream_id, true).is_none() {
+                    if let Some(rate) = rates.get(&batch.stream_id) {
+                        let rows = batch.row_metadata.len().max(1) as f64;
+                        report.estimated_link_utilization +=
+                            batch.raw_frame.len() as f64 * 10.0 * f64::from(*rate)
+                                / rows
+                                / 4_000_000.0;
+                    }
+                }
+                copy_snapshot_diagnostics(&mut report, diagnostics);
+                if v2_report_has_failure(&report) {
+                    let _ = session.disconnect();
+                    return Err(CliError::Input(
+                        "V2 R2 diagnostics reported a protocol or causal contract failure"
+                            .to_owned(),
+                    ));
+                }
+                if report.row_count >= u64::from(rows)
+                    && observed.values().all(|observed| *observed)
+                {
+                    let _ = session.stop();
+                    let _ = session.disconnect();
+                    return Ok(report);
+                }
+            }
+            SessionEvent::Stats(stats) => copy_session_stats(&mut report, &stats),
+            SessionEvent::Error(error) => return Err(CliError::Input(error)),
+            _ => {}
+        }
+    }
+    let _ = session.disconnect();
+    Err(CliError::Input(
+        "timed out waiting for all SCP1 V2 R2 streams".to_owned(),
+    ))
+}
+
+fn inspect_v2_capture(
+    address: &str,
+    stream_id: u16,
+    rows: u16,
+) -> Result<V2DiagnosticReport, CliError> {
+    let session = LiveSession::connect_v2_r2(TransportConfig::Tcp {
+        address: address.to_owned(),
+    })
+    .map_err(|error| CliError::Input(error.to_string()))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut report = empty_v2_report(stream_id);
+    report.protocol_revision = "V2-R2".to_owned();
+    while Instant::now() < deadline {
+        let event = session
+            .recv_timeout(Duration::from_millis(100))
+            .map_err(|error| CliError::Input(error.to_string()))?;
+        match event {
+            SessionEvent::StreamTableR2(table) => {
                 let descriptor = table.stream(stream_id).ok_or_else(|| {
                     CliError::Input(format!("stream {stream_id} is absent from STREAM_TABLE"))
                 })?;
                 report.domain = format!("{:?}", descriptor.domain);
                 report.capture_phase = format!("{:?}", descriptor.capture_phase);
                 report.consistency_group = descriptor.consistency_group;
-                let mask = descriptor
-                    .channel_ids
-                    .iter()
-                    .fold(0_u64, |mask, id| mask | (1_u64 << id));
-                session
-                    .configure_stream(ConfigureStream {
-                        stream_id,
-                        batch_samples: rows,
-                        channel_mask: mask,
-                    })
-                    .map_err(|error| CliError::Input(error.to_string()))?;
-            }
-            SessionEvent::ConfiguredV2(_) if !armed => {
+                report.active_streams = vec![stream_id];
+                report.metadata_encoding = "AffineWithOverrides".to_owned();
                 session
                     .arm_capture(ArmCapture {
                         capture_id: 1,
@@ -515,12 +660,8 @@ fn inspect_v2_capture(
                         },
                     })
                     .map_err(|error| CliError::Input(error.to_string()))?;
-                session
-                    .manual_trigger(ManualTrigger { capture_id: 1 })
-                    .map_err(|error| CliError::Input(error.to_string()))?;
-                armed = true;
             }
-            SessionEvent::CaptureComplete(capture) => {
+            SessionEvent::CaptureCompleteR2(capture) => {
                 report.capture_complete = capture.diagnostics.capture_complete;
                 report.capture_missing_chunks = capture.diagnostics.capture_missing_chunks;
                 report.capture_duplicate_chunks = capture.diagnostics.capture_duplicate_chunks;
@@ -533,6 +674,7 @@ fn inspect_v2_capture(
                 let _ = session.disconnect();
                 return Ok(report);
             }
+            SessionEvent::Stats(stats) => copy_session_stats(&mut report, &stats),
             SessionEvent::CaptureFailure(error) => return Err(CliError::Input(error)),
             SessionEvent::CaptureStatus(status)
                 if !matches!(
@@ -561,6 +703,11 @@ fn inspect_v2_capture(
 fn empty_v2_report(stream_id: u16) -> V2DiagnosticReport {
     V2DiagnosticReport {
         protocol_version: 2,
+        protocol_revision: "V2-R2".to_owned(),
+        session_id: 0,
+        active_streams: Vec::new(),
+        metadata_encoding: String::new(),
+        estimated_link_utilization: 0.0,
         stream_id,
         domain: String::new(),
         capture_phase: String::new(),
@@ -577,6 +724,15 @@ fn empty_v2_report(stream_id: u16) -> V2DiagnosticReport {
         causal_sequence_reorder: 0,
         causal_group_mismatch: 0,
         causal_cache_evictions: 0,
+        causal_cached_rows: 0,
+        causal_pending_matches: 0,
+        causal_match_timeouts: 0,
+        causal_window_overflows: 0,
+        causal_duplicate_cycles: 0,
+        heartbeat_pending_count: 0,
+        heartbeat_last_rtt_ms: 0,
+        heartbeat_max_rtt_ms: 0,
+        device_reset_count: 0,
         capture_complete: false,
         capture_missing_chunks: 0,
         capture_duplicate_chunks: 0,
@@ -599,6 +755,27 @@ fn copy_snapshot_diagnostics(
     report.causal_sequence_reorder = diagnostics.causal_sequence_reorder;
     report.causal_group_mismatch = diagnostics.causal_group_mismatch;
     report.causal_cache_evictions = diagnostics.causal_cache_evictions;
+    report.causal_cached_rows = diagnostics.causal_cached_rows;
+    report.causal_pending_matches = diagnostics.causal_pending_matches;
+    report.causal_match_timeouts = diagnostics.causal_match_timeouts;
+    report.causal_window_overflows = diagnostics.causal_window_overflows;
+    report.causal_duplicate_cycles = diagnostics.causal_duplicate_cycles;
+}
+
+fn copy_session_stats(
+    report: &mut V2DiagnosticReport,
+    stats: &scope_analyzer::live::session::SessionStats,
+) {
+    report.session_id = stats.session_id;
+    report.causal_cached_rows = stats.causal_cached_rows;
+    report.causal_pending_matches = stats.causal_pending_matches;
+    report.causal_match_timeouts = stats.causal_match_timeouts;
+    report.causal_window_overflows = stats.causal_window_overflows;
+    report.causal_duplicate_cycles = stats.causal_duplicate_cycles;
+    report.heartbeat_pending_count = stats.heartbeat_pending_count;
+    report.heartbeat_last_rtt_ms = stats.heartbeat_last_rtt_ms;
+    report.heartbeat_max_rtt_ms = stats.heartbeat_max_rtt_ms;
+    report.device_reset_count = stats.device_reset_count;
 }
 
 fn v2_report_has_failure(report: &V2DiagnosticReport) -> bool {
@@ -612,7 +789,9 @@ fn v2_report_has_failure(report: &V2DiagnosticReport) -> bool {
         || report.causal_application_mismatch != 0
         || report.causal_sequence_reorder != 0
         || report.causal_group_mismatch != 0
-        || report.causal_cache_evictions != 0
+        || report.causal_match_timeouts != 0
+        || report.causal_window_overflows != 0
+        || report.causal_duplicate_cycles != 0
 }
 
 fn parse_args<I, S>(args: I) -> Result<CliArgs, CliError>

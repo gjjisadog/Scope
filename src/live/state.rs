@@ -11,9 +11,10 @@ use crate::presentation::ChannelPresentation;
 use super::{
     buffer::{LiveBuffer, LiveSnapshot, SnapshotSegment},
     capture_history::{CaptureHistory, CapturePayload},
-    hardware_capture::AssembledCapture,
+    hardware_capture::{AssembledCapture, AssembledCaptureR2},
     protocol::{validate_configure_for_device, ChannelTable, Configure, HelloAck, ResultCode},
     protocol_v2::{CaptureStatus, DecodedStreamSampleBatch, StreamTable},
+    protocol_v2_r2::{DecodedStreamSampleBatchR2, StreamTableR2},
     recording::{AsyncScopeRecorder, RecordingMetadata, RecordingStats},
     session::{AcquisitionConfig, ConnectionState, LiveSession, SessionEvent, SessionStats},
     snapshot::SnapshotDiagnostics,
@@ -41,6 +42,9 @@ pub struct LiveScopeState {
     pub v2_snapshot_diagnostics: SnapshotDiagnostics,
     pub v2_capture_status: Option<CaptureStatus>,
     pub v2_last_capture: Option<AssembledCapture>,
+    pub v2_stream_table_r2: Option<StreamTableR2>,
+    pub v2_last_snapshot_r2: Option<DecodedStreamSampleBatchR2>,
+    pub v2_last_capture_r2: Option<AssembledCaptureR2>,
     pub acquisition: Configure,
     pub configuration_applied: bool,
     pub history_seconds: u32,
@@ -79,6 +83,9 @@ impl Default for LiveScopeState {
             v2_snapshot_diagnostics: SnapshotDiagnostics::default(),
             v2_capture_status: None,
             v2_last_capture: None,
+            v2_stream_table_r2: None,
+            v2_last_snapshot_r2: None,
+            v2_last_capture_r2: None,
             acquisition: Configure {
                 sample_rate_hz: 500,
                 batch_samples: 10,
@@ -490,6 +497,12 @@ impl LiveScopeState {
         match event {
             SessionEvent::State(state) => {
                 self.connection_state = state;
+                if state == ConnectionState::DeviceResetHandshake {
+                    self.configuration_applied = false;
+                    self.v2_stream_table_r2 = None;
+                    self.v2_last_snapshot_r2 = None;
+                    self.v2_last_capture_r2 = None;
+                }
                 if state == ConnectionState::Disconnected {
                     self.start_after_configure = false;
                     self.session.take();
@@ -530,6 +543,7 @@ impl LiveScopeState {
                 self.configuration_applied = false;
             }
             SessionEvent::StreamTable(table) => self.v2_stream_table = Some(table),
+            SessionEvent::StreamTableR2(table) => self.v2_stream_table_r2 = Some(table),
             SessionEvent::Configured(configure) => {
                 self.acquisition = configure;
                 self.configuration_applied = true;
@@ -543,6 +557,7 @@ impl LiveScopeState {
                 }
             }
             SessionEvent::ConfiguredV2(_) => self.configuration_applied = true,
+            SessionEvent::ConfiguredV2R2(_) => self.configuration_applied = true,
             SessionEvent::CommandResult(result) => {
                 if result.result_code != ResultCode::Ok {
                     self.start_after_configure = false;
@@ -559,8 +574,13 @@ impl LiveScopeState {
                 self.v2_last_snapshot = Some(snapshot);
                 self.v2_snapshot_diagnostics = diagnostics;
             }
+            SessionEvent::SnapshotV2R2(snapshot, diagnostics) => {
+                self.v2_last_snapshot_r2 = Some(snapshot);
+                self.v2_snapshot_diagnostics = diagnostics;
+            }
             SessionEvent::CaptureStatus(status) => self.v2_capture_status = Some(status),
             SessionEvent::CaptureComplete(capture) => self.v2_last_capture = Some(capture),
+            SessionEvent::CaptureCompleteR2(capture) => self.v2_last_capture_r2 = Some(capture),
             SessionEvent::CaptureFailure(error) => self.last_error = Some(error),
             SessionEvent::Gap(_) => {
                 // Gap detection and live-ring mutation occur in the acquisition worker.

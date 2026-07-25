@@ -1,25 +1,35 @@
-# SCP1 V2 确定性模拟器矩阵
+# SCP1 V2 冻结模拟器矩阵
 
-所有 V2 preset 都要求 `scope_dsp_simulator --protocol v2 --preset <name>`，不依赖随机概率。V1 模式没有变化。
+入口：`scope_dsp_simulator --protocol v2-r1|v2-r2 --streams fast32k,ctrl8k,slow1k --preset <name>`。`v2` 是 R2 别名，V1 默认不变。所有结果都是 TCP 软件模拟证据，不是 Hybrid30K 硬件验证。
 
-| preset | 客户端预期 |
+## Revision 与多 Stream
+
+- R1 client + R1 simulator：0x30/31/32/45、28-byte metadata。
+- R2 client + R2 simulator：0x35/34/33/47、compressed metadata。
+- R1/R2 混用和 0.15.2 的 36-byte/0x32 原型必须明确拒绝。
+- R2 一次配置 FAST32K 32 行、CTRL8K 8 行、SLOW1K 1 行；START/STOP 作用于整个原子集合，三者独立维护 row/logical/timestamp/背压诊断。
+
+## 三 Stream Causal presets
+
+| preset | 精确期望 |
 | --- | --- |
-| `30k-normal` | 三个 stream descriptor 可用；FAST32K 合法冻结行 |
-| `30k-causal-delay` | `source=N, applied=N-1` 不报错 |
-| `30k-cla-stale` | 无效 snapshot 行（缺 CLA_RESULT_VALID） |
-| `30k-row-gap` | `row_sequence_gaps` 增加 |
-| `30k-row-reorder` | row/timestamp 精确映射拒绝倒退行 |
-| `30k-phase-mismatch` | SAMPLE_BATCH_V2 被拒绝 |
-| `30k-group-mismatch` | SAMPLE_BATCH_V2 被拒绝 |
-| `30k-unfrozen-row` | 无效 snapshot 行（缺 FROZEN_ROW） |
-| `30k-capture-manual` | 手动 Capture 完整上传 |
-| `30k-capture-edge` | Edge Capture 完整上传 |
-| `30k-capture-fault` | FaultFlag Capture 完整上传 |
-| `30k-capture-timeout` | Capture 失败，不标记 complete |
-| `30k-capture-chunk-loss` | 检测缺块，Capture 失败；同一 V2 会话继续响应 PING |
-| `30k-capture-chunk-reorder` | Capture 成功且两个非期望到达位置令 `capture_reordered_chunks == 2` |
-| `30k-device-reset` | 精确报告 DeviceReset 并释放 Capture 缓存 |
+| `30k-causal-in-order` | Input→Result→Application，offset `(0,32)`，无 mismatch/timeout |
+| `30k-causal-result-first` | Result pending，Input 在 64-cycle 窗口内消解 |
+| `30k-causal-application-first` | Application 与 Result pending，Input 最后到仍消解 |
+| `30k-causal-source-timeout` | Input watermark 越过 deadline，timeout/missing 增加 |
+| `30k-causal-nonzero-offset` | result offset `+1` 正确匹配 |
+| `30k-causal-negative-offset` | result offset `-1` 正确匹配 |
+| `30k-causal-duplicate-cycle` | duplicate logical cycle 明确计数 |
+| `30k-causal-watermark-eviction` | source 跳过窗口后确定性 timeout，缓存保持有界 |
 
-0.15.2 的自动化端到端矩阵逐项执行“TCP simulator → LiveSession V2 → 帧解码 → Stream/Snapshot/Capture 校验 → 最终 SessionEvent”。断言不再只检查宽泛事件类别：每个 preset 分别固定 logical/source/applied 关系、精确诊断计数、拒绝原因、Capture id/块数/乱序计数和终态字段；chunk-loss 还在失败后以新 nonce 验证连接恢复。`live-inspect` 对快照诊断或协议拒绝返回非零退出码，`capture-inspect` 对 CaptureFailure 或失败状态返回非零退出码；正常预设返回 JSON `ok=true`。
+旧的 15 个 R1 presets 保留显式兼容入口，覆盖正常、CLA stale、row gap/reorder、phase/group mismatch、unfrozen row、manual/edge/fault Capture、timeout、chunk loss/reorder 与 DeviceReset。它们不冒充 R2 multi-stream 证据。
 
-这些是 TCP simulator/client 验证，绝不是 Hybrid30K DSP 硬件验证。
+## Capture、Reset、Heartbeat、带宽
+
+- R2 Capture 正常上传；乱序块的增量 CRC 等于一次性定义。
+- 首次 chunk loss 产生 CaptureFailure、缓存归零、连接保持；第二次 ARM 成功。
+- DeviceReset 清空订阅/Capture/causal/timing/heartbeat/pending/table，拒绝旧 session frame，再以新 id 完成 HELLO_ACK→ChannelTable→StreamTableR2→Ready；不自动恢复 streaming。
+- heartbeat 覆盖顺序/乱序、1–3 秒延迟、3 秒 timeout、unknown、duplicate、overflow、RTT/max RTT 与 reset clear。
+- 16×I16×8 kHz×128 在 4 Mbaud 下 affine 与 sparse override ≤70%；Explicit >70%；8×I16×32 kHz >70%。
+
+CI 在 Ubuntu/Windows 跑 format/check/Clippy/all-target/live/simulator，并在独立 Ubuntu job 显式执行 ignored 的 100 万行 bounded causal test。GitHub 上尚未发生的 workflow run 不得写成已通过；真实 UART、DSP Capture 和 Windows 安装验收仍由相应受控 runner 提供证据。

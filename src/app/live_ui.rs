@@ -89,6 +89,7 @@ impl ScopeApp {
             ConnectionState::Ready | ConnectionState::Streaming => Color32::from_rgb(67, 190, 115),
             ConnectionState::Connecting
             | ConnectionState::Handshaking
+            | ConnectionState::DeviceResetHandshake
             | ConnectionState::Configuring => Color32::from_rgb(226, 170, 55),
             ConnectionState::Disconnected => Color32::from_gray(130),
         };
@@ -2284,6 +2285,9 @@ impl ScopeApp {
             ConnectionState::Disconnected => self.live_text("未连接", "Disconnected"),
             ConnectionState::Connecting => self.live_text("正在连接", "Connecting"),
             ConnectionState::Handshaking => self.live_text("正在握手", "Handshaking"),
+            ConnectionState::DeviceResetHandshake => {
+                self.live_text("设备复位，重新握手", "Device reset; handshaking")
+            }
             ConnectionState::Configuring => self.live_text("正在应用采集", "Configuring"),
             ConnectionState::Ready => self.live_text("已就绪", "Ready"),
             ConnectionState::Streaming => self.live_text("正在采集", "Streaming"),

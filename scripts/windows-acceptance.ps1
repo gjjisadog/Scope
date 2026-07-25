@@ -17,7 +17,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$version = "0.15.2"
+$version = "0.15.3"
 $expectedMesaReleaseTag = "26.0.8"
 $expectedMesaAssetName = "mesa3d-26.0.8-release-msvc.7z"
 $expectedMesaAssetSha256 = "a438c26c2752726916e455f9ad121f8a7e3cfecf8626251abf8e5b3e129d8497"

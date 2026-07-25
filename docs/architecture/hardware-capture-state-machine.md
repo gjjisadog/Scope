@@ -1,9 +1,11 @@
-# SCP1 V2 DSP hardware Capture 状态机
+# SCP1 V2 R2 DSP hardware Capture 状态机
 
-Capture 的可见状态为 `Idle → Armed → Triggered → PostCapture → Complete → Uploading → Idle`。`ARM_CAPTURE` 只配置并布防 DSP 本地缓冲，`MANUAL_TRIGGER` 只能触发同一个已布防 id，`CANCEL_CAPTURE` 使其进入 `Cancelled`。
+可见流程为 `Idle → Armed → Triggered → PostCapture → Complete → Uploading → Idle`。`Cancelled`、`Timeout`、`BufferOverrun`、`InvalidConfig`、`DeviceReset` 是终态/异常，不能标记成功。
 
-`Timeout`、`BufferOverrun`、`InvalidConfig` 和 `DeviceReset` 是失败终态，客户端不得把它们标为成功。冻结后 DSP 发送 `CAPTURE_BEGIN`，按从零开始的 `CAPTURE_DATA.block_index` 上传内嵌 V2 batch，最后发送 `CAPTURE_END` 的总块数、总样本数和完整性摘要。
+`CAPTURE_BEGIN` 绑定 id、Stream、预计行数和 trigger row。R2 `CAPTURE_DATA` 使用消息 `0x47`，内嵌压缩或 Explicit 的 R2 batch。插入块时先用纯长度函数检查 payload 和 64 MiB 上限，只在块索引相邻时比较 BTreeMap 前驱/后继的行邻接；实时会话把已验证的原始 wire payload 作为 `Arc<[u8]>` 交给 assembler，无需再次编码。
 
-客户端的 in-memory assembler 以 `capture_id` 和 `stream_id` 建立会话。每个块在缓存前都必须匹配 stream revision、domain、phase、group、顺序 channel ids 和固定 sample period；累计行数/块数/编码 payload 字节数受 `1,048,576` 行、`4,096` 块、每块 `4,096` 行和 `64 MiB` 上限约束。
+CRC32C 从 `le_u32(capture_id)` 开始。乱序块进入 map；当从 `next_crc_block` 开始形成连续前缀时，逐块增量更新 CRC 并立即释放对应 wire-payload Arc。不会拼接完整 Capture Vec。push 为 O(log n)，CRC 工作仅与新变为连续的块大小有关；finish 按序移动 batch，不复制全部 payload。
 
-块按 index 排序后必须没有缺失、重叠、倒退或行号不连续，trigger row 必须落在首末行内。成功结束还要求 `uploaded_rows == total_samples == 实收行数 == BEGIN.row_count`、`dropped_rows == 0` 和 `total_blocks == 实收块数`。`integrity_summary` 固定为 `CRC32C(le_u32(capture_id) + 按 block_index 排序的 CAPTURE_DATA 编码 payload)`，客户端重算并比较。只有这些条件和 `Complete` 同时成立才会标记 complete；本阶段不修改 `.scope V1`。
+成功要求：状态 Complete、块号从零连续、行跨块连续、trigger row 在范围内、`uploaded_rows == total_samples == BEGIN.row_count`、`dropped_rows == 0`、块数一致且增量 CRC 匹配。上限为 1,048,576 行、4,096 块、每块 4,096 行、64 MiB。
+
+finish（成功或失败）以及 terminal CaptureStatus 都释放 begin、blocks、rows、bytes 和 CRC 状态。CaptureFailure 不关闭 V2 协议连接；心跳继续，下一次 ARM 可成功。DeviceReset 进一步清空会话并要求新 session id。Capture 仍只在内存交付，不写 `.scope V2`，也不修改 `.scope V1`。
