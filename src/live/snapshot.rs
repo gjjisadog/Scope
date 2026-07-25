@@ -225,7 +225,11 @@ impl SnapshotValidator {
         self.causal_rows
             .insert((descriptor.stream_id, meta.logical_cycle_sequence), meta);
 
-        for relation in &table.causal_relations {
+        for relation in table.causal_relations.iter().filter(|relation| {
+            relation.input_stream_id == descriptor.stream_id
+                || relation.result_stream_id == descriptor.stream_id
+                || relation.application_stream_id == descriptor.stream_id
+        }) {
             self.observe_relation(table, descriptor, meta, relation)?;
         }
         self.update_gauges();

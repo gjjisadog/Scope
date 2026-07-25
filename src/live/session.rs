@@ -232,6 +232,7 @@ pub struct SessionStats {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)] // Preserve the frozen source-compatible event payload API.
 pub enum SessionEvent {
     State(ConnectionState),
     HelloAck(HelloAck),
@@ -2593,6 +2594,7 @@ mod tests {
             ArmCapture, CaptureEdge, CapturePhase, CaptureState, CaptureTrigger,
             CaptureTriggerKind, ConfigureStream, ManualTrigger, SampleDomain,
         },
+        protocol_v2_r2::StreamSubscriptionR2,
         simulator::{SimulatorConfig, SimulatorHandle, SimulatorProtocol, V2Preset},
         snapshot::SnapshotMeta,
         transport::TransportConfig,
@@ -3902,6 +3904,16 @@ mod tests {
                         }
                         _ => unreachable!(),
                     }
+                }
+                V2Preset::CausalInOrder30k
+                | V2Preset::CausalResultFirst30k
+                | V2Preset::CausalApplicationFirst30k
+                | V2Preset::CausalSourceTimeout30k
+                | V2Preset::CausalNonzeroOffset30k
+                | V2Preset::CausalNegativeOffset30k
+                | V2Preset::CausalDuplicateCycle30k
+                | V2Preset::CausalWatermarkEviction30k => {
+                    unreachable!("R2-only causal preset entered the R1 acceptance matrix")
                 }
             }
             let _ = session.disconnect();

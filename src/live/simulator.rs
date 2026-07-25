@@ -685,13 +685,14 @@ fn serve_v2_client(
                                 )?;
                             }
                         }
-                        super::protocol::MSG_PONG => {
-                            if Message::decode(frame.message_type, &frame.payload).is_ok() {
-                                update_stats(stats, |value| {
-                                    value.pongs_received = value.pongs_received.saturating_add(1)
-                                });
-                            }
+                        super::protocol::MSG_PONG
+                            if Message::decode(frame.message_type, &frame.payload).is_ok() =>
+                        {
+                            update_stats(stats, |value| {
+                                value.pongs_received = value.pongs_received.saturating_add(1)
+                            });
                         }
+                        super::protocol::MSG_PONG => {}
                         super::protocol_v2::MSG_ARM_CAPTURE => {
                             let Ok(MessageV2::ArmCapture(capture)) =
                                 MessageV2::decode(frame.message_type, &frame.payload)
@@ -1035,13 +1036,14 @@ fn serve_v2_r2_client(
                                 )?;
                             }
                         }
-                        super::protocol::MSG_PONG => {
-                            if Message::decode(frame.message_type, &frame.payload).is_ok() {
-                                update_stats(stats, |value| {
-                                    value.pongs_received = value.pongs_received.saturating_add(1)
-                                });
-                            }
+                        super::protocol::MSG_PONG
+                            if Message::decode(frame.message_type, &frame.payload).is_ok() =>
+                        {
+                            update_stats(stats, |value| {
+                                value.pongs_received = value.pongs_received.saturating_add(1)
+                            });
                         }
+                        super::protocol::MSG_PONG => {}
                         super::protocol_v2::MSG_ARM_CAPTURE => {
                             let Ok(MessageV2::ArmCapture(capture)) =
                                 MessageV2::decode(frame.message_type, &frame.payload)

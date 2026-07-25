@@ -50,7 +50,7 @@ struct CaptureBlockR2 {
     encoded_payload: Option<Arc<[u8]>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct CaptureAssemblerR2 {
     begin: Option<CaptureBegin>,
     blocks: BTreeMap<u32, CaptureBlockR2>,
@@ -67,22 +67,6 @@ pub struct CaptureAssemblerR2 {
     total_rows: u32,
     total_payload_bytes: usize,
     diagnostics: CaptureDiagnostics,
-}
-
-impl Default for CaptureAssemblerR2 {
-    fn default() -> Self {
-        Self {
-            begin: None,
-            blocks: BTreeMap::new(),
-            expected_stream: None,
-            expected_next_block: 0,
-            next_crc_block: 0,
-            crc: Crc32c::new(),
-            total_rows: 0,
-            total_payload_bytes: 0,
-            diagnostics: CaptureDiagnostics::default(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -873,7 +857,7 @@ mod tests {
             trigger_row_seq: 1,
         };
         assembler
-            .begin_with_descriptor(begin.clone(), &r2_descriptor(), 3)
+            .begin_with_descriptor(begin, &r2_descriptor(), 3)
             .unwrap();
         assembler.push(r2_block(8, 1, 2)).unwrap();
         assert!(assembler
