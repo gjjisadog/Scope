@@ -367,6 +367,7 @@ fn serve_hybrid30k_r2_client(
     let session_id = SIMULATOR_SESSION_ID;
     let mut configured: Option<ConfigureStreamsR2> = None;
     let mut streaming = false;
+    let mut streaming_started = None;
     let mut row_sequences = BTreeMap::<u16, u64>::new();
     let mut emitted_rounds = 0_u64;
     let mut last_ping = Instant::now();
@@ -420,6 +421,7 @@ fn serve_hybrid30k_r2_client(
                                 Ok(()) => {
                                     configured = Some(request.clone());
                                     row_sequences.clear();
+                                    streaming_started = None;
                                     (ResultCode::Ok, accepted_subscriptions_detail(&request))
                                 }
                                 Err(error) => (ResultCode::InvalidArgument, error.to_string()),
@@ -437,6 +439,7 @@ fn serve_hybrid30k_r2_client(
                         }
                         MSG_START => {
                             streaming = configured.is_some();
+                            streaming_started = streaming.then(Instant::now);
                             update_stats(stats, |value| {
                                 value.start_requests = value.start_requests.saturating_add(1)
                             });
@@ -458,6 +461,7 @@ fn serve_hybrid30k_r2_client(
                         }
                         MSG_STOP => {
                             streaming = false;
+                            streaming_started = None;
                             update_stats(stats, |value| {
                                 value.stop_requests = value.stop_requests.saturating_add(1)
                             });
@@ -508,20 +512,36 @@ fn serve_hybrid30k_r2_client(
             let configure = configured
                 .as_ref()
                 .expect("Hybrid30K R2 streaming requires configuration");
+            let elapsed = streaming_started
+                .expect("Hybrid30K R2 streaming requires a start time")
+                .elapsed();
             for subscription in &configure.subscriptions {
-                if subscription.stream_id == 3
-                    && (fault == Hybrid30kR2FixtureFault::SlowStreamNoData
-                        || (fault == Hybrid30kR2FixtureFault::SlowStreamHalfRate
-                            && !emitted_rounds.is_multiple_of(2)))
+                if subscription.stream_id == 3 && fault == Hybrid30kR2FixtureFault::SlowStreamNoData
                 {
                     continue;
                 }
-                let repeats = match (subscription.stream_id, fault) {
-                    (2, _) => 3,
-                    (3, Hybrid30kR2FixtureFault::SlowStreamHalfRate) => 1,
-                    (3, _) => 3,
-                    _ => 1,
+                let descriptor = streams.stream(subscription.stream_id).ok_or_else(|| {
+                    SimulatorError::InvalidConfig("unknown Hybrid30K R2 stream".to_owned())
+                })?;
+                let target_rate_hz = if subscription.stream_id == 3
+                    && fault == Hybrid30kR2FixtureFault::SlowStreamHalfRate
+                {
+                    descriptor.sample_rate_hz / 2
+                } else {
+                    descriptor.sample_rate_hz
                 };
+                let target_rows =
+                    (f64::from(target_rate_hz) * elapsed.as_secs_f64()).floor() as u64;
+                let sent_rows = row_sequences
+                    .get(&subscription.stream_id)
+                    .copied()
+                    .unwrap_or(1)
+                    .saturating_sub(1);
+                let repeats = target_rows
+                    .saturating_sub(sent_rows)
+                    .checked_div(u64::from(subscription.batch_samples))
+                    .unwrap_or(0)
+                    .min(64);
                 for _ in 0..repeats {
                     let first_row = *row_sequences.entry(subscription.stream_id).or_insert(1);
                     let batch = v2_r2_sample_batch(
