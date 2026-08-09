@@ -17,16 +17,21 @@ use thiserror::Error;
 
 use super::{
     machine_profile::{MachineProfile, ProfileError},
-    protocol::{validate_configure_for_device, ChannelTable, Configure, HelloAck, ResultCode},
+    protocol::{
+        validate_configure_for_device, ChannelTable, Configure, HelloAck, ResultCode, WireFormat,
+        FRAME_CRC_LEN, FRAME_HEADER_LEN,
+    },
     protocol_v2::SampleDomain,
     protocol_v2_r2::{
-        ConfigureStreamsR2, StreamSubscriptionR2, StreamTableR2, CAPABILITY_V2_COMPRESSED_METADATA,
-        CAPABILITY_V2_MULTI_STREAM, CAPABILITY_V2_STREAMS_R2,
+        stream_sample_batch_r2_payload_len, ConfigureStreamsR2, MetadataEncodingR2,
+        StreamSampleBatchR2, StreamSubscriptionR2, StreamTableR2,
+        CAPABILITY_V2_COMPRESSED_METADATA, CAPABILITY_V2_MULTI_STREAM, CAPABILITY_V2_STREAMS_R2,
     },
     recording::{AsyncScopeRecorder, RecordingError, RecordingMetadata, ScopeRecording},
     session::{
         ConnectionState, LiveSession, SessionError, SessionEvent, SessionStats, StreamSessionStats,
     },
+    snapshot::SnapshotMeta,
     transport::TransportConfig,
 };
 
@@ -34,6 +39,9 @@ const DEFAULT_SAMPLE_RATE_HZ: u32 = 500;
 const DEFAULT_BATCH_SAMPLES: u16 = 16;
 const MAX_SMOKE_DURATION: Duration = Duration::from_secs(60);
 const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(100);
+const SAFE_SERIAL_UTILIZATION_LIMIT: f64 = 0.70;
+const MINIMUM_THROUGHPUT_RATIO: f64 = 0.95;
+const MINIMUM_LINK_STRESS_DURATION: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct HardwareSmokeConfig {
@@ -398,6 +406,30 @@ pub enum HardwareSmokeMode {
     LinkStress,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChannelSet {
+    #[default]
+    Required,
+    All,
+}
+
+impl ChannelSet {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "required" => Some(Self::Required),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::All => "all",
+        }
+    }
+}
+
 impl HardwareSmokeMode {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
@@ -424,6 +456,7 @@ pub struct HardwareSmokeV2R2Config {
     pub transport: TransportConfig,
     pub profile: String,
     pub mode: HardwareSmokeMode,
+    pub channel_set: ChannelSet,
     pub duration: Duration,
     pub batch_samples: u16,
 }
@@ -433,8 +466,15 @@ pub struct HardwareSmokeV2R2Config {
 pub struct HardwareSmokeStreamResult {
     pub stream_id: u16,
     pub domain: String,
+    pub selected_channel_count: usize,
+    pub selected_channel_mask: u64,
+    #[serde(skip)]
+    pub selected_batch_samples: u16,
     pub received_batches: u64,
+    pub expected_rows: u64,
     pub received_rows: u64,
+    pub throughput_ratio: f64,
+    pub minimum_throughput_ratio: f64,
     pub row_gaps: u64,
     pub row_reorders: u64,
     pub invalid_rows: u64,
@@ -444,13 +484,27 @@ pub struct HardwareSmokeStreamResult {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub struct R2SerialLinkBudget {
+    pub payload_bytes_per_second: f64,
+    pub wire_bytes_per_second: f64,
+    pub required_baud: u64,
+    pub configured_baud: Option<u32>,
+    pub estimated_utilization: f64,
+    pub safe_utilization_limit: f64,
+    pub headroom: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct HardwareSmokeV2R2Result {
     pub protocol: &'static str,
     pub protocol_revision: &'static str,
     pub mode: &'static str,
+    pub channel_set: &'static str,
     pub profile: String,
     pub transport: String,
     pub baud: Option<u32>,
+    pub link_budget: R2SerialLinkBudget,
     pub session_id: u32,
     pub device_id: String,
     pub firmware_name: String,
@@ -480,6 +534,214 @@ pub struct HardwareSmokeV2R2Result {
     pub ok: bool,
 }
 
+pub fn estimate_r2_serial_budget(
+    configured_baud: Option<u32>,
+    subscriptions: &[StreamSubscriptionR2],
+    streams: &StreamTableR2,
+    channels: &ChannelTable,
+) -> Result<R2SerialLinkBudget, HardwareSmokeError> {
+    let mut payload_bytes_per_second = 0.0;
+    let mut wire_bytes_per_second = 0.0;
+    for subscription in subscriptions {
+        let descriptor = streams.stream(subscription.stream_id).ok_or_else(|| {
+            HardwareSmokeError::InvalidConfig(format!(
+                "link budget references unknown stream {}",
+                subscription.stream_id
+            ))
+        })?;
+        let channel_ids = descriptor
+            .channel_ids
+            .iter()
+            .copied()
+            .filter(|channel_id| subscription.channel_mask & (1_u64 << channel_id) != 0)
+            .collect::<Vec<_>>();
+        let bytes_per_row = channel_ids.iter().try_fold(0_usize, |total, channel_id| {
+            let channel = channels.channel(*channel_id).ok_or_else(|| {
+                HardwareSmokeError::InvalidConfig(format!(
+                    "link budget references unknown channel {channel_id}"
+                ))
+            })?;
+            total
+                .checked_add(wire_format_bytes(channel.wire_format))
+                .ok_or_else(|| HardwareSmokeError::InvalidConfig("link budget overflow".to_owned()))
+        })?;
+        let row_count = usize::from(subscription.batch_samples);
+        let sample_data_len = bytes_per_row
+            .checked_mul(row_count)
+            .ok_or_else(|| HardwareSmokeError::InvalidConfig("link budget overflow".to_owned()))?;
+        let row_metadata = (0..subscription.batch_samples)
+            .map(|offset| {
+                let row_sequence = u64::from(offset) + 1;
+                let logical_cycle_sequence =
+                    row_sequence.saturating_mul(u64::from(descriptor.logical_cycle_step));
+                SnapshotMeta {
+                    row_sequence,
+                    logical_cycle_sequence,
+                    source_sequence: logical_cycle_sequence,
+                    applied_sequence: logical_cycle_sequence,
+                    valid_flags: 0,
+                }
+            })
+            .collect::<Vec<_>>();
+        let batch = StreamSampleBatchR2 {
+            stream_id: descriptor.stream_id,
+            stream_revision: streams.revision,
+            domain: descriptor.domain,
+            capture_phase: descriptor.capture_phase,
+            consistency_group: descriptor.consistency_group,
+            first_row_sequence: 1,
+            row_sequence_step: 1,
+            logical_cycle_step: descriptor.logical_cycle_step,
+            sample_period_ticks: 1,
+            row_count: subscription.batch_samples,
+            channel_ids,
+            sample_data: vec![0; sample_data_len],
+            metadata_encoding: MetadataEncodingR2::AffineWithOverrides,
+            row_metadata,
+        };
+        let payload_len = stream_sample_batch_r2_payload_len(&batch)
+            .map_err(|error| HardwareSmokeError::InvalidConfig(error.to_string()))?;
+        let frames_per_second =
+            f64::from(descriptor.sample_rate_hz) / f64::from(subscription.batch_samples);
+        payload_bytes_per_second += payload_len as f64 * frames_per_second;
+        wire_bytes_per_second +=
+            (FRAME_HEADER_LEN + payload_len + FRAME_CRC_LEN) as f64 * frames_per_second;
+    }
+    let required_baud = (wire_bytes_per_second * 10.0).ceil() as u64;
+    let estimated_utilization = configured_baud
+        .filter(|baud| *baud > 0)
+        .map(|baud| required_baud as f64 / f64::from(baud))
+        .unwrap_or(0.0);
+    Ok(R2SerialLinkBudget {
+        payload_bytes_per_second,
+        wire_bytes_per_second,
+        required_baud,
+        configured_baud,
+        estimated_utilization,
+        safe_utilization_limit: SAFE_SERIAL_UTILIZATION_LIMIT,
+        headroom: configured_baud
+            .map(|_| SAFE_SERIAL_UTILIZATION_LIMIT - estimated_utilization)
+            .unwrap_or(0.0),
+    })
+}
+
+fn enforce_serial_link_budget(budget: &R2SerialLinkBudget) -> Result<(), HardwareSmokeError> {
+    if let Some(configured_baud) = budget.configured_baud {
+        if budget.estimated_utilization > budget.safe_utilization_limit {
+            return contract(
+                "link_budget_exceeded",
+                format!(
+                    "required_baud={} configured_baud={} estimated_utilization={:.6}",
+                    budget.required_baud, configured_baud, budget.estimated_utilization
+                ),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn select_r2_subscriptions(
+    mode: HardwareSmokeMode,
+    channel_set: ChannelSet,
+    requested_batch_samples: u16,
+    max_batch_samples: u16,
+    profile: &MachineProfile,
+    channels: &ChannelTable,
+    streams: &StreamTableR2,
+) -> Result<Vec<StreamSubscriptionR2>, HardwareSmokeError> {
+    let selected = match mode {
+        HardwareSmokeMode::Handshake => Vec::new(),
+        HardwareSmokeMode::Ctrl8k => vec![SampleDomain::Control8k],
+        HardwareSmokeMode::Multistream | HardwareSmokeMode::LinkStress => {
+            vec![SampleDomain::Control8k, SampleDomain::Slow1k]
+        }
+    };
+    selected
+        .iter()
+        .map(|domain| {
+            let stream = streams
+                .streams
+                .iter()
+                .find(|value| value.domain == *domain)
+                .ok_or_else(|| HardwareSmokeError::Contract {
+                    code: "profile_missing_stream",
+                    message: format!("missing {} stream", domain_name(*domain)),
+                })?;
+            let profile_stream = profile.stream(*domain).ok_or_else(|| {
+                HardwareSmokeError::InvalidConfig(format!(
+                    "profile has no {} contract",
+                    domain_name(*domain)
+                ))
+            })?;
+            let mut requested_names = match channel_set {
+                ChannelSet::Required => profile_stream.required_channels.clone(),
+                ChannelSet::All => profile_stream
+                    .required_channels
+                    .iter()
+                    .chain(&profile_stream.optional_channels)
+                    .cloned()
+                    .collect(),
+            };
+            if requested_names.is_empty()
+                && *domain == SampleDomain::Slow1k
+                && matches!(
+                    mode,
+                    HardwareSmokeMode::Multistream | HardwareSmokeMode::LinkStress
+                )
+            {
+                if let Some(name) = profile_stream.optional_channels.iter().find(|name| {
+                    stream.channel_ids.iter().any(|channel_id| {
+                        channels
+                            .channel(*channel_id)
+                            .is_some_and(|channel| channel.name == name.as_str())
+                    })
+                }) {
+                    requested_names.push(name.clone());
+                }
+            }
+            let requested_names = requested_names.iter().collect::<BTreeSet<_>>();
+            let channel_mask = stream
+                .channel_ids
+                .iter()
+                .filter_map(|channel_id| {
+                    channels
+                        .channel(*channel_id)
+                        .filter(|channel| requested_names.contains(&channel.name))
+                })
+                .fold(0_u64, |mask, channel| mask | (1_u64 << channel.channel_id));
+            if channel_mask == 0 {
+                return Err(HardwareSmokeError::Contract {
+                    code: "profile_missing_channel",
+                    message: format!("{} has no selectable profile channels", stream.stream_id),
+                });
+            }
+            let batch_samples = if selected.len() > 1 {
+                let ctrl_rows = requested_batch_samples.max(8).next_multiple_of(8);
+                match domain {
+                    SampleDomain::Control8k => ctrl_rows,
+                    SampleDomain::Slow1k => ctrl_rows / 8,
+                    SampleDomain::Fast32k => ctrl_rows.saturating_mul(4),
+                }
+            } else {
+                requested_batch_samples
+            };
+            Ok(StreamSubscriptionR2 {
+                stream_id: stream.stream_id,
+                batch_samples: batch_samples.min(max_batch_samples),
+                channel_mask,
+            })
+        })
+        .collect()
+}
+
+const fn wire_format_bytes(format: WireFormat) -> usize {
+    match format {
+        WireFormat::I16 => 2,
+        WireFormat::I32 | WireFormat::F32 => 4,
+        WireFormat::U8 => 1,
+    }
+}
+
 pub fn run_v2_r2(
     config: &HardwareSmokeV2R2Config,
 ) -> Result<HardwareSmokeV2R2Result, HardwareSmokeError> {
@@ -495,6 +757,13 @@ pub fn run_v2_r2(
     if config.duration.is_zero() || config.duration > MAX_SMOKE_DURATION {
         return Err(HardwareSmokeError::InvalidConfig(
             "duration must be within 1ms..=60s".to_owned(),
+        ));
+    }
+    if config.mode == HardwareSmokeMode::LinkStress
+        && config.duration < MINIMUM_LINK_STRESS_DURATION
+    {
+        return Err(HardwareSmokeError::InvalidConfig(
+            "link-stress duration must be at least 5s".to_owned(),
         ));
     }
     if config.batch_samples == 0 {
@@ -554,77 +823,40 @@ fn run_v2_r2_connected(
     }
 
     let mut effective_payload_bytes = 0_u64;
+    let mut measured_streaming_duration = Duration::ZERO;
+    let subscriptions = select_r2_subscriptions(
+        config.mode,
+        config.channel_set,
+        config.batch_samples,
+        hello.max_batch_samples,
+        profile,
+        &channels,
+        &streams,
+    )?;
+    let configured_baud = match &config.transport {
+        TransportConfig::Serial { baud, .. } => Some(*baud),
+        TransportConfig::Tcp { .. } => None,
+    };
+    let link_budget =
+        estimate_r2_serial_budget(configured_baud, &subscriptions, &streams, &channels)?;
     let mut ready_after_stop = config.mode == HardwareSmokeMode::Handshake;
-    if !selected.is_empty() {
-        let subscriptions = selected
-            .iter()
-            .map(|domain| {
-                let stream = streams
-                    .streams
-                    .iter()
-                    .find(|value| value.domain == *domain)
-                    .ok_or_else(|| HardwareSmokeError::Contract {
-                        code: "profile_missing_stream",
-                        message: format!("missing {} stream", domain_name(*domain)),
-                    })?;
-                let profile_stream = profile.stream(*domain).ok_or_else(|| {
-                    HardwareSmokeError::InvalidConfig(format!(
-                        "profile has no {} contract",
-                        domain_name(*domain)
-                    ))
-                })?;
-                let requested_names = profile_stream
-                    .required_channels
-                    .iter()
-                    .chain(&profile_stream.optional_channels)
-                    .collect::<BTreeSet<_>>();
-                let channel_mask = stream
-                    .channel_ids
-                    .iter()
-                    .filter_map(|channel_id| {
-                        channels.channel(*channel_id).filter(|channel| {
-                            requested_names.is_empty() || requested_names.contains(&channel.name)
-                        })
-                    })
-                    .fold(0_u64, |mask, channel| mask | (1_u64 << channel.channel_id));
-                if channel_mask == 0 {
-                    return Err(HardwareSmokeError::Contract {
-                        code: "profile_missing_channel",
-                        message: format!("{} has no selectable profile channels", stream.stream_id),
-                    });
-                }
-                let batch_samples = if selected.len() > 1 {
-                    let ctrl_rows = config.batch_samples.max(8).next_multiple_of(8);
-                    match domain {
-                        SampleDomain::Control8k => ctrl_rows,
-                        SampleDomain::Slow1k => ctrl_rows / 8,
-                        SampleDomain::Fast32k => ctrl_rows.saturating_mul(4),
-                    }
-                } else {
-                    config.batch_samples
-                };
-                Ok(StreamSubscriptionR2 {
-                    stream_id: stream.stream_id,
-                    batch_samples: batch_samples.min(hello.max_batch_samples),
-                    channel_mask,
-                })
-            })
-            .collect::<Result<Vec<_>, HardwareSmokeError>>()?;
+    if !subscriptions.is_empty() {
         session.configure_streams_r2(ConfigureStreamsR2 {
             transaction_id: 1,
-            subscriptions,
+            subscriptions: subscriptions.clone(),
         })?;
         wait_for_v2_r2_configured(session)?;
+        enforce_serial_link_budget(&link_budget)?;
         session.start()?;
         let capture = collect_v2_r2(session, config.duration, &streams, hello.tick_hz, stats)?;
         stats = capture.stats;
         effective_payload_bytes = capture.effective_payload_bytes;
+        measured_streaming_duration = capture.measured_streaming_duration;
         session.stop()?;
         wait_for_ready(session)?;
         ready_after_stop = true;
     }
 
-    ensure_clean_v2_r2(config.mode, &stats)?;
     let duration_ms = config.duration.as_millis().try_into().unwrap_or(u64::MAX);
     let elapsed_seconds = config.duration.as_secs_f64();
     let average_data_rate_bps = if elapsed_seconds > 0.0 {
@@ -632,10 +864,7 @@ fn run_v2_r2_connected(
     } else {
         0.0
     };
-    let baud = match &config.transport {
-        TransportConfig::Serial { baud, .. } => Some(*baud),
-        TransportConfig::Tcp { .. } => None,
-    };
+    let baud = configured_baud;
     let estimated_link_utilization = baud
         .map(|value| average_data_rate_bps * 10.0 / f64::from(value))
         .unwrap_or(0.0);
@@ -652,23 +881,32 @@ fn run_v2_r2_connected(
                 .find(|value| value.stream_id == descriptor.stream_id)
                 .copied()
                 .unwrap_or_default();
+            let subscription = subscriptions
+                .iter()
+                .find(|value| value.stream_id == descriptor.stream_id)?;
             Some(stream_result(
                 domain,
                 value,
+                subscription,
+                descriptor.sample_rate_hz,
+                measured_streaming_duration,
                 stats.invalid_snapshot_rows,
                 stats.device_dropped_samples,
             ))
         })
         .collect::<Vec<_>>();
+    ensure_clean_v2_r2(config.mode, &stats, &stream_results)?;
     let received_rows = stream_results.iter().map(|value| value.received_rows).sum();
 
     Ok(HardwareSmokeV2R2Result {
         protocol: "scp1",
         protocol_revision: "v2-r2",
         mode: config.mode.name(),
+        channel_set: config.channel_set.name(),
         profile: profile.profile_name.clone(),
         transport: transport_label(&config.transport),
         baud,
+        link_budget,
         session_id: stats.session_id,
         device_id: hex_device_id(&hello.device_id),
         firmware_name: hello.firmware_name,
@@ -701,6 +939,7 @@ fn run_v2_r2_connected(
 struct V2CaptureStats {
     stats: SessionStats,
     effective_payload_bytes: u64,
+    measured_streaming_duration: Duration,
 }
 
 fn wait_for_v2_r2_handshake(
@@ -777,7 +1016,8 @@ fn collect_v2_r2(
     tick_hz: u64,
     initial_stats: SessionStats,
 ) -> Result<V2CaptureStats, HardwareSmokeError> {
-    let deadline = Instant::now() + duration;
+    let started = Instant::now();
+    let deadline = started + duration;
     let mut stats = initial_stats;
     let mut effective_payload_bytes = 0_u64;
     let mut seen = BTreeMap::<u16, u64>::new();
@@ -883,12 +1123,14 @@ fn collect_v2_r2(
     Ok(V2CaptureStats {
         stats,
         effective_payload_bytes,
+        measured_streaming_duration: started.elapsed(),
     })
 }
 
 fn ensure_clean_v2_r2(
     mode: HardwareSmokeMode,
     stats: &SessionStats,
+    streams: &[HardwareSmokeStreamResult],
 ) -> Result<(), HardwareSmokeError> {
     let checks = [
         ("crc_error", stats.crc_errors),
@@ -916,6 +1158,40 @@ fn ensure_clean_v2_r2(
         if stats.received_batches == 0 {
             return contract("no_sample_batches", "device produced no R2 sample batches");
         }
+        for stream in streams {
+            if stream.received_batches == 0 || stream.received_rows == 0 {
+                return contract(
+                    "stream_no_data",
+                    format!(
+                        "stream_id={} domain={} received_batches={} received_rows={}",
+                        stream.stream_id,
+                        stream.domain,
+                        stream.received_batches,
+                        stream.received_rows
+                    ),
+                );
+            }
+            if mode == HardwareSmokeMode::LinkStress {
+                let expected_min_rows = ((stream.expected_rows as f64
+                    * stream.minimum_throughput_ratio)
+                    .floor() as u64)
+                    .saturating_sub(stream.selected_batch_allowance());
+                if stream.received_rows < expected_min_rows {
+                    return contract(
+                        "stream_throughput_below_minimum",
+                        format!(
+                            "stream_id={} domain={} expected_rows={} received_rows={} throughput_ratio={:.6} minimum_throughput_ratio={:.6}",
+                            stream.stream_id,
+                            stream.domain,
+                            stream.expected_rows,
+                            stream.received_rows,
+                            stream.throughput_ratio,
+                            stream.minimum_throughput_ratio
+                        ),
+                    );
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -923,19 +1199,41 @@ fn ensure_clean_v2_r2(
 fn stream_result(
     domain: SampleDomain,
     stats: StreamSessionStats,
+    subscription: &StreamSubscriptionR2,
+    sample_rate_hz: u32,
+    measured_streaming_duration: Duration,
     invalid_rows: u64,
     device_dropped_rows: u64,
 ) -> HardwareSmokeStreamResult {
+    let expected_rows =
+        (f64::from(sample_rate_hz) * measured_streaming_duration.as_secs_f64()).floor() as u64;
+    let throughput_ratio = if expected_rows == 0 {
+        0.0
+    } else {
+        stats.received_rows as f64 / expected_rows as f64
+    };
     HardwareSmokeStreamResult {
-        stream_id: stats.stream_id,
+        stream_id: subscription.stream_id,
         domain: domain_name(domain).to_owned(),
+        selected_channel_count: subscription.channel_mask.count_ones() as usize,
+        selected_channel_mask: subscription.channel_mask,
+        selected_batch_samples: subscription.batch_samples,
         received_batches: stats.received_batches,
+        expected_rows,
         received_rows: stats.received_rows,
+        throughput_ratio,
+        minimum_throughput_ratio: MINIMUM_THROUGHPUT_RATIO,
         row_gaps: stats.row_sequence_gaps,
         row_reorders: stats.row_sequence_reorders,
         invalid_rows,
         host_dropped_rows: stats.host_dropped_rows,
         device_dropped_rows,
+    }
+}
+
+impl HardwareSmokeStreamResult {
+    fn selected_batch_allowance(&self) -> u64 {
+        u64::from(self.selected_batch_samples)
     }
 }
 
@@ -962,7 +1260,39 @@ mod tests {
     };
 
     use super::*;
-    use crate::live::simulator::{SimulatorConfig, SimulatorHandle};
+    use crate::live::simulator::{Hybrid30kR2FixtureFault, SimulatorConfig, SimulatorHandle};
+
+    fn hybrid30k_budget(
+        mode: HardwareSmokeMode,
+        channel_set: ChannelSet,
+        baud: u32,
+    ) -> R2SerialLinkBudget {
+        let simulator =
+            SimulatorHandle::spawn_hybrid30k_r2("127.0.0.1:0".parse().unwrap()).unwrap();
+        let session = LiveSession::connect_v2_r2(TransportConfig::Tcp {
+            address: simulator.address().to_string(),
+        })
+        .unwrap();
+        let (hello, channels, streams, _) = wait_for_v2_r2_handshake(&session).unwrap();
+        let profile = MachineProfile::load_named("hybrid30k").unwrap();
+        profile
+            .validate_compatibility(hello.device_capabilities, &channels, &streams)
+            .unwrap();
+        let subscriptions = select_r2_subscriptions(
+            mode,
+            channel_set,
+            16,
+            hello.max_batch_samples,
+            &profile,
+            &channels,
+            &streams,
+        )
+        .unwrap();
+        let budget =
+            estimate_r2_serial_budget(Some(baud), &subscriptions, &streams, &channels).unwrap();
+        session.disconnect().unwrap();
+        budget
+    }
 
     #[test]
     fn simulator_smoke_writes_clean_recording() {
@@ -1015,7 +1345,12 @@ mod tests {
                 },
                 profile: "hybrid30k".to_owned(),
                 mode,
-                duration: Duration::from_millis(400),
+                channel_set: ChannelSet::Required,
+                duration: if mode == HardwareSmokeMode::LinkStress {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_millis(400)
+                },
                 batch_samples: 4,
             })
             .unwrap_or_else(|error| {
@@ -1027,6 +1362,8 @@ mod tests {
             assert!(result.ok);
             assert_eq!(result.crc_errors, 0);
             assert_eq!(result.protocol_errors, 0);
+            assert_eq!(result.channel_set, "required");
+            assert_eq!(result.link_budget.configured_baud, None);
             if mode != HardwareSmokeMode::Handshake {
                 assert!(result.received_batches > 0);
                 assert!(result.ready_after_stop);
@@ -1034,6 +1371,7 @@ mod tests {
             if mode == HardwareSmokeMode::Ctrl8k {
                 assert_eq!(result.streams.len(), 1);
                 assert_eq!(result.streams[0].domain, "CTRL8K");
+                assert_eq!(result.streams[0].selected_channel_count, 5);
             }
             if matches!(
                 mode,
@@ -1041,7 +1379,158 @@ mod tests {
             ) {
                 assert_eq!(result.streams.len(), 2);
                 assert!(result.streams.iter().all(|stream| stream.received_rows > 0));
+                assert_eq!(result.streams[0].selected_channel_count, 5);
+                assert_eq!(result.streams[1].selected_channel_count, 1);
             }
         }
+    }
+
+    #[test]
+    fn hybrid30k_link_budget_uses_full_r2_wire_formula() {
+        for baud in [115_200, 921_600, 2_000_000, 4_000_000] {
+            let budget = hybrid30k_budget(HardwareSmokeMode::Ctrl8k, ChannelSet::Required, baud);
+            assert_eq!(
+                budget.required_baud,
+                (budget.wire_bytes_per_second * 10.0).ceil() as u64
+            );
+            assert!(
+                (budget.estimated_utilization - budget.required_baud as f64 / f64::from(baud))
+                    .abs()
+                    < f64::EPSILON
+            );
+            assert_eq!(
+                budget.estimated_utilization <= budget.safe_utilization_limit,
+                budget.required_baud
+                    <= (f64::from(baud) * budget.safe_utilization_limit).floor() as u64
+            );
+        }
+    }
+
+    #[test]
+    fn hybrid30k_link_budget_covers_frozen_baud_and_channel_scenarios() {
+        let ctrl_115k = hybrid30k_budget(HardwareSmokeMode::Ctrl8k, ChannelSet::Required, 115_200);
+        assert!(ctrl_115k.estimated_utilization > ctrl_115k.safe_utilization_limit);
+        let error = enforce_serial_link_budget(&ctrl_115k).unwrap_err();
+        assert_eq!(error.code(), "link_budget_exceeded");
+        let message = error.to_string();
+        assert!(message.contains("required_baud="));
+        assert!(message.contains("configured_baud=115200"));
+        assert!(message.contains("estimated_utilization="));
+
+        let ctrl_921k = hybrid30k_budget(HardwareSmokeMode::Ctrl8k, ChannelSet::Required, 921_600);
+        assert_eq!(
+            enforce_serial_link_budget(&ctrl_921k).is_ok(),
+            ctrl_921k.estimated_utilization <= ctrl_921k.safe_utilization_limit
+        );
+
+        let ctrl_2m = hybrid30k_budget(HardwareSmokeMode::Ctrl8k, ChannelSet::Required, 2_000_000);
+        assert_eq!(
+            enforce_serial_link_budget(&ctrl_2m).is_ok(),
+            ctrl_2m.estimated_utilization <= ctrl_2m.safe_utilization_limit
+        );
+
+        let ctrl_4m = hybrid30k_budget(HardwareSmokeMode::Ctrl8k, ChannelSet::Required, 4_000_000);
+        assert!(ctrl_4m.estimated_utilization <= ctrl_4m.safe_utilization_limit);
+
+        let multi_4m = hybrid30k_budget(
+            HardwareSmokeMode::Multistream,
+            ChannelSet::Required,
+            4_000_000,
+        );
+        assert!(multi_4m.estimated_utilization <= multi_4m.safe_utilization_limit);
+
+        let all_4m = hybrid30k_budget(HardwareSmokeMode::LinkStress, ChannelSet::All, 4_000_000);
+        assert_eq!(
+            all_4m.estimated_utilization <= all_4m.safe_utilization_limit,
+            all_4m.required_baud <= (4_000_000.0 * all_4m.safe_utilization_limit).floor() as u64
+        );
+
+        let tcp_budget = R2SerialLinkBudget {
+            configured_baud: None,
+            ..ctrl_115k
+        };
+        enforce_serial_link_budget(&tcp_budget).unwrap();
+    }
+
+    #[test]
+    fn all_channel_set_selects_all_present_profile_channels() {
+        let simulator =
+            SimulatorHandle::spawn_hybrid30k_r2("127.0.0.1:0".parse().unwrap()).unwrap();
+        let result = run_v2_r2(&HardwareSmokeV2R2Config {
+            transport: TransportConfig::Tcp {
+                address: simulator.address().to_string(),
+            },
+            profile: "hybrid30k-r2".to_owned(),
+            mode: HardwareSmokeMode::Multistream,
+            channel_set: ChannelSet::All,
+            duration: Duration::from_millis(400),
+            batch_samples: 16,
+        })
+        .unwrap();
+        assert_eq!(result.channel_set, "all");
+        assert_eq!(result.streams[0].selected_channel_count, 12);
+        assert_eq!(result.streams[1].selected_channel_count, 5);
+    }
+
+    #[test]
+    fn short_link_stress_is_rejected_before_connecting() {
+        let error = run_v2_r2(&HardwareSmokeV2R2Config {
+            transport: TransportConfig::Tcp {
+                address: "127.0.0.1:1".to_owned(),
+            },
+            profile: "hybrid30k".to_owned(),
+            mode: HardwareSmokeMode::LinkStress,
+            channel_set: ChannelSet::Required,
+            duration: Duration::from_millis(4_999),
+            batch_samples: 16,
+        })
+        .unwrap_err();
+        assert_eq!(error.code(), "invalid_config");
+    }
+
+    #[test]
+    fn multistream_fails_when_slow_stream_produces_no_data() {
+        let simulator = SimulatorHandle::spawn_hybrid30k_r2_with_fault(
+            "127.0.0.1:0".parse().unwrap(),
+            Hybrid30kR2FixtureFault::SlowStreamNoData,
+        )
+        .unwrap();
+        let error = run_v2_r2(&HardwareSmokeV2R2Config {
+            transport: TransportConfig::Tcp {
+                address: simulator.address().to_string(),
+            },
+            profile: "hybrid30k".to_owned(),
+            mode: HardwareSmokeMode::Multistream,
+            channel_set: ChannelSet::Required,
+            duration: Duration::from_millis(400),
+            batch_samples: 16,
+        })
+        .unwrap_err();
+        assert_eq!(error.code(), "stream_no_data");
+        assert!(error.to_string().contains("stream_id=3"));
+        assert!(error.to_string().contains("domain=SLOW1K"));
+    }
+
+    #[test]
+    fn link_stress_fails_when_slow_stream_runs_at_half_rate() {
+        let simulator = SimulatorHandle::spawn_hybrid30k_r2_with_fault(
+            "127.0.0.1:0".parse().unwrap(),
+            Hybrid30kR2FixtureFault::SlowStreamHalfRate,
+        )
+        .unwrap();
+        let error = run_v2_r2(&HardwareSmokeV2R2Config {
+            transport: TransportConfig::Tcp {
+                address: simulator.address().to_string(),
+            },
+            profile: "hybrid30k".to_owned(),
+            mode: HardwareSmokeMode::LinkStress,
+            channel_set: ChannelSet::Required,
+            duration: Duration::from_secs(5),
+            batch_samples: 16,
+        })
+        .unwrap_err();
+        assert_eq!(error.code(), "stream_throughput_below_minimum");
+        assert!(error.to_string().contains("stream_id=3"));
+        assert!(error.to_string().contains("domain=SLOW1K"));
     }
 }

@@ -1,6 +1,6 @@
 # Hybrid30K SCP1 V2 R2 第一轮 DSP Bring-up
 
-本文面向 Hybrid30K DSP 固件开发者，定义第一轮真板联调所需的最小 wire contract 和验收顺序。Scope 0.15.4 没有修改 SCP1 V2 R2 语义，也不规定 DSP 的 RAM、DMA、GPIO 或 UART/SCI 实现；这些资源由 Hybrid30K 工程自行分配。
+本文面向 Hybrid30K DSP 固件开发者，定义第一轮真板联调所需的最小 wire contract 和验收顺序。Scope 0.15.5 没有修改 SCP1 V2 R2 语义，也不规定 DSP 的 RAM、DMA、GPIO 或 UART/SCI 实现；这些资源由 Hybrid30K 工程自行分配。
 
 ## 1. 第一轮 DSP 最小实现清单
 
@@ -56,30 +56,36 @@ consistency group 1 的 `logical_cycle_rate_hz` 固定为 32000。FAST32K、CTRL
 
 ## 8. Machine Profile
 
-协议契约位于 `profiles/hybrid30k-r2.json`。它只包含 capability、causal group、stream、channel、wire format、scale 和 unit，不包含源文件、变量地址、共享 RAM、引脚或外设实例信息。
+协议契约位于 `profiles/hybrid30k-r2.json`。发布的 `scope-hardware-smoke.exe` 已将该 JSON 编译期嵌入，`--profile hybrid30k` 与 `--profile hybrid30k-r2` 不访问运行机器的源码目录；只有传入自定义 JSON 路径时才读取文件系统。Profile 只包含 capability、causal group、stream、channel、wire format、scale 和 unit，不包含源文件、变量地址、共享 RAM、引脚或外设实例信息。
 
 Profile 校验错误会区分：`profile_missing_stream`、`profile_stream_rate_mismatch`、`profile_logical_step_mismatch`、`profile_missing_channel`、`profile_channel_format_mismatch`、`profile_channel_scale_mismatch`、`profile_channel_unit_mismatch` 和 `profile_capability_mismatch`。
 
-## 9. Hardware Smoke 命令
+## 9. Hardware Smoke 与带宽门禁
 
-先运行 handshake：
+CTRL8K 默认 `--channel-set required`，只订阅 `Ia/Ib/Ic/Vdc/SampleValid`；`--channel-set all` 才会加入设备实际存在的 optional channels。multistream 默认使用 CTRL8K required 加 SLOW1K 第一个实际存在的 optional channel，不会自动打开全部 SLOW1K optional channels。
+
+Serial 在 CONFIGURE 确认后、START 前计算理论链路占用。估算包含 SCP1 frame header、CRC、R2 fixed sample header、channel-id table、实际 wire format、affine metadata、batch 频率，以及 8N1 每字节 10 bit；超过 70% 返回 `link_budget_exceeded`，错误包含 `required_baud`、`configured_baud` 和 `estimated_utilization`。TCP 也输出估算，但不应用串口拒绝门禁。
+
+阶段 A（115200）仅做 handshake、PING/PONG、ChannelTable、StreamTableR2 和 CONFIGURE 命令验证，不推荐 START 标准 CTRL8K。若显式运行数据模式，仍会先经过预算门禁：
 
 ```powershell
 scope-hardware-smoke --protocol v2-r2 --profile hybrid30k --serial-port COM7 --baud 115200 --mode handshake --duration-ms 3000 --output evidence\handshake.json
 ```
 
-再运行 CTRL8K、multistream 和 link-stress：
+阶段 B（921600）继续控制面与低带宽自定义流试验；不得宣称标准 Hybrid30K CTRL8K required 一定可运行。阶段 C（2M）首次尝试 CTRL8K required-only。阶段 D（4M）以 CTRL8K required、CTRL8K+SLOW1K minimal 和 link-stress 为目标：
 
 ```powershell
-scope-hardware-smoke --protocol v2-r2 --profile hybrid30k --serial-port COM7 --baud 115200 --mode ctrl8k --duration-ms 3000 --output evidence\ctrl8k.json
-scope-hardware-smoke --protocol v2-r2 --profile hybrid30k --serial-port COM7 --baud 115200 --mode multistream --duration-ms 3000 --output evidence\multistream.json
-scope-hardware-smoke --protocol v2-r2 --profile hybrid30k --serial-port COM7 --baud 115200 --mode link-stress --duration-ms 10000 --output evidence\link-stress-115200.json
+scope-hardware-smoke --protocol v2-r2 --profile hybrid30k --serial-port COM7 --baud 2000000 --mode ctrl8k --channel-set required --duration-ms 3000 --output evidence\ctrl8k-2m.json
+scope-hardware-smoke --protocol v2-r2 --profile hybrid30k --serial-port COM7 --baud 4000000 --mode multistream --channel-set required --duration-ms 3000 --output evidence\multistream-4m.json
+scope-hardware-smoke --protocol v2-r2 --profile hybrid30k --serial-port COM7 --baud 4000000 --mode link-stress --channel-set required --duration-ms 10000 --output evidence\link-stress-4m.json
 ```
 
-也可用 `--tcp host:port` 做 software smoke，但其 JSON 不能归档为 hardware PASS。成功时 stdout 为 `ok=true` JSON 且退出码为 0；失败时 stdout 仍为结构化 `ok=false` JSON，并携带稳定 `error.code`。
+`link-stress` 要求至少 5 秒，真板推荐至少 10 秒。每个订阅 Stream 必须同时有 batch 和 row；否则返回 `stream_no_data`。link-stress 还按 Stream 检查最低 95% 吞吐率，并允许 START/STOP 边界少一个 batch；否则返回 `stream_throughput_below_minimum`。
+
+也可用 `--tcp host:port` 做 software smoke，但其 JSON 不能归档为 hardware PASS。成功 JSON 包含 `channel_set`、`link_budget`，以及每个 Stream 的选择 mask、expected/received rows、throughput ratio 和 drop/sequence 诊断。成功时 stdout 为 `ok=true` 且退出码为 0；失败时 stdout 仍为结构化 `ok=false` JSON，并携带稳定 `error.code`。
 
 ## 10. 推荐波特率升级顺序
 
-真板逐级执行 `115200 → 921600 → 2M → 4M`。每一级都先 handshake，再 CTRL8K，再 multistream，最后 link-stress；只有当前级全部干净通过后才提高波特率。
+真板按冻结策略逐级执行：阶段 A `115200` 只做 handshake/control-plane；阶段 B `921600` 做控制面和低带宽试验；阶段 C `2M` 首次尝试 CTRL8K required-only；阶段 D `4M` 才以 CTRL8K + SLOW1K + stress 为目标。所有阶段均执行理论 preflight，任何波特率都不能绕过 70% 门限。
 
-这个顺序只是测试计划，不表示 Scope 仓库已经验证 2 Mbaud 或 4 Mbaud 硬件。当前仓库尚未进行真实 Hybrid30K DSP、串口电气链路、长时间稳定性或高波特率验收。
+这些波特率是测试阶段，不是“必然支持”声明。真实支持必须同时满足理论 preflight 与真板 hardware smoke；当前仓库尚未进行真实 Hybrid30K DSP、串口电气链路、长时间稳定性或高波特率验收。

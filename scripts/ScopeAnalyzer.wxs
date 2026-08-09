@@ -4,7 +4,7 @@
     Id="*"
     Name="Scope Analyzer"
     Language="1033"
-    Version="0.15.4"
+    Version="0.15.5"
     Manufacturer="Scope"
     UpgradeCode="{8C47D14B-9AA6-4F93-89C8-1B2D66B70B94}">
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="x64" />

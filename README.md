@@ -11,7 +11,9 @@ Configuration import/export is intentionally split so one file type cannot overw
 
 Windows 离线波形分析工具。界面按软件示波器方式组织，支持多 CSV 数据组叠加、通道勾选与分栏显示、双光标测量、选区 FFT/THD、三相正负序分析、变量名导入导出、浅色/深色主题和中英文界面。
 
-0.15.4 增加 Hybrid30K SCP1 V2 R2 第一轮真板接入工具包：扩展现有 `scope-hardware-smoke` 的 handshake、CTRL8K、CTRL8K+SLOW1K multistream 和 link-stress 模式，加入 `profiles/hybrid30k-r2.json` 协议契约及静态 DSP Golden Vectors。TCP 测试仅是 software smoke；真实串口、DSP 和 4 Mbaud 硬件仍未验证。接入步骤见 [Hybrid30K R2 bring-up](docs/integration/hybrid30k-r2-bringup.md)。
+0.15.5 加固 Hybrid30K SCP1 V2 R2 Hardware Acceptance Kit：内置 profile 改为编译期嵌入，串口 START 前执行含 frame/CRC/affine metadata/8N1 的 70% link-budget preflight；CTRL8K 默认仅订阅 required channels，multistream 逐 Stream 验证真实数据，link-stress 逐 Stream 验证最低 95% 吞吐率。TCP 测试仍只属于 software smoke；真实串口、DSP 和 2/4 Mbaud 硬件尚未验证。接入步骤见 [Hybrid30K R2 bring-up](docs/integration/hybrid30k-r2-bringup.md)。
+
+0.15.4 增加 Hybrid30K SCP1 V2 R2 第一轮真板接入工具包：扩展现有 `scope-hardware-smoke` 的 handshake、CTRL8K、CTRL8K+SLOW1K multistream 和 link-stress 模式，加入 `profiles/hybrid30k-r2.json` 协议契约及静态 DSP Golden Vectors。
 
 0.15.3 冻结 SCP1 V2 R1/R2 二进制边界：R1 保持 28 字节元数据和原消息号，R2 使用独立消息号、原子多 Stream 订阅、统一 logical cycle、水位驱动有界因果匹配和批级压缩元数据。FAST32K/CTRL8K/SLOW1K 模拟链路支持真实因果关系；DeviceReset 会建立新 session，Capture 使用增量 CRC32C。默认 GUI、SCP1 V1 和 `.scope V1` 保持不变。详细规范见 [SCP1 V2](docs/protocols/scp1-live-scope-v2.md)。
 
@@ -59,6 +61,8 @@ cargo run --release --bin scope_dsp_simulator -- --listen 127.0.0.1:19090
 Normal/Single 触发命中后，中央波形显示完整 pre/post capture；`Arm/重新布防` 清除上一次冻结 capture。Auto 模式未命中边沿时按 `Auto timeout` 样点数生成明确标记的超时 capture。右侧同时显示 CRC、协议错误、主机显示丢批、设备丢样/发送溢出，以及录波已写/排队记录数。
 
 串口模式使用 8-N-1、无流控，切换到串口时默认 115200 baud；波特率仍可在实时工具栏中修改。DSP 固件需要实现 [SCP1 V1 协议](docs/protocols/scp1-live-scope-v1.md)。`LAUNCHXL-F28P65X` + XDS110 Application/User UART 已在 115200 baud、四通道、500 Hz、每批 10 点条件下完成连接、触发、3010 连续样本录波和离线回放实测。
+
+Hybrid30K V2 R2 Hardware Kit 使用独立的分阶段策略：115200 仅做 handshake/control-plane，921600 做控制面和低带宽试验，2M 首次尝试 CTRL8K required-only，4M 才作为 CTRL8K+SLOW1K 与 stress 目标。`scope-hardware-smoke` 默认 `--channel-set required`，Serial 在 START 前执行完整 8N1/R2 wire-cost 70% preflight；任何阶段都不是必然支持声明，必须同时通过理论预算和真板 smoke。详见 [Hybrid30K R2 bring-up](docs/integration/hybrid30k-r2-bringup.md)。
 
 ### 实时连接排查
 
@@ -214,22 +218,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release-check.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -OfflinePackage -RequireSignature
 # 在 Win10/11 acceptance runner 上执行安装/升级/卸载和渲染器烟测
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-acceptance.ps1 `
-  -MsiPath dist\ScopeAnalyzer-0.15.4-win-x64.msi `
-  -ZipPath dist\ScopeAnalyzer-0.15.4-win-x64.zip `
+  -MsiPath dist\ScopeAnalyzer-0.15.5-win-x64.msi `
+  -ZipPath dist\ScopeAnalyzer-0.15.5-win-x64.zip `
   -ReleaseEvidencePath dist\release-evidence.json `
   -RequireSignature -RequireMesaRuntime -RequireAngleRuntime -RequireRdpSession `
   -OutputPath dist\windows-acceptance.json
 # 如需单独验证标准用户启动，先在验收管理员会话中部署但不要卸载
-msiexec.exe /i dist\ScopeAnalyzer-0.15.4-win-x64.msi /qn /norestart
+msiexec.exe /i dist\ScopeAnalyzer-0.15.5-win-x64.msi /qn /norestart
 # 切换到标准用户会话后复核启动权限和渲染器路径
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-acceptance.ps1 `
-  -MsiPath dist\ScopeAnalyzer-0.15.4-win-x64.msi `
-  -ZipPath dist\ScopeAnalyzer-0.15.4-win-x64.zip `
+  -MsiPath dist\ScopeAnalyzer-0.15.5-win-x64.msi `
+  -ZipPath dist\ScopeAnalyzer-0.15.5-win-x64.zip `
   -ReleaseEvidencePath dist\release-evidence.json `
   -SkipMsiLifecycle -RequireStandardUser -RequireSignature -RequireMesaRuntime -RequireAngleRuntime -RequireRdpSession `
   -OutputPath dist\windows-acceptance-standard-user.json
 # 验收结束后由管理员清理部署
-msiexec.exe /x dist\ScopeAnalyzer-0.15.4-win-x64.msi /qn /norestart
+msiexec.exe /x dist\ScopeAnalyzer-0.15.5-win-x64.msi /qn /norestart
 ```
 
 Release runners must preload Mesa and ANGLE in controlled directories **outside**
@@ -275,8 +279,8 @@ Windows smoke tests rather than being mixed into this deterministic core gate.
 
 产物在：
 
-- `dist/ScopeAnalyzer-0.15.4-win-x64.zip`
-- `dist/ScopeAnalyzer-0.15.4-win-x64.msi`
+- `dist/ScopeAnalyzer-0.15.5-win-x64.zip`
+- `dist/ScopeAnalyzer-0.15.5-win-x64.msi`
 
 压缩包和 MSI 同时包含 `scope-cli.exe`，用于 CI 中的 Compare、规则检查和 Markdown 报告生成。
 同时包含 `build-provenance.json`（源码 commit、工具链、运行时和 stage 文件 SHA256）与

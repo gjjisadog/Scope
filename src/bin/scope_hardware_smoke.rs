@@ -2,7 +2,7 @@ use std::{env, fs, path::Path, process::ExitCode, time::Duration};
 
 use scope_analyzer::live::{
     hardware_smoke::{
-        run, run_v2_r2, HardwareSmokeConfig, HardwareSmokeError, HardwareSmokeMode,
+        run, run_v2_r2, ChannelSet, HardwareSmokeConfig, HardwareSmokeError, HardwareSmokeMode,
         HardwareSmokeResult, HardwareSmokeV2R2Config, HardwareSmokeV2R2Result,
     },
     transport::TransportConfig,
@@ -24,7 +24,7 @@ struct SuccessEnvelope {
 #[serde(untagged)]
 enum CommandResult {
     V1(HardwareSmokeResult),
-    V2R2(HardwareSmokeV2R2Result),
+    V2R2(Box<HardwareSmokeV2R2Result>),
 }
 
 #[derive(Serialize)]
@@ -46,6 +46,7 @@ struct Options {
     protocol: String,
     profile: Option<String>,
     mode: String,
+    channel_set: String,
     serial_port: Option<String>,
     tcp_address: Option<String>,
     baud: u32,
@@ -162,6 +163,12 @@ fn execute(options: Options) -> Result<CommandResult, HardwareSmokeError> {
                     options.mode
                 ))
             })?;
+            let channel_set = ChannelSet::parse(&options.channel_set).ok_or_else(|| {
+                HardwareSmokeError::InvalidConfig(format!(
+                    "unsupported --channel-set {}; expected required|all",
+                    options.channel_set
+                ))
+            })?;
             let result = run_v2_r2(&HardwareSmokeV2R2Config {
                 transport,
                 profile: options.profile.ok_or_else(|| {
@@ -170,6 +177,7 @@ fn execute(options: Options) -> Result<CommandResult, HardwareSmokeError> {
                     )
                 })?,
                 mode,
+                channel_set,
                 duration: Duration::from_millis(options.duration_ms),
                 batch_samples: options.batch_samples.unwrap_or(16),
             })?;
@@ -183,7 +191,7 @@ fn execute(options: Options) -> Result<CommandResult, HardwareSmokeError> {
                     output_path.display()
                 ))
             })?;
-            Ok(CommandResult::V2R2(result))
+            Ok(CommandResult::V2R2(Box::new(result)))
         }
         other => Err(HardwareSmokeError::InvalidConfig(format!(
             "unsupported --protocol {other}; expected v1|v2-r2"
@@ -195,6 +203,7 @@ fn parse_options(args: Vec<String>) -> Result<Option<Options>, String> {
     let mut options = Options {
         protocol: "v1".to_owned(),
         mode: "handshake".to_owned(),
+        channel_set: "required".to_owned(),
         baud: 921_600,
         duration_ms: 3_000,
         channel_count: 1,
@@ -212,6 +221,7 @@ fn parse_options(args: Vec<String>) -> Result<Option<Options>, String> {
             "--protocol" => options.protocol = next_value(&mut args, &argument)?,
             "--profile" => options.profile = Some(next_value(&mut args, &argument)?),
             "--mode" => options.mode = next_value(&mut args, &argument)?,
+            "--channel-set" => options.channel_set = next_value(&mut args, &argument)?,
             "--baud" => options.baud = parse_value(&mut args, &argument)?,
             "--output" => options.output = Some(next_value(&mut args, &argument)?),
             "--duration-ms" => options.duration_ms = parse_value(&mut args, &argument)?,
@@ -250,7 +260,7 @@ fn print_usage() {
          scope-hardware-smoke [--protocol v1] --tcp <host:port> --output <scope> [options]\n\
          scope-hardware-smoke --protocol v2-r2 --profile <name> --mode <mode> (--serial-port <port>|--tcp <host:port>) --output <json> [options]\n\
          modes: handshake | ctrl8k | multistream | link-stress\n\
-         options: --duration-ms <ms> --sample-rate <hz> --batch-samples <count> --channels <count>"
+         options: --channel-set required|all --duration-ms <ms> --sample-rate <hz> --batch-samples <count> --channels <count>"
     );
 }
 
@@ -272,6 +282,7 @@ mod tests {
         assert_eq!(options.baud, 921_600);
         assert_eq!(options.duration_ms, 3_000);
         assert_eq!(options.channel_count, 1);
+        assert_eq!(options.channel_set, "required");
     }
 
     #[test]
@@ -290,6 +301,15 @@ mod tests {
             assert_eq!(options.protocol, "v2-r2");
             assert_eq!(options.profile.as_deref(), Some("hybrid30k"));
             assert_eq!(options.mode, mode);
+            assert_eq!(options.channel_set, "required");
         }
+    }
+
+    #[test]
+    fn parses_explicit_all_channel_set() {
+        let options = parse_options(vec!["--channel-set".to_owned(), "all".to_owned()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(options.channel_set, "all");
     }
 }

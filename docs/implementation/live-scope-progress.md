@@ -1,6 +1,6 @@
 # DSP 实时软件示波器 V1 + V2 实施进度
 
-最后更新：2026-08-09（Scope Analyzer 0.15.4）
+最后更新：2026-08-09（Scope Analyzer 0.15.5）
 
 ## 当前里程碑
 
@@ -18,6 +18,7 @@
 - 0.15.2 将 `logical_cycle_sequence` 与 stream-local `row_sequence` 分离，加入有界乱序因果匹配、Capture 失败后会话恢复与终态缓存释放、严格 row/timestamp 映射、多 nonce 心跳窗口，并把 15 preset 会话断言细化为逐项语义检查。
 - 0.15.3 将 R1 固定为 28-byte/0x32，并以 0x33/34/35/47 建立 R2；实现 1..8 Stream 原子订阅、32 kHz logical time（step 1/4/32）、正负 offset 和 watermark deadline。
 - 0.15.4 增加 Hybrid30K R2 Machine Profile、静态 DSP Golden Vectors，以及 handshake/CTRL8K/multistream/link-stress 验收模式；TCP 结果只作为 software smoke。
+- 0.15.5 将 Hybrid30K profile 编译期嵌入 Hardware Smoke，加入 START 前 70% Serial link-budget、`required|all` 通道集、逐 Stream no-data 与 link-stress 95% 吞吐校验；115200/921600/2M/4M 固定为控制面到 stress 的递进试验阶段，真实支持仍需真板证据。
 - R2 Snapshot 默认使用 48-byte affine base + sparse override；自动带宽门禁覆盖 4 Mbaud 70% 阈值。Capture R2 使用纯长度、相邻块检查、Arc block 与增量 CRC，失败后连接可复用。
 - DeviceReset 清空全部 session-local 状态并拒绝旧 id，等新 HELLO_ACK/ChannelTable/StreamTableR2 后回到 Ready，不自动恢复订阅或 Streaming。heartbeat 分离统计 RTT/timeout/unknown/duplicate/overflow。
 - CI 增加 focused live、simulator 和独立 100 万行 causal bounded job；这些仍是软件模拟证据，不是真实 Hybrid30K 硬件验证。

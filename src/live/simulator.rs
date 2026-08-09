@@ -232,6 +232,14 @@ pub struct SimulatorHandle {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Hybrid30kR2FixtureFault {
+    #[default]
+    None,
+    SlowStreamNoData,
+    SlowStreamHalfRate,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SimulatorStats {
     pub connections: u64,
     pub hello_requests: u64,
@@ -271,6 +279,13 @@ impl SimulatorHandle {
     /// This is software evidence only and deliberately does not alter the frozen
     /// general-purpose simulator presets.
     pub fn spawn_hybrid30k_r2(listen: SocketAddr) -> Result<Self, SimulatorError> {
+        Self::spawn_hybrid30k_r2_with_fault(listen, Hybrid30kR2FixtureFault::None)
+    }
+
+    pub fn spawn_hybrid30k_r2_with_fault(
+        listen: SocketAddr,
+        fault: Hybrid30kR2FixtureFault,
+    ) -> Result<Self, SimulatorError> {
         let listener = TcpListener::bind(listen)?;
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
@@ -280,7 +295,7 @@ impl SimulatorHandle {
         let worker_stats = Arc::clone(&stats);
         let worker = thread::Builder::new()
             .name("scope-hybrid30k-r2-fixture".to_owned())
-            .spawn(move || run_hybrid30k_r2_listener(listener, worker_stop, worker_stats))?;
+            .spawn(move || run_hybrid30k_r2_listener(listener, worker_stop, worker_stats, fault))?;
         Ok(Self {
             address,
             stop,
@@ -314,6 +329,7 @@ fn run_hybrid30k_r2_listener(
     listener: TcpListener,
     stop: Arc<AtomicBool>,
     stats: Arc<Mutex<SimulatorStats>>,
+    fault: Hybrid30kR2FixtureFault,
 ) {
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
@@ -324,7 +340,7 @@ fn run_hybrid30k_r2_listener(
                 update_stats(&stats, |value| {
                     value.connections = value.connections.saturating_add(1)
                 });
-                let _ = serve_hybrid30k_r2_client(stream, &stop, &stats);
+                let _ = serve_hybrid30k_r2_client(stream, &stop, &stats, fault);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(5));
@@ -338,6 +354,7 @@ fn serve_hybrid30k_r2_client(
     mut stream: TcpStream,
     stop: &AtomicBool,
     stats: &Mutex<SimulatorStats>,
+    fault: Hybrid30kR2FixtureFault,
 ) -> Result<(), SimulatorError> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_millis(5)))?;
@@ -492,32 +509,47 @@ fn serve_hybrid30k_r2_client(
                 .as_ref()
                 .expect("Hybrid30K R2 streaming requires configuration");
             for subscription in &configure.subscriptions {
-                let first_row = *row_sequences.entry(subscription.stream_id).or_insert(1);
-                let batch = v2_r2_sample_batch(
-                    &streams,
-                    &channels,
-                    subscription,
-                    first_row,
-                    V2Preset::CausalInOrder30k,
-                    emitted_rounds,
-                )?;
-                row_sequences.insert(
-                    subscription.stream_id,
-                    first_row.saturating_add(u64::from(subscription.batch_samples)),
-                );
-                let timestamp_ticks = first_row
-                    .saturating_sub(1)
-                    .saturating_mul(u64::from(batch.sample_period_ticks));
-                send_v2_r2_message(
-                    &mut stream,
-                    &mut out_sequence,
-                    session_id,
-                    MessageV2R2::StreamSampleBatch(batch),
-                    timestamp_ticks,
-                )?;
-                update_stats(stats, |value| {
-                    value.emitted_batches = value.emitted_batches.saturating_add(1)
-                });
+                if subscription.stream_id == 3
+                    && (fault == Hybrid30kR2FixtureFault::SlowStreamNoData
+                        || (fault == Hybrid30kR2FixtureFault::SlowStreamHalfRate
+                            && !emitted_rounds.is_multiple_of(2)))
+                {
+                    continue;
+                }
+                let repeats = match (subscription.stream_id, fault) {
+                    (2, _) => 3,
+                    (3, Hybrid30kR2FixtureFault::SlowStreamHalfRate) => 1,
+                    (3, _) => 3,
+                    _ => 1,
+                };
+                for _ in 0..repeats {
+                    let first_row = *row_sequences.entry(subscription.stream_id).or_insert(1);
+                    let batch = v2_r2_sample_batch(
+                        &streams,
+                        &channels,
+                        subscription,
+                        first_row,
+                        V2Preset::CausalInOrder30k,
+                        emitted_rounds,
+                    )?;
+                    row_sequences.insert(
+                        subscription.stream_id,
+                        first_row.saturating_add(u64::from(subscription.batch_samples)),
+                    );
+                    let timestamp_ticks = first_row
+                        .saturating_sub(1)
+                        .saturating_mul(u64::from(batch.sample_period_ticks));
+                    send_v2_r2_message(
+                        &mut stream,
+                        &mut out_sequence,
+                        session_id,
+                        MessageV2R2::StreamSampleBatch(batch),
+                        timestamp_ticks,
+                    )?;
+                    update_stats(stats, |value| {
+                        value.emitted_batches = value.emitted_batches.saturating_add(1)
+                    });
+                }
             }
             emitted_rounds = emitted_rounds.saturating_add(1);
             thread::sleep(Duration::from_millis(1));

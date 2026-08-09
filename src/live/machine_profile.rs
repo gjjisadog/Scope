@@ -15,6 +15,7 @@ use super::{
 };
 
 const SCALE_EPSILON: f32 = 1.0e-6;
+const HYBRID30K_R2_PROFILE_JSON: &str = include_str!("../../profiles/hybrid30k-r2.json");
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -141,13 +142,10 @@ impl ProfileError {
 
 impl MachineProfile {
     pub fn load_named(name: &str) -> Result<Self, ProfileError> {
-        let path = match name {
-            "hybrid30k" | "hybrid30k-r2" => Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("profiles")
-                .join("hybrid30k-r2.json"),
-            other => Path::new(other).to_path_buf(),
-        };
-        Self::load(path)
+        match name {
+            "hybrid30k" | "hybrid30k-r2" => Self::from_json(HYBRID30K_R2_PROFILE_JSON),
+            other => Self::load(other),
+        }
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ProfileError> {
@@ -351,6 +349,8 @@ fn wire_format_name(format: WireFormat) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, time::SystemTime};
+
     use super::*;
     use crate::live::{
         protocol::{ChannelDescriptor, ChannelKind},
@@ -447,6 +447,50 @@ mod tests {
                 &streams,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn built_in_profile_aliases_do_not_require_a_runtime_source_tree() {
+        for name in ["hybrid30k", "hybrid30k-r2"] {
+            let profile = MachineProfile::load_named(name).unwrap();
+            assert_eq!(profile.profile_name, "hybrid30k-r2");
+        }
+    }
+
+    #[test]
+    fn external_profile_paths_report_valid_invalid_and_missing_files() {
+        let suffix = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let valid = std::env::temp_dir().join(format!("scope-profile-{suffix}.json"));
+        let invalid = std::env::temp_dir().join(format!("scope-profile-invalid-{suffix}.json"));
+        let missing = std::env::temp_dir().join(format!("scope-profile-missing-{suffix}.json"));
+
+        fs::write(&valid, HYBRID30K_R2_PROFILE_JSON).unwrap();
+        fs::write(&invalid, r#"{"profile_version":1,"unknown":true}"#).unwrap();
+
+        assert_eq!(
+            MachineProfile::load_named(valid.to_str().unwrap())
+                .unwrap()
+                .profile_name,
+            "hybrid30k-r2"
+        );
+        assert_eq!(
+            MachineProfile::load_named(invalid.to_str().unwrap())
+                .unwrap_err()
+                .code(),
+            "profile_schema_invalid"
+        );
+        assert_eq!(
+            MachineProfile::load_named(missing.to_str().unwrap())
+                .unwrap_err()
+                .code(),
+            "profile_io_error"
+        );
+
+        fs::remove_file(valid).unwrap();
+        fs::remove_file(invalid).unwrap();
     }
 
     #[test]
