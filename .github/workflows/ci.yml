@@ -13,6 +13,8 @@ jobs:
   rust:
     name: Rust checks (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      RUST_TEST_THREADS: 1
     strategy:
       fail-fast: false
       matrix:
@@ -63,10 +65,11 @@ jobs:
           failing_exit=$?
           set -e
           test "$failing_exit" -eq 5
-          python3 - <<PY
+          python3 - <<'PY'
           import json
+          import os
           from pathlib import Path
-          failed = json.loads(Path("$RUNNER_TEMP/scope-failing-rules.json").read_text())
+          failed = json.loads((Path(os.environ["RUNNER_TEMP"]) / "scope-failing-rules.json").read_text())
           assert failed["ok"] is True
           assert failed["result"]["passed"] is False
           PY
@@ -78,10 +81,11 @@ jobs:
             --rules tests/fixtures/compare/rules.json \
             --output "$RUNNER_TEMP/scope-report.md" \
             --evidence-output "$RUNNER_TEMP/scope-evidence.svg" > "$RUNNER_TEMP/scope-report.json"
-          python3 - <<PY
+          python3 - <<'PY'
           import json
+          import os
           from pathlib import Path
-          report = json.loads(Path("$RUNNER_TEMP/scope-report.json").read_text())
+          report = json.loads((Path(os.environ["RUNNER_TEMP"]) / "scope-report.json").read_text())
           assert report["ok"] is True
           assert report["result"]["dataQuality"]["triggerQuality"] == []
           evidence = report["result"]["compareEvidence"]
@@ -111,7 +115,7 @@ jobs:
           key: ubuntu-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: ubuntu-cargo-
       - name: Live measurement p95 gate
-        run: cargo test --locked --lib live_measurement_p95 -- --ignored --test-threads=1
+        run: cargo test --release --locked --lib live_measurement_p95 -- --ignored --test-threads=1
       - name: Compare and render performance gates
         run: cargo test --locked --bin scope_analyzer -- --ignored perf_ --test-threads=1
       - name: Protocol one-million-input fuzz gate
@@ -144,6 +148,8 @@ jobs:
   coverage:
     name: Route A core coverage gates
     runs-on: ubuntu-latest
+    env:
+      RUST_TEST_THREADS: 1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
