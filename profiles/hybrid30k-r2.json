@@ -1,0 +1,69 @@
+{
+  "profile_version": 1,
+  "profile_name": "hybrid30k-r2",
+  "protocol": "scp1-v2-r2",
+  "protocol_revision": 2,
+  "stream_table_revision": 3,
+  "required_capabilities": [
+    "CAPABILITY_V2_STREAMS_R2",
+    "CAPABILITY_V2_MULTI_STREAM",
+    "CAPABILITY_V2_COMPRESSED_METADATA"
+  ],
+  "causal_groups": [
+    {
+      "consistency_group": 1,
+      "logical_cycle_rate_hz": 32000
+    }
+  ],
+  "streams": [
+    {
+      "name": "FAST32K",
+      "required": false,
+      "domain": "FAST32K",
+      "rate_hz": 32000,
+      "logical_cycle_step": 1,
+      "consistency_group": 1,
+      "required_channels": [],
+      "optional_channels": []
+    },
+    {
+      "name": "CTRL8K",
+      "required": true,
+      "domain": "CTRL8K",
+      "rate_hz": 8000,
+      "logical_cycle_step": 4,
+      "consistency_group": 1,
+      "required_channels": ["Ia", "Ib", "Ic", "Vdc", "SampleValid"],
+      "optional_channels": ["P", "Q", "Freq", "PllAngle", "Va", "Vb", "Vc"]
+    },
+    {
+      "name": "SLOW1K",
+      "required": true,
+      "domain": "SLOW1K",
+      "rate_hz": 1000,
+      "logical_cycle_step": 32,
+      "consistency_group": 1,
+      "required_channels": [],
+      "optional_channels": ["RunState", "FaultFlags", "CtrlEnabled", "CommandAckSeq", "ParamAppliedVersion"]
+    }
+  ],
+  "channels": [
+    { "name": "Ia", "wire_format": "I16", "scale": 0.01, "unit": "A" },
+    { "name": "Ib", "wire_format": "I16", "scale": 0.01, "unit": "A" },
+    { "name": "Ic", "wire_format": "I16", "scale": 0.01, "unit": "A" },
+    { "name": "Vdc", "wire_format": "I16", "scale": 0.1, "unit": "V" },
+    { "name": "SampleValid", "wire_format": "U8", "scale": 1.0, "unit": "" },
+    { "name": "P", "wire_format": "I32", "scale": 1.0, "unit": "W" },
+    { "name": "Q", "wire_format": "I32", "scale": 1.0, "unit": "var" },
+    { "name": "Freq", "wire_format": "I16", "scale": 0.01, "unit": "Hz" },
+    { "name": "PllAngle", "wire_format": "I32", "scale": 0.0000152587890625, "unit": "turn" },
+    { "name": "Va", "wire_format": "I16", "scale": 0.1, "unit": "V" },
+    { "name": "Vb", "wire_format": "I16", "scale": 0.1, "unit": "V" },
+    { "name": "Vc", "wire_format": "I16", "scale": 0.1, "unit": "V" },
+    { "name": "RunState", "wire_format": "U8", "scale": 1.0, "unit": "" },
+    { "name": "FaultFlags", "wire_format": "I32", "scale": 1.0, "unit": "bits" },
+    { "name": "CtrlEnabled", "wire_format": "U8", "scale": 1.0, "unit": "" },
+    { "name": "CommandAckSeq", "wire_format": "I32", "scale": 1.0, "unit": "count" },
+    { "name": "ParamAppliedVersion", "wire_format": "I32", "scale": 1.0, "unit": "count" }
+  ]
+}

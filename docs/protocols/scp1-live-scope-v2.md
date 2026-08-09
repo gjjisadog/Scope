@@ -1,6 +1,6 @@
 # SCP1 Live Scope V2 R1/R2 frozen protocol
 
-Status: frozen by Scope Analyzer 0.15.3 and validated with the deterministic TCP simulator. The real Hybrid30K DSP firmware has not implemented or validated this protocol yet. SCP1 V1 framing, message numbers, golden frames, the `.scope V1` format, and the default desktop path are unchanged.
+Status: frozen by Scope Analyzer 0.15.3; Scope Analyzer 0.15.4 adds the Hybrid30K R2 acceptance kit and deterministic TCP software smoke. The real Hybrid30K DSP firmware has not implemented or validated this protocol yet. SCP1 V1 framing, message numbers, golden frames, the `.scope V1` format, and the default desktop path are unchanged.
 
 All integers and `f32` values are little-endian. Implementations encode fields explicitly and use checked arithmetic for every size, offset, and affine reconstruction.
 

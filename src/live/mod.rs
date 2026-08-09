@@ -1,8 +1,11 @@
 pub mod bandwidth;
 pub mod buffer;
 pub mod capture_history;
+#[cfg(test)]
+mod golden_vectors;
 pub mod hardware_capture;
 pub mod hardware_smoke;
+pub mod machine_profile;
 pub mod protocol;
 pub mod protocol_v2;
 pub mod protocol_v2_r2;

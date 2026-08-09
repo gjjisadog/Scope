@@ -22,7 +22,10 @@ fn main() {
     };
     let output = out_dir.join("scope_analyzer_icon.res");
 
-    if compile_resource(&output) || link_resource(Path::new("resources/ScopeAnalyzer.res")) {
+    let gnu_target = env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu");
+    if compile_resource(&output)
+        || (!gnu_target && link_resource(Path::new("resources/ScopeAnalyzer.res")))
+    {
         return;
     }
 
@@ -33,22 +36,26 @@ fn main() {
 
 fn compile_resource(output: &Path) -> bool {
     let mut candidates = Vec::<(PathBuf, ResourceCompiler)>::new();
-    if let Some(path) = env::var_os("WINDRES") {
-        candidates.push((PathBuf::from(path), ResourceCompiler::Windres));
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") {
+        if let Some(path) = env::var_os("WINDRES") {
+            candidates.push((PathBuf::from(path), ResourceCompiler::Windres));
+        }
+        candidates.extend([
+            (PathBuf::from(default_windres()), ResourceCompiler::Windres),
+            (PathBuf::from("windres"), ResourceCompiler::Windres),
+        ]);
+    } else {
+        if let Some(path) = env::var_os("LLVM_RC") {
+            candidates.push((PathBuf::from(path), ResourceCompiler::Rc));
+        }
+        if let Some(path) = env::var_os("RC") {
+            candidates.push((PathBuf::from(path), ResourceCompiler::Rc));
+        }
+        candidates.extend([
+            (PathBuf::from("llvm-rc"), ResourceCompiler::Rc),
+            (PathBuf::from("rc"), ResourceCompiler::Rc),
+        ]);
     }
-    if let Some(path) = env::var_os("LLVM_RC") {
-        candidates.push((PathBuf::from(path), ResourceCompiler::Rc));
-    }
-    if let Some(path) = env::var_os("RC") {
-        candidates.push((PathBuf::from(path), ResourceCompiler::Rc));
-    }
-
-    candidates.extend([
-        (PathBuf::from("llvm-rc"), ResourceCompiler::Rc),
-        (PathBuf::from("rc"), ResourceCompiler::Rc),
-        (PathBuf::from(default_windres()), ResourceCompiler::Windres),
-        (PathBuf::from("windres"), ResourceCompiler::Windres),
-    ]);
 
     for (program, compiler) in candidates {
         if run_resource_compiler(&program, compiler, output) {
@@ -101,6 +108,8 @@ fn link_resource(path: &Path) -> bool {
         return false;
     }
     let path = path.to_string_lossy().replace('\\', "/");
-    println!("cargo:rustc-link-arg-bins={path}");
+    // The resource belongs to the desktop executable only. Broadcasting it to
+    // every binary also feeds an MSVC-format .res into GNU-linked CLI tests.
+    println!("cargo:rustc-link-arg-bin=scope_analyzer={path}");
     true
 }

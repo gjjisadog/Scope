@@ -2544,7 +2544,7 @@ dependencies = [
 
 [[package]]
 name = "scope_analyzer"
-version = "0.15.3"
+version = "0.15.4"
 dependencies = [
  "ab_glyph",
  "clipboard-win",

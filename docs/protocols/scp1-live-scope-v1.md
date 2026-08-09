@@ -1,6 +1,6 @@
 # SCP1 DSP 实时示波器协议 V1
 
-状态：V1 冻结；自 Scope Analyzer 0.8.0 引入，继续由当前 Scope Analyzer 0.15.3 兼容支持。
+状态：V1 冻结；自 Scope Analyzer 0.8.0 引入，继续由当前 Scope Analyzer 0.15.4 兼容支持。
 
 SCP1 是 DSP 与 Scope Analyzer 之间的双向二进制字节流协议。TCP 和串口使用完全相同的帧格式；多字节整数与 IEEE-754 `f32` 均为 little-endian。字符串为 UTF-8，不带结尾零字符。
 

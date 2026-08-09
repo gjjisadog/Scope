@@ -267,6 +267,28 @@ impl SimulatorHandle {
         })
     }
 
+    /// Starts the isolated Hybrid30K R2 software fixture used by hardware-kit tests.
+    /// This is software evidence only and deliberately does not alter the frozen
+    /// general-purpose simulator presets.
+    pub fn spawn_hybrid30k_r2(listen: SocketAddr) -> Result<Self, SimulatorError> {
+        let listener = TcpListener::bind(listen)?;
+        listener.set_nonblocking(true)?;
+        let address = listener.local_addr()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let stats = Arc::new(Mutex::new(SimulatorStats::default()));
+        let worker_stats = Arc::clone(&stats);
+        let worker = thread::Builder::new()
+            .name("scope-hybrid30k-r2-fixture".to_owned())
+            .spawn(move || run_hybrid30k_r2_listener(listener, worker_stop, worker_stats))?;
+        Ok(Self {
+            address,
+            stop,
+            stats,
+            worker: Some(worker),
+        })
+    }
+
     pub fn address(&self) -> SocketAddr {
         self.address
     }
@@ -285,6 +307,338 @@ impl SimulatorHandle {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+    }
+}
+
+fn run_hybrid30k_r2_listener(
+    listener: TcpListener,
+    stop: Arc<AtomicBool>,
+    stats: Arc<Mutex<SimulatorStats>>,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                update_stats(&stats, |value| {
+                    value.connections = value.connections.saturating_add(1)
+                });
+                let _ = serve_hybrid30k_r2_client(stream, &stop, &stats);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn serve_hybrid30k_r2_client(
+    mut stream: TcpStream,
+    stop: &AtomicBool,
+    stats: &Mutex<SimulatorStats>,
+) -> Result<(), SimulatorError> {
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(Duration::from_millis(5)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(500)))?;
+    let channels = hybrid30k_r2_channel_table();
+    let streams = hybrid30k_r2_stream_table();
+    let mut decoder = FrameDecoder::default();
+    let mut read_buffer = [0_u8; 16 * 1024];
+    let mut out_sequence = 1_u32;
+    let session_id = SIMULATOR_SESSION_ID;
+    let mut configured: Option<ConfigureStreamsR2> = None;
+    let mut streaming = false;
+    let mut row_sequences = BTreeMap::<u16, u64>::new();
+    let mut emitted_rounds = 0_u64;
+    let mut last_ping = Instant::now();
+    let mut ping_nonce = 1_u64;
+
+    while !stop.load(Ordering::Relaxed) {
+        match stream.read(&mut read_buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                decoder.push(&read_buffer[..count]);
+                for frame in decoder.drain_frames() {
+                    if frame.version != super::protocol::PROTOCOL_VERSION_V2
+                        || (frame.message_type != MSG_HELLO && frame.session_id != session_id)
+                    {
+                        continue;
+                    }
+                    match frame.message_type {
+                        MSG_HELLO => {
+                            update_stats(stats, |value| {
+                                value.hello_requests = value.hello_requests.saturating_add(1);
+                                value.v2_stream_table_requests =
+                                    value.v2_stream_table_requests.saturating_add(1);
+                            });
+                            send_r2_handshake(
+                                &mut stream,
+                                &mut out_sequence,
+                                session_id,
+                                &channels,
+                                &streams,
+                                emitted_rounds,
+                            )?;
+                        }
+                        MSG_CONFIGURE_STREAMS_R2 => {
+                            let Ok(MessageV2R2::ConfigureStreams(request)) =
+                                MessageV2R2::decode(frame.message_type, &frame.payload)
+                            else {
+                                continue;
+                            };
+                            update_stats(stats, |value| {
+                                value.configure_requests =
+                                    value.configure_requests.saturating_add(1)
+                            });
+                            let result = validate_configure_streams_r2_for_device(
+                                &request,
+                                &streams,
+                                &channels,
+                                4096,
+                                MAX_PAYLOAD_LEN as u32,
+                            );
+                            let (result_code, detail) = match result {
+                                Ok(()) => {
+                                    configured = Some(request.clone());
+                                    row_sequences.clear();
+                                    (ResultCode::Ok, accepted_subscriptions_detail(&request))
+                                }
+                                Err(error) => (ResultCode::InvalidArgument, error.to_string()),
+                            };
+                            send_v2_common_session(
+                                &mut stream,
+                                &mut out_sequence,
+                                session_id,
+                                Message::CommandResult(CommandResult {
+                                    request_sequence: frame.sequence,
+                                    result_code,
+                                    detail,
+                                }),
+                            )?;
+                        }
+                        MSG_START => {
+                            streaming = configured.is_some();
+                            update_stats(stats, |value| {
+                                value.start_requests = value.start_requests.saturating_add(1)
+                            });
+                            send_v2_common_session(
+                                &mut stream,
+                                &mut out_sequence,
+                                session_id,
+                                Message::CommandResult(CommandResult {
+                                    request_sequence: frame.sequence,
+                                    result_code: if streaming {
+                                        ResultCode::Ok
+                                    } else {
+                                        ResultCode::InvalidState
+                                    },
+                                    detail: if streaming { "ok" } else { "not configured" }
+                                        .to_owned(),
+                                }),
+                            )?;
+                        }
+                        MSG_STOP => {
+                            streaming = false;
+                            update_stats(stats, |value| {
+                                value.stop_requests = value.stop_requests.saturating_add(1)
+                            });
+                            send_v2_common_session(
+                                &mut stream,
+                                &mut out_sequence,
+                                session_id,
+                                Message::CommandResult(CommandResult {
+                                    request_sequence: frame.sequence,
+                                    result_code: ResultCode::Ok,
+                                    detail: "ok".to_owned(),
+                                }),
+                            )?;
+                        }
+                        MSG_PING => {
+                            if let Ok(Message::Ping(nonce)) =
+                                Message::decode(frame.message_type, &frame.payload)
+                            {
+                                update_stats(stats, |value| {
+                                    value.ping_requests = value.ping_requests.saturating_add(1)
+                                });
+                                send_v2_common_session(
+                                    &mut stream,
+                                    &mut out_sequence,
+                                    session_id,
+                                    Message::Pong(nonce),
+                                )?;
+                            }
+                        }
+                        super::protocol::MSG_PONG => {
+                            update_stats(stats, |value| {
+                                value.pongs_received = value.pongs_received.saturating_add(1)
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        if streaming {
+            let configure = configured
+                .as_ref()
+                .expect("Hybrid30K R2 streaming requires configuration");
+            for subscription in &configure.subscriptions {
+                let first_row = *row_sequences.entry(subscription.stream_id).or_insert(1);
+                let batch = v2_r2_sample_batch(
+                    &streams,
+                    &channels,
+                    subscription,
+                    first_row,
+                    V2Preset::CausalInOrder30k,
+                    emitted_rounds,
+                )?;
+                row_sequences.insert(
+                    subscription.stream_id,
+                    first_row.saturating_add(u64::from(subscription.batch_samples)),
+                );
+                let timestamp_ticks = first_row
+                    .saturating_sub(1)
+                    .saturating_mul(u64::from(batch.sample_period_ticks));
+                send_v2_r2_message(
+                    &mut stream,
+                    &mut out_sequence,
+                    session_id,
+                    MessageV2R2::StreamSampleBatch(batch),
+                    timestamp_ticks,
+                )?;
+                update_stats(stats, |value| {
+                    value.emitted_batches = value.emitted_batches.saturating_add(1)
+                });
+            }
+            emitted_rounds = emitted_rounds.saturating_add(1);
+            thread::sleep(Duration::from_millis(1));
+        }
+        if last_ping.elapsed() >= Duration::from_secs(1) {
+            send_v2_common_session(
+                &mut stream,
+                &mut out_sequence,
+                session_id,
+                Message::Ping(ping_nonce),
+            )?;
+            update_stats(stats, |value| {
+                value.pings_sent = value.pings_sent.saturating_add(1)
+            });
+            ping_nonce = ping_nonce.wrapping_add(1);
+            last_ping = Instant::now();
+        }
+    }
+    Ok(())
+}
+
+fn hybrid30k_r2_channel_table() -> ChannelTable {
+    let mut channels = vec![
+        descriptor(0, "FastAdc", "A", WireFormat::I16, 0.01),
+        descriptor(1, "FastClaInput", "A", WireFormat::I16, 0.01),
+        descriptor(2, "FastClaResult", "A", WireFormat::I16, 0.01),
+        descriptor(3, "FastSequence", "count", WireFormat::I32, 1.0),
+        descriptor(4, "Ia", "A", WireFormat::I16, 0.01),
+        descriptor(5, "Ib", "A", WireFormat::I16, 0.01),
+        descriptor(6, "Ic", "A", WireFormat::I16, 0.01),
+        descriptor(7, "Vdc", "V", WireFormat::I16, 0.1),
+        descriptor(8, "RunState", "", WireFormat::U8, 1.0),
+        descriptor(9, "FaultFlags", "bits", WireFormat::I32, 1.0),
+        descriptor(10, "CtrlEnabled", "", WireFormat::U8, 1.0),
+        descriptor(11, "SampleValid", "", WireFormat::U8, 1.0),
+        descriptor(12, "P", "W", WireFormat::I32, 1.0),
+        descriptor(13, "Q", "var", WireFormat::I32, 1.0),
+        descriptor(14, "Freq", "Hz", WireFormat::I16, 0.01),
+        descriptor(15, "PllAngle", "turn", WireFormat::I32, 1.0 / 65_536.0),
+        descriptor(16, "Va", "V", WireFormat::I16, 0.1),
+        descriptor(17, "Vb", "V", WireFormat::I16, 0.1),
+        descriptor(18, "Vc", "V", WireFormat::I16, 0.1),
+        descriptor(19, "CommandAckSeq", "count", WireFormat::I32, 1.0),
+        descriptor(20, "ParamAppliedVersion", "count", WireFormat::I32, 1.0),
+    ];
+    for channel in &mut channels {
+        if channel.wire_format == WireFormat::U8 {
+            channel.kind = ChannelKind::Digital;
+        }
+    }
+    ChannelTable {
+        revision: 1,
+        channels,
+    }
+}
+
+fn hybrid30k_r2_stream_table() -> StreamTableR2 {
+    let stream_channels = [
+        (1_u16, vec![0, 1, 2, 3]),
+        (
+            2_u16,
+            (4_u16..=18).filter(|id| !matches!(id, 8..=10)).collect(),
+        ),
+        (3_u16, vec![8, 9, 10, 19, 20]),
+    ];
+    let streams = vec![
+        StreamDescriptorR2 {
+            stream_id: 1,
+            domain: SampleDomain::Fast32k,
+            capture_phase: CapturePhase::AfterClaComplete,
+            sample_rate_hz: 32_000,
+            consistency_group: 1,
+            logical_cycle_step: 1,
+            channel_ids: stream_channels[0].1.clone(),
+        },
+        StreamDescriptorR2 {
+            stream_id: 2,
+            domain: SampleDomain::Control8k,
+            capture_phase: CapturePhase::ControlCycleEnd,
+            sample_rate_hz: 8_000,
+            consistency_group: 1,
+            logical_cycle_step: 4,
+            channel_ids: stream_channels[1].1.clone(),
+        },
+        StreamDescriptorR2 {
+            stream_id: 3,
+            domain: SampleDomain::Slow1k,
+            capture_phase: CapturePhase::LogicTaskEnd,
+            sample_rate_hz: 1_000,
+            consistency_group: 1,
+            logical_cycle_step: 32,
+            channel_ids: stream_channels[2].1.clone(),
+        },
+    ];
+    let bindings = stream_channels
+        .into_iter()
+        .flat_map(|(stream_id, channels)| {
+            channels
+                .into_iter()
+                .map(move |channel_id| StreamChannelBinding {
+                    channel_id,
+                    stream_id,
+                    owner: if stream_id == 3 {
+                        super::protocol_v2::SignalOwner::Cpu2
+                    } else {
+                        super::protocol_v2::SignalOwner::Cpu1
+                    },
+                    role: super::protocol_v2::SignalRole::Metadata,
+                })
+        })
+        .collect();
+    StreamTableR2 {
+        revision: 3,
+        causal_groups: vec![CausalGroupDescriptorR2 {
+            consistency_group: 1,
+            logical_cycle_rate_hz: 32_000,
+            max_reorder_cycles: 64,
+        }],
+        streams,
+        bindings,
+        causal_relations: Vec::new(),
     }
 }
 

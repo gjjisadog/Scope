@@ -1,7 +1,10 @@
 use std::{env, fs, path::Path, process::ExitCode, time::Duration};
 
 use scope_analyzer::live::{
-    hardware_smoke::{run, HardwareSmokeConfig, HardwareSmokeError, HardwareSmokeResult},
+    hardware_smoke::{
+        run, run_v2_r2, HardwareSmokeConfig, HardwareSmokeError, HardwareSmokeMode,
+        HardwareSmokeResult, HardwareSmokeV2R2Config, HardwareSmokeV2R2Result,
+    },
     transport::TransportConfig,
 };
 use serde::Serialize;
@@ -14,7 +17,14 @@ struct SuccessEnvelope {
     schema_version: u32,
     command: &'static str,
     ok: bool,
-    result: HardwareSmokeResult,
+    result: CommandResult,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum CommandResult {
+    V1(HardwareSmokeResult),
+    V2R2(HardwareSmokeV2R2Result),
 }
 
 #[derive(Serialize)]
@@ -33,6 +43,9 @@ struct ErrorPayload {
 
 #[derive(Default)]
 struct Options {
+    protocol: String,
+    profile: Option<String>,
+    mode: String,
     serial_port: Option<String>,
     tcp_address: Option<String>,
     baud: u32,
@@ -99,7 +112,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn execute(options: Options) -> Result<HardwareSmokeResult, HardwareSmokeError> {
+fn execute(options: Options) -> Result<CommandResult, HardwareSmokeError> {
     let output = options
         .output
         .ok_or_else(|| HardwareSmokeError::InvalidConfig("--output is required".to_owned()))?;
@@ -132,18 +145,56 @@ fn execute(options: Options) -> Result<HardwareSmokeResult, HardwareSmokeError> 
             ));
         }
     };
-    run(&HardwareSmokeConfig {
-        transport,
-        output: output_path.to_path_buf(),
-        duration: Duration::from_millis(options.duration_ms),
-        sample_rate_hz: options.sample_rate_hz,
-        batch_samples: options.batch_samples,
-        channel_count: options.channel_count,
-    })
+    match options.protocol.as_str() {
+        "v1" => run(&HardwareSmokeConfig {
+            transport,
+            output: output_path.to_path_buf(),
+            duration: Duration::from_millis(options.duration_ms),
+            sample_rate_hz: options.sample_rate_hz,
+            batch_samples: options.batch_samples,
+            channel_count: options.channel_count,
+        })
+        .map(CommandResult::V1),
+        "v2-r2" => {
+            let mode = HardwareSmokeMode::parse(&options.mode).ok_or_else(|| {
+                HardwareSmokeError::InvalidConfig(format!(
+                    "unsupported --mode {}; expected handshake|ctrl8k|multistream|link-stress",
+                    options.mode
+                ))
+            })?;
+            let result = run_v2_r2(&HardwareSmokeV2R2Config {
+                transport,
+                profile: options.profile.ok_or_else(|| {
+                    HardwareSmokeError::InvalidConfig(
+                        "--profile is required with --protocol v2-r2".to_owned(),
+                    )
+                })?,
+                mode,
+                duration: Duration::from_millis(options.duration_ms),
+                batch_samples: options.batch_samples.unwrap_or(16),
+            })?;
+            fs::write(
+                output_path,
+                serde_json::to_vec_pretty(&result).expect("R2 result is serializable"),
+            )
+            .map_err(|error| {
+                HardwareSmokeError::InvalidConfig(format!(
+                    "cannot write output JSON {}: {error}",
+                    output_path.display()
+                ))
+            })?;
+            Ok(CommandResult::V2R2(result))
+        }
+        other => Err(HardwareSmokeError::InvalidConfig(format!(
+            "unsupported --protocol {other}; expected v1|v2-r2"
+        ))),
+    }
 }
 
 fn parse_options(args: Vec<String>) -> Result<Option<Options>, String> {
     let mut options = Options {
+        protocol: "v1".to_owned(),
+        mode: "handshake".to_owned(),
         baud: 921_600,
         duration_ms: 3_000,
         channel_count: 1,
@@ -158,6 +209,9 @@ fn parse_options(args: Vec<String>) -> Result<Option<Options>, String> {
             }
             "--serial-port" => options.serial_port = Some(next_value(&mut args, &argument)?),
             "--tcp" => options.tcp_address = Some(next_value(&mut args, &argument)?),
+            "--protocol" => options.protocol = next_value(&mut args, &argument)?,
+            "--profile" => options.profile = Some(next_value(&mut args, &argument)?),
+            "--mode" => options.mode = next_value(&mut args, &argument)?,
             "--baud" => options.baud = parse_value(&mut args, &argument)?,
             "--output" => options.output = Some(next_value(&mut args, &argument)?),
             "--duration-ms" => options.duration_ms = parse_value(&mut args, &argument)?,
@@ -187,19 +241,55 @@ where
 }
 
 fn error_code(error: &HardwareSmokeError) -> &'static str {
-    match error {
-        HardwareSmokeError::InvalidConfig(_) => "invalid_config",
-        HardwareSmokeError::Session(_) => "session_error",
-        HardwareSmokeError::Recording(_) => "recording_error",
-        HardwareSmokeError::Timeout(_) => "timeout",
-        HardwareSmokeError::Device(_) => "device_error",
-    }
+    error.code()
 }
 
 fn print_usage() {
     eprintln!(
-        "scope-hardware-smoke --serial-port <port> [--baud <baud>] --output <scope> [options]\n\
-         scope-hardware-smoke --tcp <host:port> --output <scope> [options]\n\
+        "scope-hardware-smoke [--protocol v1] --serial-port <port> [--baud <baud>] --output <scope> [options]\n\
+         scope-hardware-smoke [--protocol v1] --tcp <host:port> --output <scope> [options]\n\
+         scope-hardware-smoke --protocol v2-r2 --profile <name> --mode <mode> (--serial-port <port>|--tcp <host:port>) --output <json> [options]\n\
+         modes: handshake | ctrl8k | multistream | link-stress\n\
          options: --duration-ms <ms> --sample-rate <hz> --batch-samples <count> --channels <count>"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_preserve_v1_hardware_smoke_behavior() {
+        let options = parse_options(vec![
+            "--tcp".to_owned(),
+            "127.0.0.1:1".to_owned(),
+            "--output".to_owned(),
+            "capture.scope".to_owned(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(options.protocol, "v1");
+        assert_eq!(options.baud, 921_600);
+        assert_eq!(options.duration_ms, 3_000);
+        assert_eq!(options.channel_count, 1);
+    }
+
+    #[test]
+    fn parses_v2_r2_round_one_modes_and_profile() {
+        for mode in ["handshake", "ctrl8k", "multistream", "link-stress"] {
+            let options = parse_options(vec![
+                "--protocol".to_owned(),
+                "v2-r2".to_owned(),
+                "--profile".to_owned(),
+                "hybrid30k".to_owned(),
+                "--mode".to_owned(),
+                mode.to_owned(),
+            ])
+            .unwrap()
+            .unwrap();
+            assert_eq!(options.protocol, "v2-r2");
+            assert_eq!(options.profile.as_deref(), Some("hybrid30k"));
+            assert_eq!(options.mode, mode);
+        }
+    }
 }
