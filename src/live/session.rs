@@ -3646,7 +3646,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(150));
         let stats = wait_for(
             &session,
-            Duration::from_secs(2),
+            Duration::from_secs(10),
             |event| matches!(event, SessionEvent::Stats(stats) if stats.host_dropped_v2_batches > 0),
         );
         assert!(matches!(

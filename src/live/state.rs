@@ -1074,7 +1074,7 @@ mod tests {
             state.connection_state == ConnectionState::Streaming
         });
 
-        std::thread::sleep(Duration::from_millis(700));
+        wait_until(&mut state, |state| state.stats.received_samples >= 2_000);
         state.stop().unwrap();
         wait_until(&mut state, |state| {
             state.connection_state == ConnectionState::Ready
