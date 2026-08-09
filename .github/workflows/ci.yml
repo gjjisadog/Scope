@@ -38,7 +38,8 @@ jobs:
       - name: Run tests
         run: cargo test --locked --all-targets
       - name: Run live protocol freeze tests
-        run: cargo test --locked --lib live::
+        run: |
+          cargo test --locked --lib live::
       - name: Run DSP simulator tests
         run: cargo test --locked --bin scope_dsp_simulator
       - name: Strict project Clippy
