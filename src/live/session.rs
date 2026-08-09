@@ -3643,7 +3643,7 @@ mod tests {
         wait_for(&session, Duration::from_secs(2), |event| {
             matches!(event, SessionEvent::State(ConnectionState::Streaming))
         });
-        std::thread::sleep(Duration::from_millis(150));
+        std::thread::sleep(Duration::from_secs(2));
         let stats = wait_for(
             &session,
             Duration::from_secs(10),

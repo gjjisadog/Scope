@@ -986,7 +986,7 @@ mod tests {
                 address: simulator.address().to_string(),
             },
             output: output.clone(),
-            duration: Duration::from_millis(80),
+            duration: Duration::from_secs(1),
             sample_rate_hz: Some(1_000),
             batch_samples: Some(10),
             channel_count: 2,
